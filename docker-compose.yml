@@ -1,0 +1,22 @@
+# Docker Compose file for the Biodiv NER project
+version: '3.8'
+
+services:
+  biodiv:
+    build: .
+    image: biodiv-ner:light
+    container_name: biodiv_dev
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./cache/hf:/app/.cache/hf
+      - ./cache/spacy:/app/.cache/spacy
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - HF_HOME=/app/.cache/hf
+      - SPACY_DATA_DIR=/app/.cache/spacy
+    command: tail -f /dev/null
