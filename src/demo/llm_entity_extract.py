@@ -63,7 +63,7 @@ def call_llm(client, model_name: str, sentence: str, candidates: list = None, re
         system_prompt = DEFAULT_SYSTEM_PROMPT
         user_payload = {
             "sentence": sentence,
-            "candidates": [{"text": c["text"], "start_char": c["start_char"], "end_char": c["end_char"]} for c in candidates],
+            "candidates": [{"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]} for c in candidates],
         }
 
     full_prompt = f"{system_prompt}\n\nUser input: {json.dumps(user_payload, ensure_ascii=False)}"
@@ -162,6 +162,7 @@ def main():
                     break
                 if (i % args.sample_every) != 0:
                     continue
+                sent_text = sent.text.stip()
 
                 if args.use_chunks:
                     # Chunk-based processing with DEFAULT_SYSTEM_PROMPT
@@ -169,34 +170,34 @@ def main():
                     if not cands:
                         continue  # Skip sentences without NP candidates
 
-                    verdict = call_llm(client, model_name, sent.text, cands)
+                    verdict = call_llm(client, model_name, sent_text, cands)
                     print(f'VERDICT: {verdict}')
 
                     # Clamp spans to sentence bounds
-                    verdict["accepted"] = [clamp_span(x, sent.text) for x in verdict.get("accepted", []) if x.get("text")]
-                    verdict["missing"] = [clamp_span(x, sent.text) for x in verdict.get("missing", []) if x.get("text")]
+                    verdict["accepted"] = [clamp_span(x, sent_text) for x in verdict.get("accepted", []) if x.get("text")]
+                    verdict["missing"] = [clamp_span(x, sent_text) for x in verdict.get("missing", []) if x.get("text")]
 
                     out_sents.append({
-                        "text": sent.text,
+                        "text": sent_text,
                         "candidates": cands,
                         "llm": verdict
                     })
                 else:
                     # No-chunk processing with NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
-                    verdict = call_llm(client, model_name, sent.text, None)
+                    verdict = call_llm(client, model_name, sent_text, None)
                     print(f'VERDICT: {verdict}')
 
                     # For no-chunk mode, clamp accepted entities only
-                    verdict["accepted"] = [clamp_span(x, sent.text) for x in verdict.get("accepted", []) if x.get("text")]
+                    verdict["accepted"] = [clamp_span(x, sent_text) for x in verdict.get("accepted", []) if x.get("text")]
 
                     out_sents.append({
-                        "text": sent.text,
+                        "text": sent_text,
                         "llm": verdict
                     })
 
             # Write one JSON object per document
             rec = {
-                "id": doc_id,
+                "doc_id": doc_id,
                 "sentences": out_sents,
                 "config": {
                     "model_type": args.model_type,

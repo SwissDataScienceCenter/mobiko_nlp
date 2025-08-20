@@ -1,4 +1,6 @@
 from schema import SCHEMA_BIODIV
+from schema import SCHEMA_TYPES
+from schema import SCHEMA_TYPES_SHORT
 
 
 DEFAULT_SYSTEM_PROMPT = f"""You are a careful biodiversity information extractor.
