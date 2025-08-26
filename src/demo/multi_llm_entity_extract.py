@@ -13,7 +13,8 @@ import spacy
 from openai import OpenAI
 
 
-from promps import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
+from prompts import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
+
 
 
 # Model configurations
@@ -24,17 +25,28 @@ MODEL_CONFIGS = {
         "model_name": "Qwen/Qwen3-4B-Instruct-2507"
     },
     "qwen3-32B": {
-        "base_url": "curl -X POST https://openwebui.runai-codev-llm.inference.compute.datascience.ch/api/",
-        "api_key": None,
+        "base_url": "https://openwebui.runai-codev-llm.inference.compute.datascience.ch/api",
+        "api_key": None,  # Will use OPEN_WEB_UI_API_KEY env var
         "model_name": "Qwen/Qwen3-32B-AWQ"
+    },
+    "medgemma-4b": {
+        "base_url": "http://medgemma-4b-it.runai-mobiko-anisia.inference.compute.datascience.ch",
+        "api_key": "EMPTY",
+        "model_name": "google/medgemma-4b-it"
+    },
+    "biomistral-7b-awq": {
+        "base_url": "https://mistral-7b-awq.runai-mobiko-anisia.inference.compute.datascience.ch/v1",
+        "api_key": "EMPTY",
+        "model_name": "BioMistral/BioMistral-7B-AWQ-QGS128-W4-GEMM"
     },
     "gpt4o": {
         "base_url": "https://api.openai.com/v1",
         "api_key": None,  # Will use OPENAI_API_KEY env var
         "model_name": "gpt-4o"
     },
-
 }
+
+
 
 # Thread-local storage for spaCy models
 thread_local = threading.local()
@@ -73,14 +85,11 @@ def read_txt_files(indir: str):
             yield os.path.splitext(name)[0], f.read()
 
 
-def find_span_positions(text: str, span_text: str, used_positions: set = None):
+def find_span_positions(text: str, span_text: str):
     """
     Find all positions of span_text in text using regex.
-    Returns list of (start, end) tuples for all matches not in used_positions.
+    Returns list of (start, end) tuples for all matches.
     """
-    if used_positions is None:
-        used_positions = set()
-
     # Escape special regex characters in the span text
     escaped_span = re.escape(span_text.strip())
 
@@ -88,19 +97,16 @@ def find_span_positions(text: str, span_text: str, used_positions: set = None):
     matches = []
     for match in re.finditer(escaped_span, text, re.IGNORECASE):
         start, end = match.span()
-        # if (start, end) not in used_positions:
         matches.append((start, end))
 
     return matches
 
 
-def fix_span_indices(spans: list, sentence_text: str, used_positions: set = None) -> List[Dict]:
+def fix_span_indices(spans: list, sentence_text: str) -> List[Dict]:
     """
     Fix span indices using regex matching.
     Returns updated spans with correct start_char and end_char.
     """
-    if used_positions is None:
-        used_positions = set()
 
     fixed_spans = []
     for span in spans:
@@ -108,11 +114,10 @@ def fix_span_indices(spans: list, sentence_text: str, used_positions: set = None
         if not span_text:
             continue
 
-        positions = find_span_positions(sentence_text, span_text, used_positions)
+        positions = find_span_positions(sentence_text, span_text)
         if positions:
             # Use the first available position
             start, end = positions[0]
-            used_positions.add((start, end))
             fixed_span = dict(span)
             fixed_span["start_char"] = start
             fixed_span["end_char"] = end
@@ -130,55 +135,31 @@ def fix_span_indices(spans: list, sentence_text: str, used_positions: set = None
     return fixed_spans
 
 
-def call_llm(client, model_name: str, sentence: str, candidates: list = None, retries: int = 3, sleep_s: float = 3.0) -> dict:
-    if candidates is None:
-        # No-chunk mode: use NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
-        system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
-        user_payload = {"sentence": sentence}
-    else:
-        # Chunk mode: use DEFAULT_SYSTEM_PROMPT with candidates
-        system_prompt = DEFAULT_SYSTEM_PROMPT
-        user_payload = {
-            "sentence": sentence,
-            "candidates": [{"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]} for c in candidates],
-        }
+def remove_thinking_blocks(content: str) -> str:
+    # Remove <think>...</think> blocks (including nested content)
+    pattern = r'<think>.*?</think>'
+    cleaned = re.sub(pattern, '', content, flags=re.DOTALL)
 
-    full_prompt = f"{system_prompt}\n\nUser input: {json.dumps(user_payload, ensure_ascii=False)}"
+    # Clean up extra whitespace
+    cleaned = cleaned.strip()
 
-    for attempt in range(retries):
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": full_prompt}],
-                temperature=0.0,
-                max_tokens=500,
-            )
-            print(f'RESPONSE: {response}')
+    # If content starts with ```json, extract just the JSON part
+    if cleaned.startswith('```json'):
+        # Find the JSON block
+        start = cleaned.find('```json') + 7
+        end = cleaned.rfind('```')
+        if end > start:
+            cleaned = cleaned[start:end].strip()
 
-            content = response.choices[0].message.content
-            llm_result = json.loads(content)
-
-            # Fix indices for all span categories using regex
-            used_positions = set()
-
-            for category in ["accepted", "missing", "rejected"]:
-                if category in llm_result:
-                    llm_result[category] = fix_span_indices(
-                        llm_result[category], sentence, used_positions
-                    )
-
-            return llm_result
-
-        except Exception as e:
-            if attempt == retries - 1:
-                return {"accepted": [], "rejected": [], "missing": [], "notes": f"llm_error: {repr(e)}"}
-            time.sleep(sleep_s * (attempt + 1))
+    return cleaned
 
 
-
-def call_llm_batch(client, model_name: str, requests: List[Dict]) -> List[Dict]:
+def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict]) -> List[Dict]:
     """Process multiple LLM requests efficiently."""
     results = []
+
+    # Configure model-specific parameters
+    max_tokens = 1024 if model_type == "qwen3-32B" else 500 # in progress here
 
     for req in requests:
         sentence = req["sentence"]
@@ -195,17 +176,31 @@ def call_llm_batch(client, model_name: str, requests: List[Dict]) -> List[Dict]:
                                c in candidates],
             }
 
+        # Modify system prompt for Qwen 32B
+        if model_type == "qwen3-32B":
+            system_prompt = f"<no_think/>\n\n{system_prompt}"
+
         full_prompt = f"{system_prompt}\n\nUser input: {json.dumps(user_payload, ensure_ascii=False)}"
 
         try:
+            print(f'Sending LLM request for sentence: {sentence[:50]}... with {len(candidates) if candidates else 0} candidates')
+
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": full_prompt}],
                 temperature=0.0,
-                max_tokens=1024,
+                max_tokens=max_tokens,
+                timeout=360
+
             )
+            # print('Response', response)
 
             content = response.choices[0].message.content
+
+            # Postprocess content for Qwen 32B to remove thinking blocks
+            if model_type == "qwen3-32B":
+                content = remove_thinking_blocks(content)
+
             llm_result = json.loads(content)
 
             # Fix indices for all span categories
@@ -219,6 +214,7 @@ def call_llm_batch(client, model_name: str, requests: List[Dict]) -> List[Dict]:
             results.append(llm_result)
 
         except Exception as e:
+            print(f"Error calling LLM for sentence: {sentence[:50]}...: {e}")
             results.append({
                 "accepted": [], "rejected": [], "missing": [],
                 "notes": f"llm_error: {repr(e)}"
@@ -267,7 +263,7 @@ def process_sentences_batch(sentence_batch: List[str], spacy_model: str, use_chu
                 "sentence": sent_text,
                 "candidates": None
             })
-
+    print(f'Processed {len(batch_results)} sentences with spaCy (use_chunks={use_chunks})')
     return batch_results
 
 
@@ -276,13 +272,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
-    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o"], default="qwen3-4B", help="LLM model to use")
+    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o"], default="biomistral-7b-awq", help="LLM model to use")
     ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
     ap.add_argument("--spacy_model", default="en_core_web_trf", help="spaCy model (needs parser for noun_chunks)")
     ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
     ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
-    ap.add_argument("--batch_size", type=int, default=10, help="Batch size for processing")
+    ap.add_argument("--batch_size", type=int, default=2, help="Batch size for processing")
     ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
+
     args = ap.parse_args()
 
 
@@ -330,7 +327,7 @@ def main():
                 spacy_results = process_sentences_batch(batch, args.spacy_model, args.use_chunks)
 
                 # Process LLM requests in batch
-                llm_results = call_llm_batch(client, model_name, spacy_results)
+                llm_results = call_llm_batch(client, model_name, args.model_type, spacy_results)
 
                 # Combine results
                 for spacy_result, llm_result in zip(spacy_results, llm_results):

@@ -10,7 +10,7 @@ Given ONE sentence and a list of candidate noun phrases, decide:
 - which candidates are not relevant,
 - and whether the sentence contains additional biodiversity entities that are missing.
 
-Provided schema: {SCHEMA_BIODIV}
+Provided schema: {SCHEMA_TYPES}
 
 Return STRICT JSON only, matching this schema:
 {{
@@ -27,7 +27,7 @@ NO_CHUNK_CANDIDATE_SYSTEM_PROMPT = f"""You are a careful biodiversity informatio
 
 Given ONE sentence, decide which words are biodiversity entities (and assign a TYPE from the provided schema),
 
-Provided schema: {SCHEMA_BIODIV}
+Provided schema: {SCHEMA_TYPES}
 
 Return STRICT JSON only, matching this schema:
 {{
