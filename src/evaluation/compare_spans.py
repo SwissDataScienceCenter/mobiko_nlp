@@ -149,8 +149,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate span extraction performance")
     parser.add_argument("--gold_file", required=True, help="Path to gold standard JSONL file")
     parser.add_argument("--model_file", required=True, help="Path to model output JSONL file")
-    parser.add_argument("--output_file", default="src/evaluation/qwen_no_chunk_evaluation.json",
-                        help="Path to save detailed results (default: src/evaluation/qwen_no_chunk_evaluation.json)")
+    parser.add_argument("--output_file",
+                        help="Path to save detailed results")
     parser.add_argument("--overlap_threshold", type=float, default=0.5,
                         help="Minimum overlap ratio for span matching (default: 0.5)")
 
