@@ -10,6 +10,16 @@ from collections import namedtuple
 from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass
+#
+
+# Add the src directory to Python path
+src_path = Path(__file__).parent.parent
+if str(src_path) not in sys.path:
+    sys.path.insert(0, str(src_path))
+
+print(sys.path)
+
+from ner.labels import EntityLabel
 
 
 # Set up logging
@@ -39,22 +49,6 @@ I_PREFIX = "I-"
 
 # Processing constants
 SPACY_BATCH_SIZE = 5000
-
-
-class EntityLabel(Enum):
-    """Supported entity label types."""
-    TAXON = "TAXON"
-    HABITAT = "HABITAT"
-    ENV_FEATURE = "ENV_FEATURE"
-    THREAT = "THREAT"
-    POPULATION = "POPULATION"
-    LOCATION = "LOCATION"
-    BEHAVIOR = "BEHAVIOR"
-    DRIVER = "DRIVER"
-    STATUS = "STATUS"
-    CONTEXT = "CONTEXT"
-
-
 
 @dataclass
 class ProcessingConfig:
