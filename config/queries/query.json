@@ -1,0 +1,22 @@
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "query_string": {
+            "query": "(mountain* OR alpine OR montane OR subalpine OR submontane OR afromontane or afroalpine OR andes OR himalaya* OR \"rocky mountains\" OR carpathian* OR caucasus) AND (biodiversity OR ecosystem* OR ecology OR \"biological diversity\" OR mammal* OR bird* OR reptile* OR amphibian* OR fish OR invertebrate* OR botany OR flora OR fauna)"
+          }
+        },
+        {
+          "term": {
+            "pubyear": 2018
+          }
+        }
+      ]
+    }
+  },
+  "fields": [
+    "_id"
+  ],
+  "_source": false
+}
