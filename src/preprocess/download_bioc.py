@@ -56,7 +56,7 @@ FETCH_URL  = "https://biodiversitypmc.sibils.org/api/fetch"
 
 # Default values
 DEFAULT_COLLECTION = "pmc"
-DEFAULT_LIMIT = 1000
+DEFAULT_LIMIT = 2000
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_TIMEOUT = 120
 DEFAULT_SEARCH_TIMEOUT = 60
@@ -186,10 +186,12 @@ def fetch_document_chunks(document_ids: List[str], collection: str, out_dir: Pat
     """
     written_files = []
 
+    print(start_index, len(document_ids))
     for i in range(start_index, len(document_ids), batch_size):
         chunk = document_ids[i:i + batch_size]
         output_path = out_dir / f"fetch_{i:05d}.json"
 
+        print(i)
         # Skip if file already exists
         if output_path.exists():
             written_files.append(output_path)
@@ -318,18 +320,19 @@ def main():
     print(f"Found {len(ids)} ids to fetch (query sha1={qhash})")
 
     # Determine starting batch for resume
-    start_idx = 0
+    start_index = 0
     if args.resume:
         start_index = determine_resume_start_index(out_dir, args.batch)
         if start_index > 0:
             print(f"[resume] Resuming fetch from index {start_index} (skipping existing files)")
+
 
     written = fetch_document_chunks(
         document_ids=ids,
         collection=args.col,
         out_dir=out_dir,
         batch_size=args.batch,
-        start_index=start_idx,
+        start_index=start_index,
         timeout=args.timeout,
         sleep_seconds=args.sleep)
 
