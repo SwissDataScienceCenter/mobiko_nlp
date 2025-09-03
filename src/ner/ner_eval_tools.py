@@ -47,7 +47,7 @@ except Exception:
 ENTITY_PREFIXES = ("B-", "I-")
 
 # ---------------------
-# IO helpers
+# Helpers
 # ---------------------
 
 def write_jsonl(path: str, records: List[Dict[str, Any]]):
@@ -55,80 +55,6 @@ def write_jsonl(path: str, records: List[Dict[str, Any]]):
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-# ---------------------
-# Split
-# ---------------------
-
-def split_dataset(records: List[Dict[str, Any]], train_ratio=0.8, dev_ratio=0.1, seed=13) -> Tuple[List, List, List]:
-    assert 0 < train_ratio < 1 and 0 <= dev_ratio < 1 and train_ratio + dev_ratio < 1
-    test_ratio = 1.0 - train_ratio - dev_ratio
-
-    # Optional: group by doc_id to avoid leaking sentences across splits
-    by_doc = {}
-    for r in records:
-        did = r.get("doc_id") or "_"
-        by_doc.setdefault(did, []).append(r)
-
-    rng = random.Random(seed)
-    doc_ids = list(by_doc.keys())
-    rng.shuffle(doc_ids)
-
-    n = len(doc_ids)
-    n_train = int(round(n * train_ratio))
-    n_dev = int(round(n * dev_ratio))
-    train_ids = set(doc_ids[:n_train])
-    dev_ids = set(doc_ids[n_train:n_train+n_dev])
-    test_ids = set(doc_ids[n_train+n_dev:])
-
-    train = [r for did in train_ids for r in by_doc[did]]
-    dev   = [r for did in dev_ids   for r in by_doc[did]]
-    test  = [r for did in test_ids  for r in by_doc[did]]
-
-    return train, dev, test
-
-
-def split_dataset_stratified(records: List[Dict[str, Any]], train_ratio=0.8, dev_ratio=0.1, seed=13) -> Tuple[List, List, List]:
-    # Build label list and map to indices (ignore 'O')
-
-    labels = build_label_space(records)
-    print(labels)
-    lab2id = {l:i for i,l in enumerate(labels)}
-    # multi-label presence per sentence
-    X_bin = [
-        { lab2id[l] for l in extract_present_classes(r) if l in lab2id }
-        for r in records
-    ]
-
-    # run iterative stratification into 3 parts
-    splits = iterative_stratify(X_bin, [train_ratio, dev_ratio, 1.0-train_ratio-dev_ratio], seed=seed)
-
-    # enforce presence (best-effort)
-    enforce_class_presence(splits, X_bin, num_labels=len(labels))
-    train = [records[i] for i in splits[0]]
-    dev   = [records[i] for i in splits[1]]
-    test  = [records[i] for i in splits[2]]
-    return train, dev, test, labels
-
-
-def percentage_no_entities(records: List[Dict[str, Any]]) -> float:
-    if not records:
-        return 0.0
-    n_none = 0
-    for r in records:
-        tags = r.get("tags", [])
-        if all(t == "O" for t in tags):
-            n_none += 1
-    return 100.0 * n_none / len(records)
-
-
-def align_predictions(predictions: np.ndarray, label_ids: np.ndarray, id2label: Dict[int, str]):
-    preds = np.argmax(predictions, axis=2)
-    batch_preds = []
-    for pred in preds:
-        batch_preds.append([id2label[int(p)] for p in pred])
-    return batch_preds
 
 
 def strip_ignored(pred_tags: List[str], example: Dict[str, Any], tokenizer) -> List[str]:
@@ -151,8 +77,7 @@ def strip_ignored(pred_tags: List[str], example: Dict[str, Any], tokenizer) -> L
 
 # ----------------------
 # Stream the split
-# ----------------------\
-
+# ----------------------
 
 def stratify_groups(group_masks: Dict[str, np.uint32], ratios: List[float], seed: int = 13):
     """Stratify *groups* (e.g., docs). Returns group->split_id map."""
@@ -264,7 +189,6 @@ def _bit_counts(masks, K):
     return counts
 
 
-
 def iterative_stratify_bitmask(masks: np.ndarray, ratios: List[float], seed: int = 13):
     """
     Iterative stratification working on uint32 masks (multi-label per row).
@@ -346,8 +270,8 @@ def iterative_stratify_bitmask(masks: np.ndarray, ratios: List[float], seed: int
     return [np.array(x, dtype=np.int64) for x in per_split], assign
 
 
-
-def write_streamed_splits(input_path: str, offsets: np.ndarray, assign: np.ndarray, out_dir: str):
+def write_streamed_splits(input_path: str, offsets: np.ndarray, assign: np.ndarray, out_dir: str,
+                          tags_field: str = "tags"):
     os.makedirs(out_dir, exist_ok=True)
     paths = [
         os.path.join(out_dir, "train.jsonl"),
@@ -355,6 +279,9 @@ def write_streamed_splits(input_path: str, offsets: np.ndarray, assign: np.ndarr
         os.path.join(out_dir, "test.jsonl")
     ]
     fhs = [open(p, "wb") for p in paths]
+
+    counts_split = [defaultdict(int) for _ in range(3)]
+
     try:
         with open(input_path, "rb") as f:
             for i, off in enumerate(offsets):
@@ -362,238 +289,26 @@ def write_streamed_splits(input_path: str, offsets: np.ndarray, assign: np.ndarr
                 line = f.readline()
                 s = int(assign[i])
                 fhs[s].write(line)
+
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                    tags = rec.get(tags_field) or []
+                except Exception:
+                    tags = []
+
+                # Accumulate BIO tag counts
+                for t in tags:
+                    counts_split[s][t] += 1
     finally:
-        for fh in fhs: fh.close()
+        for fh in fhs:
+            fh.close()
 
-
-# ---------------------
-# Iterative stratification
-# ---------------------
-
-def extract_present_classes(rec):
-    """Return a set of EntityLabel values present in this sentence."""
-    present = set()
-    for t in rec.get("tags", []):
-        if t and t != "O":
-            _, typ = t.split("-", 1)
-            try:
-                present.add(EntityLabel[typ])
-            except KeyError:
-                # skip unknowns
-                print(f'Warning: unknown label type "{typ}" in record {rec.get("doc_id")}', file=sys.stderr)
-                continue
-    return present
-
-
-def iterative_stratify(X_bin, ratios, seed=13):
-    """
-    Iterative stratification (Sechidis et al. 2011) for multi-label data.
-
-    Args:
-        X_bin: List of sets, where each set contains label indices present in that sample
-        ratios: List of floats summing to 1.0 (e.g., [0.8, 0.1, 0.1])
-        seed: Random seed for reproducibility
-
-    Returns:
-        List of lists containing sample indices for each split
-    """
-
-    rnd = random.Random(seed)
-    n_samples = len(X_bin)
-    n_splits = len(ratios)
-
-    # Calculate target sizes for each split
-    target_sizes = [int(round(n_samples * ratio)) for ratio in ratios]
-    target_sizes = _adjust_target_sizes(target_sizes, n_samples)
-
-    # Initialize tracking variables
-    remaining_quota = target_sizes[:]
-    remaining_samples = list(range(n_samples))
-    splits = [[] for _ in range(n_splits)]
-
-    # Calculate label statistics
-    n_labels = max((max(sample_labels) if sample_labels else -1) for sample_labels in X_bin) + 1
-    label_needs = _calculate_label_needs(X_bin, ratios, n_labels, n_splits)
-    labels_by_rarity = _get_labels_by_rarity(X_bin, n_labels)
-
-
-    while remaining_samples:
-        # pick next label to place: rarest label with unmet need
-        target_label = _find_next_target_label(label_needs, labels_by_rarity)
-
-        # if all label needs are met, just fill by remaining quota
-        if target_label is None:
-            # All label needs satisfied, distribute remaining samples by quota
-            _distribute_remaining_samples(remaining_samples, splits, remaining_quota, rnd)
-            break
-
-        _assign_samples_for_label(
-            target_label, remaining_samples, X_bin, splits,
-            remaining_quota, label_needs, rnd
-        )
-
-    return splits
-
-
-def _adjust_target_sizes(target_sizes, n_samples):
-    """Adjust target sizes to ensure they sum to n_samples."""
-    while sum(target_sizes) > n_samples:
-        max_idx = target_sizes.index(max(target_sizes))
-        target_sizes[max_idx] -= 1
-    while sum(target_sizes) < n_samples:
-        min_idx = target_sizes.index(min(target_sizes))
-        target_sizes[min_idx] += 1
-    return target_sizes
-
-
-def _calculate_label_needs(X_bin, ratios, n_labels, n_splits):
-    """Calculate desired label distribution across splits."""
-    total_label_counts = [0] * n_labels
-    for sample_labels in X_bin:
-        for label in sample_labels:
-            total_label_counts[label] += 1
-
-    label_needs = [[0] * n_labels for _ in range(n_splits)]
-    for split_idx in range(n_splits):
-        for label_idx in range(n_labels):
-            label_needs[split_idx][label_idx] = int(
-                round(total_label_counts[label_idx] * ratios[split_idx])
-            )
-
-    return label_needs
-
-
-def _get_labels_by_rarity(X_bin, n_labels):
-    """Sort labels by rarity (rarest first)."""
-    label_counts = [0] * n_labels
-    for sample_labels in X_bin:
-        for label in sample_labels:
-            label_counts[label] += 1
-
-    return sorted(range(n_labels), key=lambda label: label_counts[label] if label_counts[label] > 0 else 10 ** 9)
-
-
-def _find_next_target_label(label_needs, labels_by_rarity):
-    """Find the rarest label that still has unmet needs."""
-    for label in labels_by_rarity:
-        if sum(need_row[label] for need_row in label_needs) > 0:
-            return label
-    return None
-
-
-def _distribute_remaining_samples(remaining_samples, splits, remaining_quota, rnd):
-    """Distribute remaining samples based on remaining quota."""
-    rnd.shuffle(remaining_samples)
-    for sample_idx in remaining_samples:
-        split_idx = max(range(len(remaining_quota)), key=lambda k: remaining_quota[k])
-        splits[split_idx].append(sample_idx)
-        remaining_quota[split_idx] -= 1
-
-
-def _assign_samples_for_label(target_label, remaining_samples, X_bin, splits,
-                              remaining_quota, label_needs, rnd):
-    """Assign samples containing the target label to appropriate splits."""
-    candidates = [idx for idx in remaining_samples if target_label in X_bin[idx]]
-
-    if not candidates:
-        # No samples with this label, mark needs as satisfied
-        for split_needs in label_needs:
-            split_needs[target_label] = 0
-        return
-
-    rnd.shuffle(candidates)
-
-    for sample_idx in candidates[:]:  # Use slice copy to modify during iteration
-        if sample_idx not in remaining_samples:
-            continue
-
-        # Choose split with highest need for this label, then by remaining quota
-        best_split = max(
-            range(len(splits)),
-            key=lambda k: (label_needs[k][target_label], remaining_quota[k])
-        )
-
-        if remaining_quota[best_split] <= 0:
-            continue
-
-        # Assign sample to split
-        splits[best_split].append(sample_idx)
-        remaining_quota[best_split] -= 1
-        remaining_samples.remove(sample_idx)
-
-        # Update label needs for all labels in this sample
-        for label in X_bin[sample_idx]:
-            if label_needs[best_split][label] > 0:
-                label_needs[best_split][label] -= 1
-
-
-def enforce_class_presence(splits, X_bin, num_labels):
-    """
-    If any class missing from a split, move one sample with that class from another split.
-    """
-    K = len(splits)
-
-    for label_idx in range(num_labels):
-        # check which splits contrain the label
-        splits_with_label = [
-            any(label_idx in X_bin[sample_idx] for sample_idx in splits[split_idx])
-            for split_idx in range(K)
-        ]
-        for target_split in range(K):
-            if splits_with_label[target_split]:
-                continue
-
-            # Find a donor split that can safely give away a sample with this label
-            donor_split, sample_to_move = _find_donor_sample(
-                splits, X_bin, label_idx, target_split, K
-            )
-
-            if donor_split is not None:
-                splits[donor_split].remove(sample_to_move)
-                splits[target_split].append(sample_to_move)
-            # else: Label is extremely rare (single instance), cannot redistribute
-
-
-def _find_donor_sample(splits, X_bin, label_idx, target_split, K):
-    """
-    Find a donor split and sample that can be moved without losing label coverage.
-
-    Returns:
-        Tuple of (donor_split_idx, sample_idx) or (None, None) if no donor found
-    """
-    for potential_donor in range(K):
-        if potential_donor == target_split:
-            continue
-
-        # Find a candidate sample with the required label
-        candidate_sample = next(
-            (sample_idx for sample_idx in splits[potential_donor]
-             if label_idx in X_bin[sample_idx]),
-            None
-        )
-
-        if candidate_sample is None:
-            continue
-
-        # Check if donor would still have this label after removal
-        would_retain_label = any(
-            label_idx in X_bin[sample_idx]
-            for sample_idx in splits[potential_donor]
-            if sample_idx != candidate_sample
-        )
-
-        if would_retain_label:
-            return potential_donor, candidate_sample
-
-    return None, None
-
-
-def build_label_space(records):
-    labs = set()
-    for r in records:
-        labs |= extract_present_classes(r)
-    return sorted(labs, key=lambda l: l.value)
-
+    # Save counts dicts as JSON (sorted by key for stability)
+    for s, name in enumerate(["train", "dev", "test"]):
+        out_counts = os.path.join(out_dir, f"{name}_label_counts.json")
+        with open(out_counts, "w", encoding="utf-8") as g:
+            json.dump(dict(sorted(counts_split[s].items())),
+                      g, indent=2, ensure_ascii=False)
 
 # ---------------------
 # Commands
@@ -610,7 +325,8 @@ def cmd_split(args):
     # if getattr(args, "stream", False):
     # 1) first pass: offsets + bitmasks
     offsets, masks, types, doc_ids = _scan_jsonl_bitmasks_and_offsets(args.input_jsonl,
-                                                                             args.tags_field, args.strict_types)
+                                                                      args.tags_field,
+                                                                      args.strict_types)
 
 
     K = len(types)
@@ -624,7 +340,7 @@ def cmd_split(args):
         if group_key != "doc_id":
             # Light re-scan just for the group field
             gids = []
-            with open(args.input, "rb") as f:
+            with open(args.input_jsonl, "rb") as f:
                 line = f.readline()
                 while line:
                     try:
@@ -653,7 +369,7 @@ def cmd_split(args):
         # Sentence-level stratification
         _, assign = iterative_stratify_bitmask(masks, ratios, args.seed)
 
-    write_streamed_splits(args.input_jsonl, offsets, assign, args.out_dir)
+    write_streamed_splits(args.input_jsonl, offsets, assign, args.out_dir, "tags")
 
     # Quick report
     def pct_no_ent(idx):
@@ -666,7 +382,6 @@ def cmd_split(args):
     for s, name in enumerate(names):
         present = [t for k, t in enumerate(types) if np.any(((masks[splits[s]] >> k) & 1))]
         print(f"{name:>5} no-entity %: {pct_no_ent(splits[s]):5.1f} | classes: {', '.join(present) if present else '—'}")
-
 
 
 def load_labels(model_dir: str) -> List[str]:
