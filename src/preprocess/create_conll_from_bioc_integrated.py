@@ -747,7 +747,6 @@ def setup_gazetteer(config: ProcessingConfig):
         tokenizer, matcher = build_matcher_from_gazetteer(
             gazetteer, prefer_spacy=config.prefer_spacy
         )
-        logger.info(f"Loaded {len(gazetteer)} habitat terms from gazetteer")
         return tokenizer, matcher
     except Exception as e:
         logger.error(f"Failed to load gazetteer: {e}")
