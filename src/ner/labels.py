@@ -8,10 +8,10 @@ class EntityLabel(Enum):
     THREAT = "THREAT"
     POPULATION = "POPULATION"
     LOCATION = "LOCATION"
-    BEHAVIOR = "BEHAVIOR"
-    DRIVER = "DRIVER"
-    STATUS = "STATUS"
-    CONTEXT = "CONTEXT"
+    # BEHAVIOR = "BEHAVIOR"
+    # DRIVER = "DRIVER"
+    # STATUS = "STATUS"
+    # CONTEXT = "CONTEXT"
 
 
 def build_bio_labels():
