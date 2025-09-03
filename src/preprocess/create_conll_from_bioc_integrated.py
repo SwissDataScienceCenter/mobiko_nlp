@@ -10,6 +10,8 @@ from collections import namedtuple
 from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass
+from collections import Counter
+
 #
 
 # Add the src directory to Python path
@@ -556,72 +558,181 @@ def merge_spans(base_spans: List[Dict[str, Any]],
     return merged
 
 
+def extract_records_from_sentence_format(article: Dict[str, Any],
+                                         rules: List[Rule],
+                                         gaz_matcher=None) -> List[Dict[str, Any]]:
+    """Handle BioC JSON with top-level 'sentences' and flat 'annotations'."""
+    records = []
+
+    # Build sentence index: (field, sentence_number) -> sentence text
+    sent_by_key: Dict[Tuple[str, int], str] = {}
+    sent_objs: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+    for s in article.get("sentences", []):
+        fld = s.get("field") or ""
+        num = int(s.get("sentence_number", 0))
+        txt = s.get("sentence") or ""
+        key = (fld, num)
+        sent_by_key[key] = txt
+        sent_objs[key] = s  # keep original if needed
+
+    # Group annotations by (field, sentence_number)
+    ann_by_key: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+
+    for a in article.get("annotations", []):
+        fld = a.get("field") or ""
+        num = int(a.get("sentence_number", 0))
+        key = (fld, num)
+        ann_by_key.setdefault(key, []).append(a)
+
+    # For each sentence, convert annotations → spans → BIO
+    for key, text in sent_by_key.items():
+        fld, num = key
+        anns = ann_by_key.get(key, [])
+        spans: List[Dict[str, Any]] = []
+
+        # Convert flat annotations into our internal span dicts
+        for a in anns:
+            # Build infons-like dict so rules/default_label still work
+            infons = {
+                "concept_source": a.get("concept_source", ""),
+                "type": a.get("type", ""),
+                "preferred_term": a.get("preferred_term", ""),
+                "concept_id": a.get("concept_id", ""),
+            }
+            label = apply_rules(infons, rules)
+            if label is None:
+                label = default_label(infons)
+            if not label:
+                continue
+
+
+            start = int(a.get("start_index", 0))
+            end   = int(a.get("end_index", 0))   # end is exclusive in your example
+            # Validate boundaries against this sentence text
+            if start < 0 or end <= start or end > len(text):
+                continue
+
+            spans.append({
+                "start": start,
+                "end": end,
+                "text": text[start:end],
+                "label": label,
+
+                # --- added metadata ---
+                "concept_source": a.get("concept_source"),
+                "concept_id": a.get("concept_id"),
+                "concept_form": a.get("concept_form"),
+                "evidence_code": a.get("evidence_code"),
+                "preferred_term": a.get("preferred_term"),
+                "score": a.get("score"),
+                "provider": a.get("provider"),
+                "provenance": a.get("provenance"),
+                "field": a.get("field"),
+            })
+
+        # Optional gazetteer augmentation
+        if gaz_matcher is not None and text:
+            gaz_spans = gaz_matcher(text)
+            spans = merge_spans(spans, gaz_spans)
+        else:
+            spans.sort(key=lambda s: (s["start"], -(s["end"]-s["start"])))
+
+        # Tokenize + BIO
+        tokens, token_spans = simple_whitespace_tokenize(text)
+        tags = [O_TAG] * len(tokens)
+        for sp in spans:
+            assign_bio_tags(tags, sp["start"], sp["end"], sp["label"], token_spans)
+        repair_bio_tags(tags)
+
+        # Validate consistency
+        assert len(tags) == len(tokens), f"Tag/token length mismatch: {len(tags)} vs {len(tokens)}"
+        # #
+        # print(tags)
+        # print(tokens)
+        # print(spans)
+        # print('___________')
+
+
+        records.append({
+            "doc_id": article.get("id") or article.get("doc_id") or "",
+            "sentence_id": num,
+            "field": fld,
+            "text": text,
+            "tokens": tokens,
+            "spans": spans,
+            "tags": tags,
+        })
+
+    return records
+
+
+# --- LEGACY FORMAT: 'passages' with embedded annotations/locations ---
+def extract_records_from_legacy_passages(article, rules, gaz_matcher=None):
+    """Handle BioC JSON with 'passages' (legacy structure)."""
+
+    records = []
+    doc_id = article.get("id") or article.get("doc_id") or ""
+    for passage in article.get("passages", []):
+        text = passage.get("text", "") or ""
+        sent_id = passage.get("infons", {}).get("sentence_number")
+
+        base_spans = extract_base_spans_from_bioc_passage(passage, rules)
+        spans = merge_spans(base_spans, gaz_matcher(text)) if (gaz_matcher and text) else base_spans
+
+        tokens, token_spans = simple_whitespace_tokenize(text)
+        tags = [O_TAG] * len(tokens)
+        for sp in spans:
+            assign_bio_tags(tags, sp["start"], sp["end"], sp["label"], token_spans)
+
+        repair_bio_tags(tags)
+
+        records.append({
+            "doc_id": doc_id,
+            "sentence_id": sent_id,
+            "text": text,
+            "tokens": tokens,
+            "spans": spans,
+            "tags": tags
+        })
+    return records
+
+
 def process_json_file(json_path: Path, rules: List[Rule],
                      gaz_matcher=None, tokenizer=None) -> List[Dict[str, Any]]:
-    """Process a single JSON file and return records."""
+    """Process a single JSON file and return records for either 'passages' or 'sentences' format."""
     try:
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         raise ProcessingError(f"Error reading {json_path}: {e}")
 
-    records = []
+    out_records: List[Dict[str, Any]] = []
 
-    # Support multiple JSON structures
-    articles = (data.get("sibils_article_set") or
-               data.get("articles") or
-               [data])
+    # Support multiple top-level shapes
+    articles = (data.get("sibils_article_set") or data.get("articles") or [data])
 
     for article in articles:
-        doc_id = (article.get("id") or
-                 article.get("doc_id") or
-                 json_path.stem)
+        doc_id = article.get("id") or article.get("doc_id") or json_path.stem
 
-        for passage in article.get("passages", []):
-            text = passage.get("text", "") or ""
-            sent_id = passage.get("infons", {}).get("sentence_number")
+        # New format: sentences + flat annotations
+        if article.get("sentences") and isinstance(article.get("sentences"), list):
+            recs = extract_records_from_sentence_format(article, rules, gaz_matcher=gaz_matcher)
+            # Ensure doc_id present
+            for r in recs:
+                if not r.get("doc_id"):
+                    r["doc_id"] = doc_id
+            out_records.extend(recs)
+            continue
 
-            # Extract base spans from annotations
-            base_spans = extract_base_spans_from_bioc_passage(passage, rules)
+        # Legacy format
+        if isinstance(article.get("passages"), list):
+            out_records.extend(extract_records_from_legacy_passages(article, rules, gaz_matcher=gaz_matcher))
+            continue
 
-            # Add gazetteer spans if available
-            if gaz_matcher is not None and text:
-                gaz_spans = gaz_matcher(text)
-                spans = merge_spans(base_spans, gaz_spans)
-            else:
-                spans = base_spans
+        continue
 
-            # Generate BIO tags
-            tokens, token_spans = simple_whitespace_tokenize(text)
-            tags = [O_TAG] * len(tokens)
-
-            for span in spans:
-                assign_bio_tags(tags, span["start"], span["end"],
-                              span["label"], token_spans)
-
-            repair_bio_tags(tags)
-
-            # Validate consistency
-            assert len(tags) == len(tokens), f"Tag/token length mismatch: {len(tags)} vs {len(tokens)}"
-            #
-            # print(tags)
-            # print(tokens)
-            # print(spans)
-            # print('___________')
-
-
-
-            record = {
-                "doc_id": doc_id,
-                "sentence_id": sent_id,
-                "text": text,
-                "tokens": tokens,
-                "spans": spans,
-                "tags": tags
-            }
-            records.append(record)
-
-    return records
+    return out_records
 
 
 # -------- CLI --------
@@ -655,6 +766,65 @@ def find_json_files(input_path: Path) -> List[Path]:
     return json_files
 
 
+def compute_stats(records, by_bio=False):
+    """
+    Returns a dict with:
+      - total_sentences
+      - percent_no_tags
+      - avg_tags_per_tagged_sentence
+      - label_distribution (entity type, e.g., TAXON/HABITAT/…)
+      - bio_distribution (optional: B-*/I-*/O)
+    """
+
+    n = len(records)
+    if n == 0:
+        return {
+            "total_sentences": 0,
+            "percent_no_tags": 0.0,
+            "avg_tags_per_tagged_sentence": 0.0,
+            "label_distribution": {},
+            "bio_distribution": {} if by_bio else None,
+        }
+
+    num_no_tags = 0
+    tags_per_tagged = []
+    label_ctr = Counter()
+    bio_ctr = Counter()
+
+    for r in records:
+        # count spans (entity instances) per sentence
+        spans = r.get("spans", []) or []
+        if len(spans) == 0:
+            num_no_tags += 1
+        else:
+            tags_per_tagged.append(len(spans))
+
+        # distribution over entity *types* (labels)
+        for sp in spans:
+            lab = sp.get("label")
+            if lab:
+                label_ctr[lab] += 1
+
+        if by_bio:
+            for t in r.get("tags", []) or []:
+                bio_ctr[t] += 1
+
+    percent_no = 100.0 * num_no_tags / max(1, n)
+    avg_tags = (sum(tags_per_tagged) / len(tags_per_tagged)) if tags_per_tagged else 0.0
+
+    out = {
+        "total_sentences": n,
+        "percent_no_tags": round(percent_no, 2),
+        "avg_tags_per_tagged_sentence": round(avg_tags, 3),
+        "label_distribution": dict(sorted(label_ctr.items(), key=lambda kv: (-kv[1], kv[0]))),
+    }
+    if by_bio:
+        out["bio_distribution"] = dict(sorted(bio_ctr.items(), key=lambda kv: (-kv[1], kv[0])))
+    return out
+
+
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(description="Process BioC JSON files to JSONL with NER tags")
@@ -670,6 +840,9 @@ def main():
                         help="Use spaCy PhraseMatcher if available")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable verbose logging")
+    parser.add_argument("--stats_out", default=None,
+                    help="Write a JSON file with split-level stats (coverage, distributions)")
+    parser.add_argument("--stats_bio", action="store_true", help="Also include BIO tag distribution")
 
     args = parser.parse_args()
 
@@ -719,6 +892,32 @@ def main():
                 except ProcessingError as e:
                     logger.error(f"Error processing {json_path}: {e}")
                     continue
+
+        # Accumulate all records to compute stats
+        all_records = []
+        with open(args.out_jsonl, "r", encoding="utf-8") as fin:
+            for ln in fin:
+                all_records.append(json.loads(ln))
+
+        stats = compute_stats(all_records, by_bio=args.stats_bio)
+
+        print("\n=== Split statistics ===")
+        print(f"Total sentences: {stats['total_sentences']}")
+        print(f"Sentences with NO tags: {stats['percent_no_tags']}%")
+        print(f"Avg #tags per tagged sentence: {stats['avg_tags_per_tagged_sentence']}")
+        print("Label distribution (entity types):")
+        for lab, cnt in stats["label_distribution"].items():
+            print(f"  {lab:>12s}: {cnt}")
+
+        if args.stats_bio and stats.get("bio_distribution"):
+            print("BIO tag distribution:")
+            for tag, cnt in stats["bio_distribution"].items():
+                print(f"  {tag:>12s}: {cnt}")
+
+        if args.stats_out:
+            with open(args.stats_out, "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+            print(f"Saved stats → {args.stats_out}")
 
         logger.info(f"Completed! Processed {len(json_files)} files, "
                     f"generated {total_records} total records")
