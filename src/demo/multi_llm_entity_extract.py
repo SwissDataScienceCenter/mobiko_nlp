@@ -159,7 +159,11 @@ def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict
     results = []
 
     # Configure model-specific parameters
-    max_tokens = 1024 if model_type == "qwen3-32B" else 500 # in progress here
+    if model_type in ["qwen3-32B", "gpt4o"]:
+        max_tokens = 1024
+    else:
+        max_tokens = 500
+
 
     for req in requests:
         sentence = req["sentence"]
@@ -198,18 +202,16 @@ def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict
             content = response.choices[0].message.content
 
             # Postprocess content for Qwen 32B to remove thinking blocks
-            if model_type == "qwen3-32B":
+            if model_type == "qwen3-32B" or model_type == "gpt4o":
                 content = remove_thinking_blocks(content)
 
             llm_result = json.loads(content)
 
             # Fix indices for all span categories
-            used_positions = set()
             for category in ["accepted", "missing", "rejected"]:
                 if category in llm_result:
                     llm_result[category] = fix_span_indices(
-                        llm_result[category], sentence, used_positions
-                    )
+                        llm_result[category], sentence)
 
             results.append(llm_result)
 
@@ -272,12 +274,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
-    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o"], default="biomistral-7b-awq", help="LLM model to use")
+    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq"], default="gpt4o", help="LLM model to use")
     ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
     ap.add_argument("--spacy_model", default="en_core_web_trf", help="spaCy model (needs parser for noun_chunks)")
     ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
     ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
-    ap.add_argument("--batch_size", type=int, default=2, help="Batch size for processing")
+    ap.add_argument("--batch_size", type=int, default=10, help="Batch size for processing")
     ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
 
     args = ap.parse_args()
