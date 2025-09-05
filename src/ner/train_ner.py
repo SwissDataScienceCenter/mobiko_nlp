@@ -33,6 +33,8 @@ python train_ner.py \
 
 import argparse, json, math, os, random, sys, time, mlflow
 from transformers.integrations import MLflowCallback
+from transformers import EarlyStoppingCallback
+
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Any
@@ -41,10 +43,10 @@ import numpy as np
 from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 
-src_path = Path(__file__).parent.parent
-sys.path.insert(0, str(src_path))
+# src_path = Path(__file__).parent.parent
+# sys.path.insert(0, str(src_path))
 
-from preprocess.create_conll_from_bioc_integrated import EntityLabel
+from labels import BIO_LABELS
 
 import logging
 
@@ -61,7 +63,8 @@ logger.info("Starting NER training script - importing dependencies")
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from transformers.trainer_utils import get_last_checkpoint
 
 from transformers import (
         AutoTokenizer,
@@ -94,18 +97,6 @@ def read_jsonl(path: str) -> List[Dict[str, Any]]:
                 continue
             items.append(json.loads(line))
     return items
-
-
-def create_bio_labels():
-    """Create BIO tagging scheme labels from entity types."""
-    labels = ["O"]  # Outside tag
-
-    # Add B- and I- prefixes for each entity type
-    for entity in EntityLabel:
-        labels.append(f"B-{entity.value}")
-        labels.append(f"I-{entity.value}")
-
-    return labels
 
 
 def build_label_list(train_examples: List[Dict[str, Any]], provided_labels: List[str] = None) -> List[str]:
@@ -194,26 +185,6 @@ class NerDataset(Dataset):
 # Weighted loss Trainer
 # --------------------------
 
-# class WeightedTokenTrainer(Trainer):
-#     def __init__(self, *args, class_weights: torch.Tensor = None, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self.class_weights = class_weights
-#
-#     def compute_loss(self, model, inputs, return_outputs=False):
-#         labels = inputs.get("labels")
-#         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
-#         logits = outputs.get("logits")  # (bsz, seq, num_labels)
-#         # flatten
-#         bsz, seqlen, nlab = logits.shape
-#         loss = F.cross_entropy(
-#             logits.view(-1, nlab),
-#             labels.view(-1),
-#             weight=self.class_weights.to(logits.device) if self.class_weights is not None else None,
-#             ignore_index=-100,
-#             reduction="mean",
-#         )
-#         return (loss, outputs) if return_outputs else loss
-
 
 class WeightedTokenTrainer(Trainer):
     def __init__(self, *args, class_weights: torch.Tensor = None, **kwargs):
@@ -276,22 +247,104 @@ def build_compute_metrics(id2label: Dict[int, str]):
 # Helpers
 # --------------------------
 
-def compute_class_weights(train_ds: NerDataset, num_labels: int, o_id: int, power: float = 0.5, o_weight: float = None) -> torch.Tensor:
-    """Compute inverse-frequency class weights over visible tokens (labels != -100).
-    power in [0..1], lower = more uniform. Optionally override 'O' weight.
-    """
-    counts = torch.zeros(num_labels, dtype=torch.float)
-    for i in range(len(train_ds)):
-        y = train_ds[i]["labels"]
-        for v in y.tolist():
-            if v != -100:
-                counts[v] += 1
-    counts = torch.clamp(counts, min=1.0)
-    inv = (1.0 / counts) ** power
+# def compute_class_weights(train_ds: NerDataset, num_labels: int, o_id: int, power: float = 0.5, o_weight: float = None) -> torch.Tensor:
+#     """Compute inverse-frequency class weights over visible tokens (labels != -100).
+#     power in [0..1], lower = more uniform. Optionally override 'O' weight.
+#     """
+#     counts = torch.zeros(num_labels, dtype=torch.float)
+#     for i in range(len(train_ds)):
+#         y = train_ds[i]["labels"]
+#         for v in y.tolist():
+#             if v != -100:
+#                 counts[v] += 1
+#     counts = torch.clamp(counts, min=1.0)
+#     inv = (1.0 / counts) ** power
+#     weights = inv / inv.mean()
+#     if o_weight is not None:
+#         weights[o_id] = o_weight
+#     return weights
+
+
+PAD_IGNORE = -100  # ignore index
+
+
+def labels_only_collate(batch):
+    # batch: list of dicts, each with a 1D labels tensor/list of len T_i
+    seqs = []
+    for item in batch:
+        lab = item["labels"]
+        if isinstance(lab, list):
+            lab = torch.tensor(lab, dtype=torch.long)
+        elif not torch.is_tensor(lab):
+            lab = torch.as_tensor(lab, dtype=torch.long)
+        else:
+            lab = lab.to(torch.long)
+        seqs.append(lab)
+    # pad to [B, T_max] with -100
+    padded = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=PAD_IGNORE)
+    return {"labels": padded}
+
+
+@torch.no_grad()
+def compute_class_weights_from_loader(loader, num_labels: int, o_id: int,
+                                      power: float = 0.5, o_weight: float | None = None) -> torch.Tensor:
+
+
+    counts = torch.zeros(num_labels, dtype=torch.long)
+    for batch in loader:
+        labels = batch["labels"].view(-1)                  # [B*T]
+        labels = labels[labels != PAD_IGNORE]
+        if labels.numel():
+            counts += torch.bincount(labels, minlength=num_labels)
+    counts = counts.clamp_min(1).float()
+    inv = (1.0 / counts).pow(power)
     weights = inv / inv.mean()
     if o_weight is not None:
         weights[o_id] = o_weight
     return weights
+
+
+def _load_counts_json(path: str) -> Dict[str, float]:
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    # ensure numeric
+    return {str(k): float(v) for k, v in d.items()}
+
+
+def _counts_json_to_weight_tensor(counts_json: Dict[str, float],
+                                  label2id: Dict[str, int],
+                                  power: float = 0.5,
+                                  o_tag: str = "O",
+                                  o_weight: float | None = None,
+                                  smoothing: float = 0.0,
+                                  normalize: bool = True) -> torch.Tensor:
+    """Map counts dict keyed by BIO tag → weight tensor aligned to label2id."""
+    num_labels = max(label2id.values()) + 1
+    counts_vec = torch.zeros(num_labels, dtype=torch.float)
+
+    # put counts into correct indices; unseen labels stay at 0 for now
+    for tag, c in counts_json.items():
+        if tag in label2id:
+            counts_vec[label2id[tag]] = float(c)
+
+    # make sure O exists
+    if o_tag in label2id and counts_vec[label2id[o_tag]] <= 0:
+        counts_vec[label2id[o_tag]] = 0.0
+
+    # smoothing + clamp
+    if smoothing > 0:
+        counts_vec = counts_vec + smoothing
+
+    counts_vec = counts_vec.clamp_min(1.0)
+
+    inv = (1.0 / counts_vec).pow(power)
+    weights = inv / inv.mean() if normalize else inv
+
+    if (o_tag in label2id) and (o_weight is not None):
+        weights[label2id[o_tag]] = float(o_weight)
+
+    return weights
+
 
 
 def save_labels(output_dir: str, labels: List[str]):
@@ -315,7 +368,7 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=1)
     ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--lr", type=float, default=3e-5)
+    ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--warmup_ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--fp16", action="store_true")
@@ -323,12 +376,30 @@ def main():
     # class weighting
     ap.add_argument("--class_weight_power", type=float, default=0.5)
     ap.add_argument("--o_weight", type=float, default=None, help="Override weight for 'O' label (e.g., 0.2)")
+    ap.add_argument("--train_label_counts_json", type=str, default=None,
+                    help="Path to BIO-tag counts JSON (e.g., train_label_counts.json) to compute weights without rescanning.")
+    ap.add_argument("--weights_smoothing", type=float, default=0.0,
+                    help="Laplace smoothing added to counts before inversion (e.g., 0.1).")
+    ap.add_argument("--weights_no_normalize", action="store_true",
+                    help="If set, do not divide weights by mean.")
+
+    # resume/overwrite
+    ap.add_argument("--resume", action="store_true",
+                    help="If set, resume from the latest checkpoint in --output_dir (if any).")
+    ap.add_argument("--resume_from", type=str, default=None,
+                    help="Explicit checkpoint path to resume from (overrides --resume).")
+    ap.add_argument("--overwrite_output_dir", action="store_true",
+                    help="Allow training to proceed even if output_dir exists and is non-empty.")
+
     # mlflow
     ap.add_argument("--mlflow_experiment", type=str, default="ner", help="MLflow experiment name")
     ap.add_argument("--mlflow_tracking_uri", type=str, default="http://localhost:5000",
                     help="MLflow tracking URI; if omitted uses env or local ./mlruns")
     ap.add_argument("--mlflow_tags", type=str, default="",
                     help='Comma-separated tags like: project=mobiko,task=BioDiv-NER')
+
+
+
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -359,11 +430,8 @@ def main():
     logger.info("Loaded %d train and %d valid examples", len(train), len(valid))
 
 
+    labels = BIO_LABELS
 
-
-    # Label list
-    provided = create_bio_labels()
-    labels = build_label_list(train, provided_labels=provided)
     print(labels)
     if "O" not in labels:
         labels = ["O"] + labels
@@ -388,27 +456,62 @@ def main():
     train_ds = NerDataset(train, tokenizer, label2id, max_length=args.max_length)
     valid_ds = NerDataset(valid, tokenizer, label2id, max_length=args.max_length)
 
-    # Class weights
-    weights = compute_class_weights(train_ds, num_labels=len(labels), o_id=label2id["O"], power=args.class_weight_power, o_weight=args.o_weight)
-    label_info = {labels[i]: round(float(w),3) for i,w in enumerate(weights)}
-    logger.info(f"Class weights: {label_info}")
+    # Class weights: prefer precomputed counts JSON if given
+    if args.train_label_counts_json:
+        counts_json = _load_counts_json(args.train_label_counts_json)
+        weights = _counts_json_to_weight_tensor(
+            counts_json,
+            label2id=label2id,
+            power=args.class_weight_power,
+            o_tag="O",
+            o_weight=args.o_weight,
+            smoothing=args.weights_smoothing,
+            normalize=(not args.weights_no_normalize),
+        )
+    else:
+        # fallback: compute by streaming labels from the dataset
+        loader = DataLoader(
+            train_ds, batch_size=2048, num_workers=4,
+            shuffle=False, pin_memory=False, collate_fn=labels_only_collate
+        )
+        weights = compute_class_weights_from_loader(
+            loader, num_labels=len(labels), o_id=label2id["O"],
+            power=args.class_weight_power, o_weight=args.o_weight
+        )
+
+    label_info = {labels[i]: round(float(weights[i]), 6) for i in range(len(labels))}
+    logger.info("Class weights: %s", label_info)
+
 
     # Training args
     targs = TrainingArguments(
         output_dir=args.output_dir,
-        learning_rate=args.lr,
+
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=64,
         gradient_accumulation_steps=args.grad_accum,
+
         num_train_epochs=args.epochs,
         warmup_ratio=args.warmup_ratio,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        optim="adamw_torch",
+        max_grad_norm=1.0,
+        learning_rate=args.lr,
+
+        eval_strategy="steps",
+        eval_steps=500,
+        save_strategy="steps",
+        save_steps=2000,
+        save_total_limit=3,                 # keep last 3 checkpoints
+        logging_steps=500,
+        logging_first_step=True,
         load_best_model_at_end=True,
+        overwrite_output_dir=args.overwrite_output_dir,
+
         metric_for_best_model="f1",
         greater_is_better=True,
         fp16=args.fp16,
-        logging_steps=50,
         seed=args.seed,
         dataloader_drop_last=False,
         report_to=["mlflow"],
@@ -428,9 +531,8 @@ def main():
         tokenizer=tokenizer,
         compute_metrics=build_compute_metrics(id2label),
         class_weights=weights,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.0)],
     )
-
-    trainer.add_callback(MLflowCallback())
 
     logger.info("Starting training")
 
@@ -465,8 +567,9 @@ def main():
             mlflow.log_text(json.dumps(label2id, indent=2), "artifacts/label2id.json")
         except Exception:
             pass
+
         try:
-            mlflow.log_text(json.dumps(class_weights_dict, indent=2), "artifacts/class_weights.json")
+            mlflow.log_text(json.dumps(label_info, indent=2), "artifacts/class_weights.json")
         except Exception:
             pass
 
@@ -480,9 +583,25 @@ def main():
         except Exception:
             pass
 
+        # resume logic
+        resume_path = None
+        if args.resume_from:
+            resume_path = args.resume_from
+        elif args.resume:
+            # If user asked to resume, auto-pick the last checkpoint in output_dir (if any)
+            try:
+                resume_path = get_last_checkpoint(args.output_dir)
+            except Exception:
+                resume_path = None
+
+        if resume_path:
+            logger.info("Resuming training from checkpoint: %s", resume_path)
+        else:
+            logger.info("No resume checkpoint requested/found; starting fresh training.")
+
 
         # --- Train as usual (HF will stream loss/metrics to MLflow) ---
-        train_result = trainer.train()
+        train_result = trainer.train(resume_from_checkpoint=resume_path)
 
         # Log final eval (HF will already log epoch metrics; we also dump a final JSON for convenience)
         try:
