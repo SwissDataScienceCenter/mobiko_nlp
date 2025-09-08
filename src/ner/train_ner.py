@@ -318,30 +318,43 @@ def _counts_json_to_weight_tensor(counts_json: Dict[str, float],
                                   o_weight: float | None = None,
                                   smoothing: float = 0.0,
                                   normalize: bool = True) -> torch.Tensor:
-    """Map counts dict keyed by BIO tag → weight tensor aligned to label2id."""
+    """
+    Compute weights at the ENTITY TYPE level (e.g., TAXON, HABITAT, ...)
+    and assign the same weight to both B-TYPE and I-TYPE.
+    'O' is set via o_weight (defaults to 1.0 if not provided).
+    """
     num_labels = max(label2id.values()) + 1
-    counts_vec = torch.zeros(num_labels, dtype=torch.float)
+    weights = torch.ones(num_labels, dtype=torch.float)
 
-    # put counts into correct indices; unseen labels stay at 0 for now
+    # 1) Aggregate counts per TYPE (ignore BIO prefix; ignore 'O')
+    type_counts: Dict[str, float] = {}
     for tag, c in counts_json.items():
-        if tag in label2id:
-            counts_vec[label2id[tag]] = float(c)
+        if tag == o_tag:
+            continue
+        typ = tag.split("-", 1)[-1] if "-" in tag else tag
+        type_counts[typ] = type_counts.get(typ, 0.0) + float(c)
 
-    # make sure O exists
-    if o_tag in label2id and counts_vec[label2id[o_tag]] <= 0:
-        counts_vec[label2id[o_tag]] = 0.0
+    # 2) Inverse-frequency weight per TYPE (with smoothing + clamp)
+    type_weights: Dict[str, float] = {}
+    for typ, cnt in type_counts.items():
+        cnt = max(cnt + smoothing, 1.0)
+        type_weights[typ] = (1.0 / cnt) ** power
 
-    # smoothing + clamp
-    if smoothing > 0:
-        counts_vec = counts_vec + smoothing
+    # 3) Normalize TYPE weights to mean=1 (optional)
+    if normalize and type_weights:
+        mean_w = sum(type_weights.values()) / len(type_weights)
+        if mean_w > 0:
+            for typ in type_weights:
+                type_weights[typ] /= mean_w
 
-    counts_vec = counts_vec.clamp_min(1.0)
-
-    inv = (1.0 / counts_vec).pow(power)
-    weights = inv / inv.mean() if normalize else inv
-
-    if (o_tag in label2id) and (o_weight is not None):
-        weights[label2id[o_tag]] = float(o_weight)
+    # 4) Populate tensor for every label id
+    for lab, idx in label2id.items():
+        if lab == o_tag:
+            w = float(o_weight) if o_weight is not None else 1.0
+        else:
+            typ = lab.split("-", 1)[-1] if "-" in lab else lab
+            w = type_weights.get(typ, 1.0)
+        weights[idx] = float(w)
 
     return weights
 
@@ -456,6 +469,8 @@ def main():
     train_ds = NerDataset(train, tokenizer, label2id, max_length=args.max_length)
     valid_ds = NerDataset(valid, tokenizer, label2id, max_length=args.max_length)
 
+
+
     # Class weights: prefer precomputed counts JSON if given
     if args.train_label_counts_json:
         counts_json = _load_counts_json(args.train_label_counts_json)
@@ -498,6 +513,7 @@ def main():
         optim="adamw_torch",
         max_grad_norm=1.0,
         learning_rate=args.lr,
+        label_smoothing_factor=0.1,
 
         eval_strategy="steps",
         eval_steps=500,
@@ -531,7 +547,7 @@ def main():
         tokenizer=tokenizer,
         compute_metrics=build_compute_metrics(id2label),
         class_weights=weights,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.0)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5, early_stopping_threshold=0.0)],
     )
 
     logger.info("Starting training")
