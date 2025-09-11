@@ -667,6 +667,87 @@ def extract_records_from_sentence_format(article: Dict[str, Any],
     return records
 
 
+def extract_records_from_manual_format(article, rules, gaz_matcher=None):
+    """ Hanadle manual annotation format with 'sentences' """
+    records = []
+
+    for s in article.get("sentences", []):
+        text = s.get("text") or ""
+        spans: List[Dict[str, Any]] = []
+
+        for a in s.get('spans'):
+            sources = a.get("sources", []) # manually annoated file has more than 1 source per identical span (why?)
+            best_label = None
+            best_infons = None
+            label = None
+
+            for source in sources:
+                infons = {
+                    "concept_source": source.get("source", ""),
+                    "concept_id": source.get("source_id", "")
+                }
+                label = apply_rules(infons, rules)
+
+                if label is None:
+                    label = default_label(infons)
+
+                if label is not None:
+                    best_label = label
+                    best_infons = infons
+                    break
+
+            label = best_label
+            infons = best_infons
+
+            if not label:
+                continue
+
+            start = int(a.get("start_char", 0))
+            end = int(a.get("end_char", 0))
+
+            # Validate boundaries against this sentence text
+            if start < 0 or end <= start or end > len(text):
+                continue
+
+            spans.append({
+                "start": start,
+                "end": end,
+                "text": text[start:end],
+                "label": label,
+
+                # --- added metadata ---
+                "concept_source": infons.get("concept_source"),
+                "concept_id": infons.get("concept_id"),
+            })
+
+        # Optional gazetteer augmentation
+        if gaz_matcher is not None and text:
+            gaz_spans = gaz_matcher(text)
+            spans = merge_spans(spans, gaz_spans)
+        else:
+            spans.sort(key=lambda s: (s["start"], -(s["end"] - s["start"])))
+
+        # Tokenize + BIO
+        tokens, token_spans = simple_whitespace_tokenize(text)
+        tags = [O_TAG] * len(tokens)
+        for sp in spans:
+            assign_bio_tags(tags, sp["start"], sp["end"], sp["label"], token_spans)
+        repair_bio_tags(tags)
+
+        # Validate consistency
+        assert len(tags) == len(tokens), f"Tag/token length mismatch: {len(tags)} vs {len(tokens)}"
+
+        records.append({
+            "doc_id": article.get("id") or article.get("doc_id") or "",
+            "text": text,
+            "tokens": tokens,
+            "spans": spans,
+            "tags": tags,
+        })
+
+    return records
+
+
 # --- LEGACY FORMAT: 'passages' with embedded annotations/locations ---
 def extract_records_from_legacy_passages(article, rules, gaz_matcher=None):
     """Handle BioC JSON with 'passages' (legacy structure)."""
@@ -698,7 +779,7 @@ def extract_records_from_legacy_passages(article, rules, gaz_matcher=None):
     return records
 
 
-def process_json_file(json_path: Path, rules: List[Rule],
+def process_json_file(json_path: Path, rules: List[Rule], manual=False,
                      gaz_matcher=None, tokenizer=None) -> List[Dict[str, Any]]:
     """Process a single JSON file and return records for either 'passages' or 'sentences' format."""
     try:
@@ -717,8 +798,11 @@ def process_json_file(json_path: Path, rules: List[Rule],
 
         # New format: sentences + flat annotations
         if article.get("sentences") and isinstance(article.get("sentences"), list):
-            recs = extract_records_from_sentence_format(article, rules, gaz_matcher=gaz_matcher)
-            # Ensure doc_id present
+            if manual:
+                recs = extract_records_from_manual_format(article, rules, gaz_matcher=gaz_matcher)
+            else:
+                recs = extract_records_from_sentence_format(article, rules, gaz_matcher=gaz_matcher)
+                # Ensure doc_id present
             for r in recs:
                 if not r.get("doc_id"):
                     r["doc_id"] = doc_id
@@ -842,7 +926,7 @@ def main():
     parser.add_argument("--stats_out", default=None,
                     help="Write a JSON file with split-level stats (coverage, distributions)")
     parser.add_argument("--stats_bio", action="store_true", help="Also include BIO tag distribution")
-
+    parser.add_argument("--manual", action="store_true", help="Input uses manual annotation format")
     args = parser.parse_args()
 
     # Configure logging
@@ -878,6 +962,7 @@ def main():
                 try:
                     records = process_json_file(
                         json_path, rules,
+                        manual=args.manual,
                         gaz_matcher=gaz_matcher,
                         tokenizer=tokenizer
                     )
