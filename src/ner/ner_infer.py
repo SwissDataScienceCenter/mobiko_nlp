@@ -6,6 +6,7 @@ import torch
 from transformers import (
     AutoTokenizer, AutoConfig, AutoModelForTokenClassification, DataCollatorForTokenClassification
 )
+import torch.nn.functional as F
 
 
 def _best_device():
@@ -102,6 +103,10 @@ class NerInferencer:
             self.labels = ["O"] + self.labels
         self.label2id = {l:i for i,l in enumerate(self.labels)}
         self.id2label = {i:l for l,i in self.label2id.items()}
+        self.o_id = self.label2id["O"]
+        self.num_labels = len(self.labels)
+        self._entity_mask = torch.ones(self.num_labels, dtype=torch.bool)
+        self._entity_mask[self.o_id] = False
 
         self.device = _best_device()
         self.tok = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
@@ -136,11 +141,44 @@ class NerInferencer:
         torch.backends.cudnn.benchmark = True
 
 
+    def _predict_ids_with_threshold(
+            self,
+            logits: torch.Tensor,
+            entity_threshold: float | None = None,
+    ) -> list[list[int]]:
+        """
+        logits: [B, T, C] (same dtype/device as model output)
+        entity_threshold:
+          - None  -> plain argmax over all labels
+          - float -> choose max over entity labels; if max_entity_prob <= thr => 'O'
+        """
+        if entity_threshold is None:
+            return logits.argmax(dim=-1).to("cpu").tolist()
+
+        # clone mask to logits device once
+        entity_mask = self._entity_mask.to(logits.device)
+
+        # probs in float32 for numerical stability (keeps bf16 speed for matmuls; softmax cast is cheap)
+        probs = F.softmax(logits.to(torch.float32), dim=-1)  # [B,T,C]
+        entity_probs = probs[..., entity_mask]  # [B,T,C-1]
+        max_entity_prob, max_entity_idx = entity_probs.max(dim=-1)  # [B,T]
+
+        # map entity argmax indices back to original label ids
+        entity_ids = torch.arange(self.num_labels, device=logits.device)[entity_mask]  # [C-1]
+        chosen_entity_ids = entity_ids[max_entity_idx]  # [B,T]
+
+        # threshold: if max_entity_prob <= thr => O
+        o_tensor = torch.full_like(chosen_entity_ids, fill_value=self.o_id)
+        pred_ids = torch.where(max_entity_prob > entity_threshold, chosen_entity_ids, o_tensor)
+        return pred_ids.to("cpu").tolist()
+
+
     def predict_word_tags_for_tokenized(
         self,
         records: List[Dict[str, Any]],
         batch_size: int = 128,
-        max_length: int = 256
+        max_length: int = 256,
+        entity_threshold: float | None = None,
     ) -> List[List[str]]:
         """
         records: [{"tokens":[..]}, ...]  →  BIO word-level tags per record
@@ -165,7 +203,7 @@ class NerInferencer:
             batch = self.collator(sample_dicts[i:i+batch_size])
             batch = {k: v.to(self.model.device, non_blocking=True) for k,v in batch.items()}
             out = self.model(**batch)
-            pred_ids = out.logits.argmax(dim=2).to("cpu").tolist()
+            pred_ids = self._predict_ids_with_threshold(out.logits, entity_threshold)
             preds.extend(pred_ids)
 
         # Need word_ids to collapse subtokens → words
@@ -186,7 +224,8 @@ class NerInferencer:
         self,
         sentences: List[str],
         batch_size: int = 128,
-        max_length: int = 256
+        max_length: int = 256,
+        entity_threshold: float | None = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         sentences: [str]  →  list of span dicts per sentence (char indices)
@@ -212,8 +251,8 @@ class NerInferencer:
             batch = self.collator(sample_dicts[i:i+batch_size])
             batch = {k: v.to(self.model.device, non_blocking=True) for k,v in batch.items()}
             out = self.model(**batch)
-            logits = out.logits.detach().cpu().numpy()
-            preds.extend(list(np.argmax(logits, axis=2)))
+            pred_ids = self._predict_ids_with_threshold(out.logits, entity_threshold)
+            preds.extend(pred_ids)
 
         # collapse to word-level tags, then BIO→spans with the original offsets
         enc2 = self.tok(
