@@ -1,0 +1,728 @@
+import os
+import sys
+import json
+import time
+import argparse
+from pathlib import Path
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional, Any
+import threading
+import torch
+import torch.nn.functional as F
+
+import subprocess
+import runpy
+from pathlib import Path
+import numpy as np
+
+from transformers import AutoTokenizer, AutoConfig, AutoModelForTokenClassification, DataCollatorForTokenClassification
+
+
+import spacy
+from openai import OpenAI
+
+src_path = Path(__file__).parent.parent
+sys.path.insert(0, str(src_path))
+
+from ner.labels import EntityLabel, build_bio_labels
+from ner.ner_infer import NerInferencer
+
+from prompts import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT, NER_AWARE_SYSTEM_PROMPT
+
+
+
+
+# Model configurations
+MODEL_CONFIGS = {
+    "qwen3-4B": {
+        "base_url": "https://qwen3-4b-instruct.runai-mobiko-anisia.inference.compute.datascience.ch/v1",
+        "api_key": "EMPTY",
+        "model_name": "Qwen/Qwen3-4B-Instruct-2507"
+    },
+    "qwen3-32B": {
+        "base_url": "https://openwebui.runai-codev-llm.inference.compute.datascience.ch/api",
+        "api_key": None,  # Will use OPEN_WEB_UI_API_KEY env var
+        "model_name": "Qwen/Qwen3-32B-AWQ"
+    },
+    "medgemma-4b": {
+        "base_url": "http://medgemma-4b-it.runai-mobiko-anisia.inference.compute.datascience.ch",
+        "api_key": "EMPTY",
+        "model_name": "google/medgemma-4b-it"
+    },
+    "biomistral-7b-awq": {
+        "base_url": "https://mistral-7b-awq.runai-mobiko-anisia.inference.compute.datascience.ch/v1",
+        "api_key": "EMPTY",
+        "model_name": "BioMistral/BioMistral-7B-AWQ-QGS128-W4-GEMM"
+    },
+    "gpt4o": {
+        "base_url": "https://api.openai.com/v1",
+        "api_key": None,  # Will use OPENAI_API_KEY env var
+        "model_name": "gpt-4o"
+    },
+}
+
+
+
+# Thread-local storage for spaCy models
+thread_local = threading.local()
+
+
+_ws = re.compile(r"\s+")
+
+
+def _ws_tokenize_with_offsets(text: str):
+    """
+    Whitespace tokenization with character offsets.
+    Returns (tokens, token_spans) where token_spans[i] = (start_char, end_char).
+    """
+    tokens, spans = [], []
+    pos = 0
+    while True:
+        m = _ws.search(text, pos)
+        end = m.start() if m else len(text)
+        if end > pos:  # non-empty
+            tokens.append(text[pos:end])
+            spans.append((pos, end))
+        if not m:
+            break
+        pos = m.end()
+    return tokens, spans
+
+
+def _bio_from_ids_to_spans(tags: List[str], token_spans: List[tuple], text: str):
+    """
+    Map BIO word tags → sentence-level char spans using precomputed token spans.
+    """
+    spans, active_type, start_i = [], None, None
+    for i, tag in enumerate(tags):
+        if not tag or tag == "O":
+            if active_type is not None:
+                s, _ = token_spans[start_i]; _, e = token_spans[i-1]
+                spans.append({"start_char": s, "end_char": e, "text": text[s:e], "type": active_type})
+                active_type, start_i = None, None
+            continue
+        if "-" in tag:
+            pref, typ = tag.split("-", 1)
+        else:
+            pref, typ = "B", tag
+        if pref == "B" or (active_type and typ != active_type):
+            if active_type is not None:
+                s, _ = token_spans[start_i]; _, e = token_spans[i-1]
+                spans.append({"start_char": s, "end_char": e, "text": text[s:e], "type": active_type})
+            active_type, start_i = typ, i
+    if active_type is not None:
+        s, _ = token_spans[start_i]; _, e = token_spans[len(token_spans)-1]
+        spans.append({"start_char": s, "end_char": e, "text": text[s:e], "type": active_type})
+    return spans
+
+
+def get_openai_client(model_type: str):
+    config = MODEL_CONFIGS.get(model_type)
+    if not config:
+        raise ValueError(f"Unknown model type: {model_type}. Use: {list(MODEL_CONFIGS.keys())}")
+
+    api_key = config["api_key"] or os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_WEB_UI_API_KEY")
+    if not api_key:
+        raise ValueError(f"API key required for {model_type}. Set OPENAI_API_KEY or OPEN_WEB_UI_API_KEY environment variable.")
+
+    return OpenAI(
+                base_url=config["base_url"],
+                api_key=api_key
+                ), config["model_name"]
+
+
+def get_spacy_model(model_name: str):
+    """Get thread-local spaCy model for parallel processing."""
+    if not hasattr(thread_local, 'nlp'):
+        thread_local.nlp = spacy.load(model_name)
+    return thread_local.nlp
+
+
+def read_txt_files(indir: str):
+    for name in os.listdir(indir):
+        if not name.endswith(".txt"):
+            continue
+        path = os.path.join(indir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            yield os.path.splitext(name)[0], f.read()
+
+
+def find_span_positions(text: str, span_text: str):
+    """
+    Find all positions of span_text in text using regex.
+    Returns list of (start, end) tuples for all matches.
+    """
+    # Escape special regex characters in the span text
+    escaped_span = re.escape(span_text.strip())
+
+    # Find all matches (case-insensitive, word boundaries optional)
+    matches = []
+    for match in re.finditer(escaped_span, text, re.IGNORECASE):
+        start, end = match.span()
+        matches.append((start, end))
+
+    return matches
+
+
+def fix_span_indices(spans: list, sentence_text: str) -> List[Dict]:
+    """
+    Fix span indices using regex matching.
+    Returns updated spans with correct start_char and end_char.
+    """
+
+    fixed_spans = []
+    for span in spans:
+        span_text = span.get("text", "").strip()
+        if not span_text:
+            continue
+
+        positions = find_span_positions(sentence_text, span_text)
+        if positions:
+            # Use the first available position
+            start, end = positions[0]
+            fixed_span = dict(span)
+            fixed_span["start_char"] = start
+            fixed_span["end_char"] = end
+            fixed_span["text"] = sentence_text[start:end]  # Use actual text from sentence
+            fixed_spans.append(fixed_span)
+        else:
+            # Span text not found in sentence - log warning but keep original
+            print(f"WARNING: Could not find span '{span_text}' in sentence: {sentence_text}")
+            fixed_span = dict(span)
+            fixed_span["start_char"] = 0
+            fixed_span["end_char"] = 0
+            fixed_span["text"] = span_text
+            fixed_spans.append(fixed_span)
+
+    return fixed_spans
+
+
+def remove_thinking_blocks(content: str) -> str:
+    # Remove <think>...</think> blocks (including nested content)
+    pattern = r'<think>.*?</think>'
+    cleaned = re.sub(pattern, '', content, flags=re.DOTALL)
+
+    # Clean up extra whitespace
+    cleaned = cleaned.strip()
+
+    # If content starts with ```json, extract just the JSON part
+    if cleaned.startswith('```json'):
+        # Find the JSON block
+        start = cleaned.find('```json') + 7
+        end = cleaned.rfind('```')
+        if end > start:
+            cleaned = cleaned[start:end].strip()
+
+    return cleaned
+
+
+def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict]) -> List[Dict]:
+    """Process multiple LLM requests efficiently."""
+    results = []
+
+    # Configure model-specific parameters
+    if model_type in ["qwen3-32B", "gpt4o"]:
+        max_tokens = 1024
+    else:
+        max_tokens = 500
+
+
+    for req in requests:
+        sentence = req["sentence"]
+        candidates = req.get("candidates")
+
+        if candidates is None:
+            system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
+            user_payload = {"sentence": sentence}
+        else:
+            # Determine whether candidates include NER-proposed types
+            has_types = any("type" in c and c["type"] for c in candidates)
+            if has_types:
+                # NER-aware path: include proposed_type
+                system_prompt = NER_AWARE_SYSTEM_PROMPT
+                cand_objs = []
+                for c in candidates:
+                    obj = {
+                        "text": c["text"].strip(),
+                        "start_char": c["start_char"],
+                        "end_char": c["end_char"],
+                        "proposed_type": c.get("type", None)
+                    }
+                    cand_objs.append(obj)
+                user_payload = {"sentence": sentence, "candidates": cand_objs}
+            else:
+                # Legacy chunks path: no types proposed
+                system_prompt = DEFAULT_SYSTEM_PROMPT
+                cand_objs = [
+                    {"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]}
+                    for c in candidates
+                ]
+                user_payload = {"sentence": sentence, "candidates": cand_objs}
+
+
+        # Modify system prompt for Qwen 32B
+        if model_type == "qwen3-32B":
+            system_prompt = f"<no_think/>\n\n{system_prompt}"
+
+        full_prompt = f"{system_prompt}\n\nUser input: {json.dumps(user_payload, ensure_ascii=False)}"
+
+        try:
+            print(f'Sending LLM request for sentence: {sentence[:50]}... with {len(candidates) if candidates else 0} candidates')
+
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": full_prompt}],
+                temperature=0.0,
+                max_tokens=max_tokens,
+                timeout=360
+
+            )
+            # print('Response', response)
+
+            content = response.choices[0].message.content
+
+            # Postprocess content for Qwen 32B to remove thinking blocks
+            if model_type == "qwen3-32B" or model_type == "gpt4o":
+                content = remove_thinking_blocks(content)
+
+            llm_result = json.loads(content)
+
+            # Fix indices for all span categories
+            for category in ["accepted", "missing", "rejected"]:
+                if category in llm_result:
+                    llm_result[category] = fix_span_indices(
+                        llm_result[category], sentence)
+
+            results.append(llm_result)
+
+        except Exception as e:
+            print(f"Error calling LLM for sentence: {sentence[:50]}...: {e}")
+            results.append({
+                "accepted": [], "rejected": [], "missing": [],
+                "notes": f"llm_error: {repr(e)}"
+            })
+
+    return results
+
+
+def process_with_chunks(sent):
+    """Extract noun phrase candidates from sentence"""
+    cands = []
+    for np in sent.noun_chunks:
+        if np.root.pos_ not in ("NOUN", "PROPN"):
+            continue
+        np_text = np.text.strip()
+        if not np_text:
+            continue
+
+        cands.append({
+            "start_char": np.start_char,
+            "end_char": np.end_char,
+            "text": np_text
+        })
+    return cands
+
+
+# def process_sentences_batch(sentence_batch: List[str], spacy_model: str, use_chunks: bool) -> List[Dict]:
+#     """Process a batch of sentences with spaCy."""
+#     nlp = get_spacy_model(spacy_model)
+#
+#     # Process multiple sentences at once for better performance
+#     docs = list(nlp.pipe(sentence_batch))
+#
+#     batch_results = []
+#     for sent_text, sent_doc in zip(sentence_batch, docs):
+#         if use_chunks:
+#             cands = process_with_chunks(sent_doc)
+#             if not cands:
+#                 continue
+#             batch_results.append({
+#                 "sentence": sent_text,
+#                 "candidates": cands
+#             })
+#         else:
+#             batch_results.append({
+#                 "sentence": sent_text,
+#                 "candidates": None
+#             })
+#     print(f'Processed {len(batch_results)} sentences with spaCy (use_chunks={use_chunks})')
+#     return batch_results
+
+
+def _load_labels_from_model(model_dir):
+    config_path = os.path.join(model_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if "id2label" in cfg:
+            # ensure sorted by id
+            id2label = {int(k): v for k, v in cfg["id2label"].items()}
+            return [id2label[i] for i in sorted(id2label.keys())]
+        if "label2id" in cfg:
+            label2id = {k: int(v) for k, v in cfg["label2id"].items()}
+            return [lab for lab, _ in sorted(label2id.items(), key=lambda kv: kv[1])]
+    # Fallback to your provided set if config lacks labels
+    provided = build_bio_labels()
+    return sorted(provided)
+
+
+# def _load_ner(model_dir: str):
+#     labels = _load_labels_from_model(model_dir)
+#     label2id = {l:i for i,l in enumerate(labels)}
+#     id2label = {i:l for l,i in label2id.items()}
+#
+#     tok = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+#     cfg = AutoConfig.from_pretrained(model_dir, num_labels=len(labels), id2label=id2label, label2id=label2id,
+#                                      return_dict=True)
+#     model = AutoModelForTokenClassification.from_pretrained(model_dir, config=cfg)
+#     model.eval()
+#
+#     if torch.cuda.is_available():
+#         model.to("cuda")
+#     collator = DataCollatorForTokenClassification(tok, padding=True)
+#     return tok, model, collator, id2label, label2id
+
+
+def _load_ner(model_dir: str):
+    # Backwards-compat shim if other code relies on this name
+    infer = NerInferencer(model_dir, dtype="auto")
+    return infer
+
+
+def process_sentences_batch_new(
+    sentence_batch: List[str],
+    spacy_model: str,
+    use_chunks: bool,
+    candidates_from: str = "ner",
+    ner_runtime: Optional["NerInferencer"] = None,
+    ner_max_length: int = 512,
+    ner_runtime_batch_size: int = 64,
+) -> List[Dict[str, Any]]:
+    """
+    Build candidates for a batch of sentences.
+
+    When candidates_from == "ner", this uses a shared NerInferencer to produce
+    BIO→char spans (with types) directly from the NER model, so the same runtime
+    is used across pipeline and eval.
+
+    Returns:
+        List[{"sentence": <str>, "candidates": List[{"start_char": int,
+                                                     "end_char": int,
+                                                     "text": str,
+                                                     "type": str}]}]
+        for NER mode. For other modes, keep your previous structure.
+    """
+    batch_results: List[Dict[str, Any]] = []
+
+    if candidates_from == "chunks" and use_chunks:
+        nlp = get_spacy_model(spacy_model)
+        docs = list(nlp.pipe(sentence_batch))
+        for sent_text, sent_doc in zip(sentence_batch, docs):
+            cands = process_with_chunks(sent_doc)
+            if not cands:
+                continue
+            batch_results.append({"sentence": sent_text, "candidates": cands})
+        print(f'Processed {len(batch_results)} sentences with spaCy chunks')
+        return batch_results
+
+    if candidates_from == "ner":
+        if ner_runtime is None:
+            raise ValueError(
+                "NER candidates requested but ner_runtime is None. "
+                "Initialize with NerInferencer(model_dir) and pass it in."
+            )
+
+        spans_lists = ner_runtime.predict_spans_for_sentences(
+            sentences=sentence_batch,
+            batch_size=ner_runtime_batch_size,
+            max_length=ner_max_length,
+            entity_threshold=0.2
+        )
+
+        for sent_text, spans in zip(sentence_batch, spans_lists):
+            # spans: [{"start_char":..., "end_char":..., "text":..., "type":...}]
+            batch_results.append({"sentence": sent_text, "candidates": spans})
+        return batch_results
+
+    # candidates_from == "none"
+    for sent_text in sentence_batch:
+        batch_results.append({"sentence": sent_text, "candidates": None})
+    print(f'Processed {len(batch_results)} sentences without candidates')
+    return batch_results
+
+
+def process_sentences_batch(
+    sentence_batch: List[str],
+    spacy_model: str,
+    use_chunks: bool,
+    candidates_from: str = "ner",
+    ner_runtime: Optional[tuple] = None,
+    ner_max_length: int = 512,
+    ner_runtime_batch_size: int = 64,
+) -> List[Dict]:
+    """
+    Process a batch with spaCy, then:
+      - if use_chunks=True and candidates_from='chunks': noun-chunk candidates
+      - if candidates_from='ner': HF NER spans (BIO->char spans)
+      - if candidates_from='none': no candidates
+    Returns [{"sentence": str, "candidates": List[span] or None}, ...] as before. :contentReference[oaicite:1]{index=1}
+    """
+    batch_results: List[Dict[str, Any]] = []
+
+    if candidates_from == "chunks" and use_chunks:
+        nlp = get_spacy_model(spacy_model)
+        docs = list(nlp.pipe(sentence_batch))
+        for sent_text, sent_doc in zip(sentence_batch, docs):
+            cands = process_with_chunks(sent_doc)
+            if not cands:
+                continue
+            batch_results.append({"sentence": sent_text, "candidates": cands})
+        print(f'Processed {len(batch_results)} sentences with spaCy chunks')
+        return batch_results
+
+    if candidates_from == "ner":
+        if ner_runtime is None:
+            raise ValueError("NER requested but ner_runtime is None (call _load_ner in main and pass it in).")
+        tok, mdl, collator, id2label, label2id = ner_runtime
+
+
+        # 1) whitespace-tokenize all sentences and keep offsets
+        tokenized = []
+        for sent in sentence_batch:
+            words, spans = _ws_tokenize_with_offsets(sent)
+            tokenized.append((sent, words, spans))
+
+        # 2) encode pre-tokenized words (is_split_into_words=True)
+        enc_inputs, word_maps = [], []
+        for _, words, _ in tokenized:
+            enc = tok(
+                words,
+                is_split_into_words=True,
+                truncation=True,
+                padding="max_length",
+                max_length=ner_max_length,
+                return_offsets_mapping=False
+            )
+
+
+            enc_inputs.append({k: enc[k] for k in enc.keys()})
+
+            word_maps.append(enc.word_ids())
+
+        # 3) run model in mini-batches
+        preds = []
+        for i in range(0, len(enc_inputs), ner_runtime_batch_size):
+            chunk = enc_inputs[i:i + ner_runtime_batch_size]
+            batch = collator(chunk)
+            # --- make sure we have a dict of tensors ---
+            if isinstance(batch, tuple):
+                # should not happen with HF collators, but be defensive
+                batch = batch[0]
+            if not isinstance(batch, dict):
+                batch = dict(batch)
+
+            # --- move to device correctly (use .items() !) ---
+            if torch.cuda.is_available():
+                batch = {k: v.to("cuda") for k, v in batch.items()}
+
+            # --- forward pass; support both tuple and ModelOutput ---
+            with torch.no_grad():
+                outputs = mdl(**batch)
+
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            # pred_ids = np.argmax(logits.detach().cpu().numpy(), axis=2)
+            # preds.extend(list(pred_ids))
+
+            probs = F.softmax(logits, dim=-1)  # [B, T, C]
+            entity_ids = [i for i, l in id2label.items() if l != "O"]
+
+            pred_ids = []
+            for batch_probs in probs:  # per sequence
+                seq_preds = []
+                for tok_probs in batch_probs:  # per token
+                    p_entity = tok_probs[entity_ids].max()
+                    if p_entity > 0.2:  # threshold (tune this)
+                        seq_preds.append(entity_ids[torch.argmax(tok_probs[entity_ids])])
+                    else:
+                        seq_preds.append(label2id["O"])
+                pred_ids.append(seq_preds)
+
+            # if torch.cuda.is_available():
+            #     batch = {k: v.to("cuda") for k, v in batch.items()}
+            # logits = mdl(**batch).logits.detach().cpu().numpy()  # [B,T,C]
+            # preds.extend(list(np.argmax(logits, axis=2)))
+
+        # 4) subword->word: first-subword tag wins
+        word_tags_all = []
+        for pred_ids, wids in zip(preds, word_maps):
+            tags, seen = [], set()
+            for pid, wid in zip(pred_ids, wids):
+                if wid is None:
+                    continue
+                if wid not in seen:
+                    tags.append(id2label[int(pid)])
+                    seen.add(wid)
+            word_tags_all.append(tags)
+
+        # 5) BIO → spans with offsets (no string search)
+        for (sent, words, spans), tags in zip(tokenized, word_tags_all):
+            if len(tags) < len(words):
+                tags = tags + ["O"] * (len(words) - len(tags))
+            elif len(tags) > len(words):
+                tags = tags[:len(words)]
+            cand_spans = _bio_from_ids_to_spans(tags, spans, sent)
+            batch_results.append({"sentence": sent, "candidates": cand_spans})
+        return batch_results
+
+    # candidates_from == "none"
+    for sent_text in sentence_batch:
+        batch_results.append({"sentence": sent_text, "candidates": None})
+    print(f'Processed {len(batch_results)} sentences without candidates')
+    return batch_results
+
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
+    ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
+    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq"], default="gpt4o", help="LLM model to use")
+    ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
+    ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
+    ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
+    ap.add_argument("--batch_size", type=int, default=10, help="Batch size for processing")
+    ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
+
+    # ==== Candidate source switch ====
+    ap.add_argument("--candidates_from", choices=["chunks", "ner"], default="ner",
+                    help="Generate LLM candidates from spaCy noun chunks or NER predictions.")
+
+    # ==== BioC preparation ====
+    ap.add_argument("--input_bioc", type=str, default=None,
+                    help="Path to a BioC XML/JSON file. If set, we will reuse create_conll_from_bioc_integrated to prepare inputs.")
+    ap.add_argument("--prepared_conll_jsonl", type=str, default=None,
+                    help="Where to write/read the prepared CoNLL-style JSONL for NER.")
+    ap.add_argument("--prepared_txt_dir", type=str, default=None,
+                    help="Where to write/read prepared TXT sentences for spaCy chunker.")
+    ap.add_argument("--schema_csv", type=str, default=None,
+                    help="Optional schema CSV passed to the converter.")
+    ap.add_argument("--envo_gazetteer_csv", type=str, default=None,
+                    help="Optional ENVO gazetteer CSV passed to the converter.")
+    ap.add_argument("--prefer_spacy", action="store_true",
+                    help="Prefer spaCy PhraseMatcher inside the converter.")
+
+    # ==== NER path params ====
+    ap.add_argument("--input_jsonl", type=str, default=None,
+                    help="CoNLL-style JSONL (from converter) for NER path.")
+    ap.add_argument("--ner_model_dir", type=str, default=None,
+                    help="HF token classification model directory (must contain labels.txt).")
+    ap.add_argument("--ner_batch_size", type=int, default=16)
+    ap.add_argument("--ner_max_length", type=int, default=512)
+
+
+    # ==== spaCy chunker params ===
+    ap.add_argument("--spacy_model", default="en_core_web_trf", help="spaCy model (needs parser for noun_chunks)")
+
+
+    args = ap.parse_args()
+
+    # Initialize LLM client
+    try:
+        client, model_name = get_openai_client(args.model_type)
+        print(f"Using {args.model_type} model: {model_name}")
+    except Exception as e:
+        print(f"Error initializing {args.model_type} client: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate spaCy model
+    if args.use_chunks:
+        try:
+            test_nlp = spacy.load(args.spacy_model)
+            if "parser" not in test_nlp.pipe_names:
+                print("WARNING: spaCy parser not enabled; noun_chunks may be empty.", file=sys.stderr)
+        except OSError:
+            print(f"spaCy model '{args.spacy_model}' not found. Install with: python -m spacy download {args.spacy_model}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+
+    Path(os.path.dirname(args.out_jsonl) or ".").mkdir(parents=True, exist_ok=True)
+
+    # NER runtime (loaded once)
+    ner_runtime = None
+    if args.candidates_from == "ner":
+        if not args.ner_model_dir:
+            print("Provide --ner_model_dir for candidates_from=ner", file=sys.stderr)
+            sys.exit(1)
+        ner_runtime = _load_ner(args.ner_model_dir)
+
+
+    docs_written = 0
+
+    with open(args.out_jsonl, "w", encoding="utf-8") as fout:
+        for doc_id, text in read_txt_files(args.in_dir):
+            if docs_written > 1:  # Debug limit
+                break
+
+            # Split text into lines (one sentence per line)
+            lines = text.strip().split('\n')
+            sentences = [line.strip() for line in lines if line.strip()]
+
+            out_sents = []
+            print(f"Processing {len(sentences)} sentences from lines")
+
+            total_batches = (len(sentences) + args.batch_size - 1) // args.batch_size
+
+            for bidx, i in enumerate(range(0, len(sentences), args.batch_size), start=1):
+                batch = sentences[i:i + args.batch_size]
+
+                # === Candidate generation in-batch (spaCy tokenization for both modes)
+                candidate_results = process_sentences_batch_new(
+                    batch,
+                    args.spacy_model,
+                    args.use_chunks,
+                    candidates_from=args.candidates_from,
+                    ner_runtime=ner_runtime,
+                    ner_max_length=args.ner_max_length,
+                    ner_runtime_batch_size=args.ner_batch_size
+                )
+
+
+                llm_results = call_llm_batch(client, model_name, args.model_type, candidate_results)
+
+                for spacy_result, llm_result in zip(candidate_results, llm_results):
+                    sentence_data = {
+                        "text": spacy_result["sentence"],
+                        "llm": llm_result
+                    }
+                    if spacy_result["candidates"] is not None:
+                        sentence_data["candidates"] = spacy_result["candidates"]
+                    out_sents.append(sentence_data)
+
+                print(f"Processed batch {bidx}/{total_batches}")
+
+                # Write results
+            rec = {
+                "doc_id": doc_id,
+                "sentences": out_sents,
+                "config": {
+                    "model_type": args.model_type,
+                    "model_name": model_name,
+                    "use_chunks": args.use_chunks
+                }
+            }
+
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            docs_written += 1
+            print(f"Completed document {doc_id} with {len(out_sents)} sentences")
+
+
+    mode_str = "with chunks" if args.use_chunks else "without chunks"
+    print(f"Done. Processed {docs_written} documents using {args.model_type} {mode_str} and wrote to {args.out_jsonl}")
+
+
+if __name__ == "__main__":
+    main()
