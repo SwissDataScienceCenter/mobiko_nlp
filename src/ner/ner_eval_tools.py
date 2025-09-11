@@ -38,6 +38,8 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForTokenClassificat
 
 from train_ner import NerDataset, read_jsonl, build_label_list
 from labels import EntityLabel, build_bio_labels
+from ner_infer import NerInferencer
+
 
 # seqeval metrics
 try:
@@ -53,15 +55,24 @@ from sklearn.metrics import confusion_matrix
 
 ENTITY_PREFIXES = ("B-", "I-")
 
+
 # ---------------------
 # Helpers
 # ---------------------
+
 
 def write_jsonl(path: str, records: List[Dict[str, Any]]):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def to_conll(tokens: List[str], tags: List[str]) -> str:
+    lines = []
+    for tok, tag in zip(tokens, tags):
+        lines.append(f"{tok} {tag}")
+    return "\n".join(lines) + "\n\n"
 
 
 def strip_ignored(pred_tags: List[str], example: Dict[str, Any], tokenizer) -> List[str]:
@@ -83,79 +94,32 @@ def strip_ignored(pred_tags: List[str], example: Dict[str, Any], tokenizer) -> L
     return out
 
 
-def _load_labels_from_model(model_dir):
-    # Prefer model's id2label/label2id so we don't scan test
-    import json, os
-    config_path = os.path.join(model_dir, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        if "id2label" in cfg:
-            # ensure sorted by id
-            id2label = {int(k): v for k, v in cfg["id2label"].items()}
-            return [id2label[i] for i in sorted(id2label.keys())]
-        if "label2id" in cfg:
-            label2id = {k: int(v) for k, v in cfg["label2id"].items()}
-            return [lab for lab, _ in sorted(label2id.items(), key=lambda kv: kv[1])]
-    # Fallback to your provided set if config lacks labels
-    provided = build_bio_labels()
-    return sorted(provided)
+def run_inference(model, tokenizer, label2id, id2label, records: List[Dict[str, Any]], labels: List,
+                  batch_size=16, max_length=512):
 
-def _best_device():
-    if torch.cuda.is_available(): return "cuda"
-    if torch.backends.mps.is_available(): return "mps"
-    return "cpu"
+    ds = NerDataset(records, tokenizer, label2id, max_length=max_length)
 
+    data_collator = DataCollatorForTokenClassification(tokenizer, padding=True)
 
-def load_inference_stack(model_dir, dtype="auto"):
-    device = _best_device()
-    tok = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
-    model = AutoModelForTokenClassification.from_pretrained(model_dir)
-    model.eval()
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
+    all_preds = []
+    with torch.no_grad():
+        for batch in loader:
+            for k in batch:
+                batch[k] = batch[k].to(model.device)
+                # print(batch[k].shape)
+            # print(len(batch))
+            logits = model(**batch).logits.cpu().numpy()
+            all_preds.extend(list(np.argmax(logits, axis=2)))
 
-    # dtype selection
-    if dtype == "auto":
-        if device == "cuda":
-            if torch.cuda.is_bf16_supported():
-                model.to(device=device, dtype=torch.bfloat16)
-            else:
-                model.to(device=device, dtype=torch.float16)
-        else:
-            model.to(device)  # CPU or MPS: leave fp32
-    elif dtype == "bf16":
-        model.to(device=device, dtype=torch.bfloat16)
-    elif dtype == "fp16":
-        model.to(device=device, dtype=torch.float16)
-    else:
-        model.to(device=device)
+    # Map back to tags per example (first subword per word)
+    out_tags = []
+    for pred_ids, ex in zip(all_preds, records):
+        pred_strs = [id2label[int(i)] for i in pred_ids]
+        word_tags = strip_ignored(pred_strs, ex, tokenizer)
+        out_tags.append(word_tags)
+    return out_tags
 
-    # perf knobs
-    torch.set_grad_enabled(False)
-    torch.backends.cudnn.benchmark = True  # speeds up varying shapes (still pad to max_length)
-    return tok, model, device
-
-
-
-def _iter_jsonl(path, limit=None):
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if limit is not None and i >= limit:
-                break
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
-
-
-def _batched_iter(it, batch_size):
-    batch = []
-    for x in it:
-        batch.append(x)
-        if len(batch) >= batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
 
 
 # --------------- FAST JSON READER ---------------
@@ -167,34 +131,6 @@ except Exception:
     import json as _json
     def _json_loads(s): return _json.loads(s)
     def _json_dumps(o): return _json.dumps(o)
-
-
-
-# --------------- FAST ALIGNMENT (first-subtoken) ---------------
-def align_ids_to_words(batch_records, encodings, pred_ids, id2label):
-    """
-    Map subtoken predictions to word-level tags by taking the first subtoken’s label.
-    Avoid per-subtoken Python loops as much as possible.
-    """
-    out = []
-    word_id_batches = encodings.word_ids  # requires fast tokenizer; returns list[list[int|None]]
-    # word_ids can be a callable in new HF; handle both
-    if callable(word_id_batches): word_id_batches = [encodings.word_ids(i) for i in range(len(batch_records))]
-
-    for rec, wp_ids, pred in zip(batch_records, word_id_batches, pred_ids):
-        tags = []
-        last_w = None
-        for sub_id, w in zip(pred, wp_ids):
-            if w is None or w == last_w:  # skip special tokens and continuation subtokens
-                continue
-            tags.append(id2label[int(sub_id)])
-            last_w = w
-        # Truncate/pad to number of input words (safety)
-        n_words = len(rec.get("tokens", []))
-        if len(tags) != n_words:
-            tags = tags[:n_words] + ["O"] * max(0, n_words - len(tags))
-        out.append(tags)
-    return out
 
 
 # ----------------------
@@ -503,151 +439,63 @@ def cmd_split(args):
         print(f"{name:>5} no-entity %: {pct_no_ent(splits[s]):5.1f} | classes: {', '.join(present) if present else '—'}")
 
 
-def run_inference(model, tokenizer, label2id, id2label, records: List[Dict[str, Any]], labels: List,
-                  batch_size=16, max_length=512):
+def cmd_test_infer(args):
 
-    ds = NerDataset(records, tokenizer, label2id, max_length=max_length)
+    infer = NerInferencer(args.model_dir, dtype="auto")
+    # Stream the test file in chunks, but call a single shared predictor
+    y_true, y_pred = [], []
+    writer = open(args.out_jsonl, "w", encoding="utf-8") if args.out_jsonl else None
 
-    data_collator = DataCollatorForTokenClassification(tokenizer, padding=True)
+    # count lines for tqdm (optional; reuse your helper if you prefer)
 
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
-    all_preds = []
-    with torch.no_grad():
-        for batch in loader:
-            for k in batch:
-                batch[k] = batch[k].to(model.device)
-                # print(batch[k].shape)
-            # print(len(batch))
-            logits = model(**batch).logits.cpu().numpy()
-            all_preds.extend(list(np.argmax(logits, axis=2)))
-
-    # Map back to tags per example (first subword per word)
-    out_tags = []
-    for pred_ids, ex in zip(all_preds, records):
-        pred_strs = [id2label[int(i)] for i in pred_ids]
-        word_tags = strip_ignored(pred_strs, ex, tokenizer)
-        out_tags.append(word_tags)
-    return out_tags
-
-
-@torch.inference_mode()
-def run_inference_stream(model_dir, test_jsonl, labels, out_jsonl=None,
-                         batch_size=128, chunk_size=5000, max_length=256,
-                         subset=None, dtype="auto"):
-
-    tok, model, device = load_inference_stack(model_dir, dtype=dtype)
-
-    # label mapping from model config if possible
-    id2label = getattr(model.config, "id2label", None)
-    if not id2label:
-        # fallback to labels list
-        id2label = {i: lab for i, lab in enumerate(labels)}
-
-    # progress total
     try:
-        with open(test_jsonl, "r", encoding="utf-8") as f:
+        with open(args.test_jsonl, "r", encoding="utf-8") as f:
             total = sum(1 for _ in f)
-        if subset: total = min(total, subset)
     except Exception:
         total = None
 
-    writer = None
-    if out_jsonl:
-        os.makedirs(os.path.dirname(out_jsonl) or ".", exist_ok=True)
-        writer = open(out_jsonl, "w", encoding="utf-8")
+    def _iter_jsonl(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue
 
-    y_true, y_pred = [], []
+    def _batched(it, n):
+        buf = []
+        for x in it:
+            buf.append(x)
+            if len(buf) >= n:
+                yield buf
+                buf = []
+        if buf: yield buf
 
     with tqdm(total=total, unit="rec", desc="Inference") as pbar:
-        for chunk in _batched_iter(_iter_jsonl(test_jsonl, limit=subset), chunk_size):
-            # prepare truths
+        for chunk in _batched(_iter_jsonl(args.test_jsonl), getattr(args, "chunk_size", 10000)):
             y_true.extend([rec.get("tags", []) for rec in chunk])
-
-            # tokenize & predict in BATCHES
-            chunk_preds = []
-            for i in range(0, len(chunk), batch_size):
-                batch = chunk[i:i+batch_size]
-                tokens = [r["tokens"] for r in batch]
-
-                enc = tok(tokens,
-                          is_split_into_words=True,
-                          return_tensors="pt",
-                          padding="max_length",      # fixed shape speeds kernels
-                          truncation=True,
-                          max_length=max_length)
-
-                for k in enc: enc[k] = enc[k].to(device, non_blocking=True)
-                logits = model(**enc).logits    # [B, T, C]
-                # argmax in-place-ish
-                pred_ids = logits.argmax(-1).to("cpu").tolist()
-
-                # align to word-level tags (fast)
-                aligned = align_ids_to_words(batch, enc, pred_ids, id2label)
-                chunk_preds.extend(aligned)
-
-            y_pred.extend(chunk_preds)
-
-            # stream write
+            # shared runtime on already-tokenized records
+            preds = infer.predict_word_tags_for_tokenized(
+                records = chunk,
+                batch_size = args.batch_size,
+                max_length = args.max_length
+            )
+            y_pred.extend(preds)
             if writer:
-                for rec, tags_hat in zip(chunk, chunk_preds):
-                    rec_out = dict(rec)
-                    rec_out["pred_tags"] = tags_hat
-                    writer.write(_json_dumps(rec_out) + "\n")
-
+                for rec, tags_hat in zip(chunk, preds):
+                    rr = dict(rec)
+                    rr["pred_tags"] = tags_hat
+                    writer.write(json.dumps(rr, ensure_ascii=False) + "\n")
             pbar.update(len(chunk))
-
     if writer: writer.close()
-    return y_true, y_pred
-
-
-def entity_level_metrics(y_true: List[List[str]], y_pred: List[List[str]]):
-    if f1_score is None:
-        return {"precision": None, "recall": None, "f1": None, "report": "seqeval not installed"}
-    return {
-        "precision": precision_score(y_true, y_pred),
-        "recall": recall_score(y_true, y_pred),
-        "f1": f1_score(y_true, y_pred),
-        "report": classification_report(y_true, y_pred, digits=3)
-    }
-
-
-def cmd_test(args):
-    # get labels from model (don’t scan test)
-    labels = _load_labels_from_model(args.model_dir)
-    if "O" not in labels: labels = ["O"] + labels
-
-    y_true, y_pred = run_inference_stream(
-        model_dir=args.model_dir,
-        test_jsonl=args.test_jsonl,
-        labels=labels,
-        out_jsonl=args.out_jsonl,
-        batch_size=args.batch_size,          # try 128–256 on 16–24GB GPUs
-        chunk_size=getattr(args, "chunk_size", 10000),
-        max_length=args.max_length,          # keep modest, e.g., 256/320
-        subset=getattr(args, "subset", None),
-        dtype="auto",                        # bf16 on Ampere+, else fp16 on CUDA
-    )
-
-    metrics = entity_level_metrics(y_true, y_pred)
-    if args.report_path:
-        with open(args.report_path, "w", encoding="utf-8") as f:
-            f.write(metrics["report"])
-    else:
-        print(metrics["report"])
     print(classification_report(y_true, y_pred, digits=3))
+
     y_true_flat = list(chain.from_iterable(y_true))
     y_pred_flat = list(chain.from_iterable(y_pred))
     labels = sorted(set(y_true_flat) | set(y_pred_flat))  # or your fixed label order
     cm = confusion_matrix(y_true_flat, y_pred_flat, labels=labels)
     print(labels)
     print(cm)
-
-
-def to_conll(tokens: List[str], tags: List[str]) -> str:
-    lines = []
-    for tok, tag in zip(tokens, tags):
-        lines.append(f"{tok} {tag}")
-    return "\n".join(lines) + "\n\n"
 
 
 def cmd_predict(args):
@@ -702,7 +550,7 @@ def main():
     sp.add_argument("--out_jsonl", default=None)
     sp.add_argument("--chunk_size", type=int, default=5000, help="Records per streaming chunk")
 
-    sp.set_defaults(func=cmd_test)
+    sp.set_defaults(func=cmd_test_infer)
 
     sp = sub.add_parser("predict")
     sp.add_argument("--model_dir", required=True)
