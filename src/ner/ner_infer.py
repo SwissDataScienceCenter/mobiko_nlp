@@ -145,6 +145,7 @@ class NerInferencer:
             self,
             logits: torch.Tensor,
             entity_threshold: float | None = None,
+            entity_bias: float | None = None,
     ) -> list[list[int]]:
         """
         logits: [B, T, C] (same dtype/device as model output)
@@ -152,6 +153,12 @@ class NerInferencer:
           - None  -> plain argmax over all labels
           - float -> choose max over entity labels; if max_entity_prob <= thr => 'O'
         """
+
+        if entity_bias is not None:
+            mask = self._entity_mask.to(logits.device)
+            logits = logits.clone()  # avoid modifying in-place
+            logits[..., mask] += entity_bias
+
         if entity_threshold is None:
             return logits.argmax(dim=-1).to("cpu").tolist()
 
@@ -226,6 +233,7 @@ class NerInferencer:
         batch_size: int = 128,
         max_length: int = 256,
         entity_threshold: float | None = None,
+        entity_bias: float | None = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         sentences: [str]  →  list of span dicts per sentence (char indices)
@@ -251,7 +259,7 @@ class NerInferencer:
             batch = self.collator(sample_dicts[i:i+batch_size])
             batch = {k: v.to(self.model.device, non_blocking=True) for k,v in batch.items()}
             out = self.model(**batch)
-            pred_ids = self._predict_ids_with_threshold(out.logits, entity_threshold)
+            pred_ids = self._predict_ids_with_threshold(out.logits, entity_threshold, entity_bias)
             preds.extend(pred_ids)
 
         # collapse to word-level tags, then BIO→spans with the original offsets
