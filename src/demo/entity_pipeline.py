@@ -32,7 +32,6 @@ from prompts import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT, NER
 
 
 
-
 # Model configurations
 MODEL_CONFIGS = {
     "qwen3-4B": {
@@ -280,8 +279,6 @@ def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict
                 timeout=360
 
             )
-            # print('Response', response)
-
             content = response.choices[0].message.content
 
             # Postprocess content for Qwen 32B to remove thinking blocks
@@ -309,7 +306,7 @@ def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict
 
 
 def process_with_chunks(sent):
-    """Extract noun phrase candidates from sentence"""
+    """ Extract noun phrase candidates from sentence """
     cands = []
     for np in sent.noun_chunks:
         if np.root.pos_ not in ("NOUN", "PROPN"):
@@ -324,32 +321,6 @@ def process_with_chunks(sent):
             "text": np_text
         })
     return cands
-
-
-# def process_sentences_batch(sentence_batch: List[str], spacy_model: str, use_chunks: bool) -> List[Dict]:
-#     """Process a batch of sentences with spaCy."""
-#     nlp = get_spacy_model(spacy_model)
-#
-#     # Process multiple sentences at once for better performance
-#     docs = list(nlp.pipe(sentence_batch))
-#
-#     batch_results = []
-#     for sent_text, sent_doc in zip(sentence_batch, docs):
-#         if use_chunks:
-#             cands = process_with_chunks(sent_doc)
-#             if not cands:
-#                 continue
-#             batch_results.append({
-#                 "sentence": sent_text,
-#                 "candidates": cands
-#             })
-#         else:
-#             batch_results.append({
-#                 "sentence": sent_text,
-#                 "candidates": None
-#             })
-#     print(f'Processed {len(batch_results)} sentences with spaCy (use_chunks={use_chunks})')
-#     return batch_results
 
 
 def _load_labels_from_model(model_dir):
@@ -369,30 +340,13 @@ def _load_labels_from_model(model_dir):
     return sorted(provided)
 
 
-# def _load_ner(model_dir: str):
-#     labels = _load_labels_from_model(model_dir)
-#     label2id = {l:i for i,l in enumerate(labels)}
-#     id2label = {i:l for l,i in label2id.items()}
-#
-#     tok = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
-#     cfg = AutoConfig.from_pretrained(model_dir, num_labels=len(labels), id2label=id2label, label2id=label2id,
-#                                      return_dict=True)
-#     model = AutoModelForTokenClassification.from_pretrained(model_dir, config=cfg)
-#     model.eval()
-#
-#     if torch.cuda.is_available():
-#         model.to("cuda")
-#     collator = DataCollatorForTokenClassification(tok, padding=True)
-#     return tok, model, collator, id2label, label2id
-
-
 def _load_ner(model_dir: str):
     # Backwards-compat shim if other code relies on this name
     infer = NerInferencer(model_dir, dtype="auto")
     return infer
 
 
-def process_sentences_batch_new(
+def process_sentences_batch(
     sentence_batch: List[str],
     spacy_model: str,
     use_chunks: bool,
@@ -400,6 +354,7 @@ def process_sentences_batch_new(
     ner_runtime: Optional["NerInferencer"] = None,
     ner_max_length: int = 512,
     ner_runtime_batch_size: int = 64,
+    np_fallback: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Build candidates for a batch of sentences.
@@ -417,6 +372,7 @@ def process_sentences_batch_new(
     """
     batch_results: List[Dict[str, Any]] = []
 
+    # All-chunks mode
     if candidates_from == "chunks" and use_chunks:
         nlp = get_spacy_model(spacy_model)
         docs = list(nlp.pipe(sentence_batch))
@@ -428,6 +384,7 @@ def process_sentences_batch_new(
         print(f'Processed {len(batch_results)} sentences with spaCy chunks')
         return batch_results
 
+    # NER mode (+ optional NP fallback)
     if candidates_from == "ner":
         if ner_runtime is None:
             raise ValueError(
@@ -439,142 +396,42 @@ def process_sentences_batch_new(
             sentences=sentence_batch,
             batch_size=ner_runtime_batch_size,
             max_length=ner_max_length,
-            entity_threshold=0.2
+            entity_threshold=0.25,
+            entity_bias=0.25
         )
 
-        for sent_text, spans in zip(sentence_batch, spans_lists):
-            # spans: [{"start_char":..., "end_char":..., "text":..., "type":...}]
-            batch_results.append({"sentence": sent_text, "candidates": spans})
-        return batch_results
+        # Collect indices with no NER spans (eligible for fallback)
+        empty_idx = [i for i, spans in enumerate(spans_lists) if not spans]
 
-    # candidates_from == "none"
-    for sent_text in sentence_batch:
-        batch_results.append({"sentence": sent_text, "candidates": None})
-    print(f'Processed {len(batch_results)} sentences without candidates')
-    return batch_results
+        # fall back to NP chunks if enabled and no NER spans
+        fallback_maps: Dict[int, List[Dict[str, Any]]] = {}
+        if np_fallback and empty_idx:
+            nlp = get_spacy_model(spacy_model)
+            # pipe only the empty sentences
+            empty_sents = [sentence_batch[i] for i in empty_idx]
+            empty_docs = list(nlp.pipe(empty_sents))
+            for j, doc in enumerate(empty_docs):
+                i = empty_idx[j]
+                cands = process_with_chunks(doc)
+                # NOTE: keep chunk candidates untyped; LLM prompt will use DEFAULT path
+                fallback_maps[i] = cands
 
-
-def process_sentences_batch(
-    sentence_batch: List[str],
-    spacy_model: str,
-    use_chunks: bool,
-    candidates_from: str = "ner",
-    ner_runtime: Optional[tuple] = None,
-    ner_max_length: int = 512,
-    ner_runtime_batch_size: int = 64,
-) -> List[Dict]:
-    """
-    Process a batch with spaCy, then:
-      - if use_chunks=True and candidates_from='chunks': noun-chunk candidates
-      - if candidates_from='ner': HF NER spans (BIO->char spans)
-      - if candidates_from='none': no candidates
-    Returns [{"sentence": str, "candidates": List[span] or None}, ...] as before. :contentReference[oaicite:1]{index=1}
-    """
-    batch_results: List[Dict[str, Any]] = []
-
-    if candidates_from == "chunks" and use_chunks:
-        nlp = get_spacy_model(spacy_model)
-        docs = list(nlp.pipe(sentence_batch))
-        for sent_text, sent_doc in zip(sentence_batch, docs):
-            cands = process_with_chunks(sent_doc)
-            if not cands:
-                continue
-            batch_results.append({"sentence": sent_text, "candidates": cands})
-        print(f'Processed {len(batch_results)} sentences with spaCy chunks')
-        return batch_results
-
-    if candidates_from == "ner":
-        if ner_runtime is None:
-            raise ValueError("NER requested but ner_runtime is None (call _load_ner in main and pass it in).")
-        tok, mdl, collator, id2label, label2id = ner_runtime
-
-
-        # 1) whitespace-tokenize all sentences and keep offsets
-        tokenized = []
-        for sent in sentence_batch:
-            words, spans = _ws_tokenize_with_offsets(sent)
-            tokenized.append((sent, words, spans))
-
-        # 2) encode pre-tokenized words (is_split_into_words=True)
-        enc_inputs, word_maps = [], []
-        for _, words, _ in tokenized:
-            enc = tok(
-                words,
-                is_split_into_words=True,
-                truncation=True,
-                padding="max_length",
-                max_length=ner_max_length,
-                return_offsets_mapping=False
-            )
-
-
-            enc_inputs.append({k: enc[k] for k in enc.keys()})
-
-            word_maps.append(enc.word_ids())
-
-        # 3) run model in mini-batches
-        preds = []
-        for i in range(0, len(enc_inputs), ner_runtime_batch_size):
-            chunk = enc_inputs[i:i + ner_runtime_batch_size]
-            batch = collator(chunk)
-            # --- make sure we have a dict of tensors ---
-            if isinstance(batch, tuple):
-                # should not happen with HF collators, but be defensive
-                batch = batch[0]
-            if not isinstance(batch, dict):
-                batch = dict(batch)
-
-            # --- move to device correctly (use .items() !) ---
-            if torch.cuda.is_available():
-                batch = {k: v.to("cuda") for k, v in batch.items()}
-
-            # --- forward pass; support both tuple and ModelOutput ---
-            with torch.no_grad():
-                outputs = mdl(**batch)
-
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-            # pred_ids = np.argmax(logits.detach().cpu().numpy(), axis=2)
-            # preds.extend(list(pred_ids))
-
-            probs = F.softmax(logits, dim=-1)  # [B, T, C]
-            entity_ids = [i for i, l in id2label.items() if l != "O"]
-
-            pred_ids = []
-            for batch_probs in probs:  # per sequence
-                seq_preds = []
-                for tok_probs in batch_probs:  # per token
-                    p_entity = tok_probs[entity_ids].max()
-                    if p_entity > 0.2:  # threshold (tune this)
-                        seq_preds.append(entity_ids[torch.argmax(tok_probs[entity_ids])])
+        # build unified results
+        for i, sent_text in enumerate(sentence_batch):
+            spans = spans_lists[i]
+            if spans:
+                # NER-proposed typed spans
+                batch_results.append({"sentence": sent_text, "candidates": spans})
+            else:
+                # Fallback (if any), else leave candidates=None
+                if np_fallback:
+                    cands = fallback_maps.get(i, [])
+                    if cands:
+                        batch_results.append({"sentence": sent_text, "candidates": cands})
                     else:
-                        seq_preds.append(label2id["O"])
-                pred_ids.append(seq_preds)
-
-            # if torch.cuda.is_available():
-            #     batch = {k: v.to("cuda") for k, v in batch.items()}
-            # logits = mdl(**batch).logits.detach().cpu().numpy()  # [B,T,C]
-            # preds.extend(list(np.argmax(logits, axis=2)))
-
-        # 4) subword->word: first-subword tag wins
-        word_tags_all = []
-        for pred_ids, wids in zip(preds, word_maps):
-            tags, seen = [], set()
-            for pid, wid in zip(pred_ids, wids):
-                if wid is None:
-                    continue
-                if wid not in seen:
-                    tags.append(id2label[int(pid)])
-                    seen.add(wid)
-            word_tags_all.append(tags)
-
-        # 5) BIO → spans with offsets (no string search)
-        for (sent, words, spans), tags in zip(tokenized, word_tags_all):
-            if len(tags) < len(words):
-                tags = tags + ["O"] * (len(words) - len(tags))
-            elif len(tags) > len(words):
-                tags = tags[:len(words)]
-            cand_spans = _bio_from_ids_to_spans(tags, spans, sent)
-            batch_results.append({"sentence": sent, "candidates": cand_spans})
+                        batch_results.append({"sentence": sent_text, "candidates": None})
+                else:
+                    batch_results.append({"sentence": sent_text, "candidates": None})
         return batch_results
 
     # candidates_from == "none"
@@ -582,10 +439,11 @@ def process_sentences_batch(
         batch_results.append({"sentence": sent_text, "candidates": None})
     print(f'Processed {len(batch_results)} sentences without candidates')
     return batch_results
-
 
 
 def main():
+    global client, model_name
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
@@ -593,7 +451,7 @@ def main():
     ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
     ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
     ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
-    ap.add_argument("--batch_size", type=int, default=10, help="Batch size for processing")
+    ap.add_argument("--batch_size", type=int, default=15, help="Batch size for processing")
     ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
 
     # ==== Candidate source switch ====
@@ -625,6 +483,9 @@ def main():
 
     # ==== spaCy chunker params ===
     ap.add_argument("--spacy_model", default="en_core_web_trf", help="spaCy model (needs parser for noun_chunks)")
+
+    ap.add_argument("--np_fallback", action="store_true",
+                    help="If NER finds no entities in a sentence, fill candidates with NP chunks.")
 
 
     args = ap.parse_args()
@@ -680,16 +541,16 @@ def main():
                 batch = sentences[i:i + args.batch_size]
 
                 # === Candidate generation in-batch (spaCy tokenization for both modes)
-                candidate_results = process_sentences_batch_new(
+                candidate_results = process_sentences_batch(
                     batch,
                     args.spacy_model,
                     args.use_chunks,
                     candidates_from=args.candidates_from,
                     ner_runtime=ner_runtime,
                     ner_max_length=args.ner_max_length,
-                    ner_runtime_batch_size=args.ner_batch_size
+                    ner_runtime_batch_size=args.ner_batch_size,
+                    np_fallback=args.np_fallback,
                 )
-
 
                 llm_results = call_llm_batch(client, model_name, args.model_type, candidate_results)
 
