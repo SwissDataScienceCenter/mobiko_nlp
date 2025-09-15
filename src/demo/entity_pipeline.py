@@ -1,22 +1,11 @@
 import os
 import sys
 import json
-import time
 import argparse
-from pathlib import Path
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Any
 import threading
-import torch
-import torch.nn.functional as F
-
-import subprocess
-import runpy
 from pathlib import Path
-import numpy as np
-
-from transformers import AutoTokenizer, AutoConfig, AutoModelForTokenClassification, DataCollatorForTokenClassification
+import re, unicodedata
 
 
 import spacy
@@ -29,6 +18,8 @@ from ner.labels import EntityLabel, build_bio_labels
 from ner.ner_infer import NerInferencer
 
 from prompts import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT, NER_AWARE_SYSTEM_PROMPT
+import glob
+
 
 
 
@@ -114,6 +105,55 @@ def _bio_from_ids_to_spans(tags: List[str], token_spans: List[tuple], text: str)
         s, _ = token_spans[start_i]; _, e = token_spans[len(token_spans)-1]
         spans.append({"start_char": s, "end_char": e, "text": text[s:e], "type": active_type})
     return spans
+
+
+
+def _load_bioc_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Read all *.json in a directory of BioC files.
+    Extract per-sentence spans.
+    Return {sentence_text -> [ {text, start_char, end_char, type}, ... ]}.
+    """
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    for path in glob.glob(os.path.join(bioc_dir, "*.json")):
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+            articles = (doc.get("sibils_article_set") or doc.get("articles"))
+            for article in articles:
+
+                if article.get("passages") and isinstance(article.get("passages"), list):
+                    # Build sentence index: (field, sentence_number) -> sentence text
+
+                    for passage in article["passages"]:
+                        text = passage.get("text") or ""
+                        if not text:
+                            continue
+                        spans = []
+                        for annotation in passage.get("annotations", []):
+                            infons = annotation.get("infons", {}) or {}
+
+                            for location in annotation.get("locations", []):
+                                start = int(location.get("offset", 0))
+                                length = int(location.get("length", 0))
+                                end = start + length
+
+                                # Validate span boundaries
+                                if end <= start or start < 0 or end > len(text):
+                                    continue
+
+                                spans.append({
+                                    "start": start,
+                                    "end": end,
+                                    "text": text[start:end],
+                                    "source": infons.get("concept_source"),
+                                    "concept_id": infons.get("concept_id"),
+                                    "preferred_term": infons.get("preferred_term")
+                                })
+                        # Sort spans (stable) for predictability
+                        spans.sort(key=lambda s: (s["start"], -(s["end"] - s["start"])))
+                        index[text] = spans
+    return index
+
 
 
 def get_openai_client(model_type: str):
@@ -355,6 +395,7 @@ def process_sentences_batch(
     ner_max_length: int = 512,
     ner_runtime_batch_size: int = 64,
     np_fallback: bool = False,
+    bioc_index: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Build candidates for a batch of sentences.
@@ -371,6 +412,27 @@ def process_sentences_batch(
         for NER mode. For other modes, keep your previous structure.
     """
     batch_results: List[Dict[str, Any]] = []
+
+    if candidates_from == "bioc":
+        if bioc_index is None:
+            raise ValueError("candidates_from='bioc' requires bioc_index (load with _load_bioc_index).")
+        for sent_text in sentence_batch:
+            spans = bioc_index.get(sent_text, [])
+            # Normalize to the format your LLM path expects; keep types to enable NER_AWARE_SYSTEM_PROMPT
+            norm_spans = []
+            for s in spans:
+                if "text" in s and "start" in s and "end" in s:
+                    norm_spans.append({
+                        "text": s["text"].strip(),
+                        "start_char": int(s["start"]),
+                        "end_char": int(s["end"]),
+                        "type": s.get("type")  # may be None; prompt handles both
+                    })
+            # Optional: if BioC offsets are off, auto-fix using your existing fixer
+            norm_spans = fix_span_indices(norm_spans, sent_text)
+            batch_results.append({"sentence": sent_text, "candidates": norm_spans if norm_spans else None})
+        print(f'Processed {len(batch_results)} sentences with bioc candidates')
+        return batch_results
 
     # All-chunks mode
     if candidates_from == "chunks" and use_chunks:
@@ -437,8 +499,66 @@ def process_sentences_batch(
     # candidates_from == "none"
     for sent_text in sentence_batch:
         batch_results.append({"sentence": sent_text, "candidates": None})
-    print(f'Processed {len(batch_results)} sentences without candidates')
+        print(f'Processed {len(batch_results)} sentences without candidates')
     return batch_results
+
+
+
+_WS = re.compile(r"\s+")
+_PUNCT = str.maketrans({
+    "“":"\"", "”":"\"", "‘":"'", "’":"'",
+    "–":"-", "—":"-", "−":"-", "…":"...",
+    "\u00A0":" ", "\u2009":" ", "\u200A":" ", "\u200B":" ",
+})
+
+
+def _canon(s: str) -> str:
+    # same canonicalization as for gold: normalize, collapse space, lowercase
+    s = unicodedata.normalize("NFKC", s).translate(_PUNCT)
+    s = _WS.sub(" ", s).strip().lower()
+    return s
+
+
+
+def _dedupe_bioc_index(
+    bioc_index: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Merge entries for identical sentences (by canonical form), prefer the first
+    exact text seen as the key, union spans, remove duplicate spans.
+    """
+    # map canon -> (original_text_key, merged_spans_list)
+    tmp: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
+
+    def _span_key(sp):
+        # dedupe by geometry + text + mapped type
+        return (int(sp["start"]), int(sp["end"]),
+                sp.get("text",""), sp.get("type"))
+
+    for sent_text, spans in bioc_index.items():
+        c = _canon(sent_text)
+        if c not in tmp:
+            tmp[c] = (sent_text, [])
+        key_text, merged = tmp[c]
+        # extend
+        merged.extend(spans)
+
+    deduped: Dict[str, List[Dict[str, Any]]] = {}
+    for c, (orig_text, merged) in tmp.items():
+        # remove duplicate spans
+        seen = set()
+        uniq = []
+        for sp in merged:
+            k = _span_key(sp)
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(sp)
+        # sort deterministic
+        uniq.sort(key=lambda s: (int(s["start"]), -(int(s["end"]) - int(s["start"]))))
+        deduped[orig_text] = uniq
+    return deduped
+
 
 
 def main():
@@ -455,16 +575,13 @@ def main():
     ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
 
     # ==== Candidate source switch ====
-    ap.add_argument("--candidates_from", choices=["chunks", "ner"], default="ner",
+    ap.add_argument("--candidates_from", choices=["chunks", "ner", "bioc"], default="ner",
                     help="Generate LLM candidates from spaCy noun chunks or NER predictions.")
 
-    # ==== BioC preparation ====
-    ap.add_argument("--input_bioc", type=str, default=None,
-                    help="Path to a BioC XML/JSON file. If set, we will reuse create_conll_from_bioc_integrated to prepare inputs.")
-    ap.add_argument("--prepared_conll_jsonl", type=str, default=None,
-                    help="Where to write/read the prepared CoNLL-style JSONL for NER.")
-    ap.add_argument("--prepared_txt_dir", type=str, default=None,
-                    help="Where to write/read prepared TXT sentences for spaCy chunker.")
+    # ==== BioC ====
+    ap.add_argument("--bioc_candidates_dir", type=str, default=None,
+                    help = "Directory with BioC JSON files. We will extract sentence->spans as candidates.")
+
     ap.add_argument("--schema_csv", type=str, default=None,
                     help="Optional schema CSV passed to the converter.")
     ap.add_argument("--envo_gazetteer_csv", type=str, default=None,
@@ -473,8 +590,6 @@ def main():
                     help="Prefer spaCy PhraseMatcher inside the converter.")
 
     # ==== NER path params ====
-    ap.add_argument("--input_jsonl", type=str, default=None,
-                    help="CoNLL-style JSONL (from converter) for NER path.")
     ap.add_argument("--ner_model_dir", type=str, default=None,
                     help="HF token classification model directory (must contain labels.txt).")
     ap.add_argument("--ner_batch_size", type=int, default=16)
@@ -511,6 +626,21 @@ def main():
 
 
     Path(os.path.dirname(args.out_jsonl) or ".").mkdir(parents=True, exist_ok=True)
+
+    #
+    bioc_index = None
+    if args.candidates_from == "bioc":
+        if not args.bioc_candidates_dir:
+            print("Provide --bioc_candidates_dir for candidates_from=bioc", file=sys.stderr)
+            sys.exit(1)
+        bioc_index = _load_bioc_index_from_dir(args.bioc_candidates_dir)
+        print(f"Loaded BioC candidates for {len(bioc_index)} sentences from {args.bioc_candidates_dir}")
+
+        before = len(bioc_index)
+        bioc_index = _dedupe_bioc_index(bioc_index)
+        after = len(bioc_index)
+        print(f"[BioC] deduped unique sentences: {after} (from {before})")
+
 
     # NER runtime (loaded once)
     ner_runtime = None
@@ -550,9 +680,15 @@ def main():
                     ner_max_length=args.ner_max_length,
                     ner_runtime_batch_size=args.ner_batch_size,
                     np_fallback=args.np_fallback,
+                    bioc_index=bioc_index
                 )
 
+                assert len(candidate_results) == len(batch), \
+                    f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
+
                 llm_results = call_llm_batch(client, model_name, args.model_type, candidate_results)
+                if len(llm_results) != len(candidate_results):
+                    raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
 
                 for spacy_result, llm_result in zip(candidate_results, llm_results):
                     sentence_data = {
