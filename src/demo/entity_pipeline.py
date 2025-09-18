@@ -16,6 +16,8 @@ sys.path.insert(0, str(src_path))
 
 from ner.labels import EntityLabel, build_bio_labels
 from ner.ner_infer import NerInferencer
+from preprocess.gazetteer_matcher import Rule as GazetteerRule, load_gaz_rules_from_dir, GazetteerMatcher
+
 
 from prompts import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT, NER_AWARE_SYSTEM_PROMPT
 import glob
@@ -311,14 +313,17 @@ def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict
         try:
             print(f'Sending LLM request for sentence: {sentence[:50]}... with {len(candidates) if candidates else 0} candidates')
 
+            # if candidates and len(candidates) >= 10:
+            #     print(full_prompt)
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": full_prompt}],
                 temperature=0.0,
                 max_tokens=max_tokens,
-                timeout=360
+                timeout=800
 
             )
+            print('LLM response received.')
             content = response.choices[0].message.content
 
             # Postprocess content for Qwen 32B to remove thinking blocks
@@ -386,6 +391,42 @@ def _load_ner(model_dir: str):
     return infer
 
 
+def _normalize_bioc_spans(spans: List[Dict[str, Any]], sent_text: str) -> List[Dict[str, Any]]:
+    """Map BioC spans to the schema your LLM path expects, then fix indices."""
+    norm_spans = []
+    for s in spans:
+        if "text" in s and "start" in s and "end" in s:
+            norm_spans.append({
+                "text": s["text"].strip(),
+                "start_char": int(s["start"]),
+                "end_char": int(s["end"]),
+                "type": s.get("type"),  # may be None; prompt handles both
+            })
+    return fix_span_indices(norm_spans, sent_text)
+
+
+def _build_np_fallback(
+    sentence_batch: List[str],
+    spacy_model: str,
+    empty_idx: List[int],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Compute chunk candidates only for sentences where NER found nothing."""
+
+    fallback_maps: Dict[int, List[Dict[str, Any]]] = {}
+    if not empty_idx:
+        return fallback_maps
+
+    nlp = get_spacy_model(spacy_model)
+    empty_sents = [sentence_batch[i] for i in empty_idx]
+    empty_docs = list(nlp.pipe(empty_sents))
+
+    for j, doc in enumerate(empty_docs):
+        i = empty_idx[j]
+        # keep chunk candidates untyped; LLM prompt will use DEFAULT path
+        fallback_maps[i] = process_with_chunks(doc)
+    return fallback_maps
+
+
 def process_sentences_batch(
     sentence_batch: List[str],
     spacy_model: str,
@@ -396,6 +437,8 @@ def process_sentences_batch(
     ner_runtime_batch_size: int = 64,
     np_fallback: bool = False,
     bioc_index: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    gazetteer_matcher: GazetteerMatcher | None = None,
+    use_bioc: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Build candidates for a batch of sentences.
@@ -418,21 +461,11 @@ def process_sentences_batch(
             raise ValueError("candidates_from='bioc' requires bioc_index (load with _load_bioc_index).")
         for sent_text in sentence_batch:
             spans = bioc_index.get(sent_text, [])
-            # Normalize to the format your LLM path expects; keep types to enable NER_AWARE_SYSTEM_PROMPT
-            norm_spans = []
-            for s in spans:
-                if "text" in s and "start" in s and "end" in s:
-                    norm_spans.append({
-                        "text": s["text"].strip(),
-                        "start_char": int(s["start"]),
-                        "end_char": int(s["end"]),
-                        "type": s.get("type")  # may be None; prompt handles both
-                    })
-            # Optional: if BioC offsets are off, auto-fix using your existing fixer
-            norm_spans = fix_span_indices(norm_spans, sent_text)
+            norm_spans = _normalize_bioc_spans(spans, sent_text)
             batch_results.append({"sentence": sent_text, "candidates": norm_spans if norm_spans else None})
         print(f'Processed {len(batch_results)} sentences with bioc candidates')
         return batch_results
+
 
     # All-chunks mode
     if candidates_from == "chunks" and use_chunks:
@@ -440,11 +473,19 @@ def process_sentences_batch(
         docs = list(nlp.pipe(sentence_batch))
         for sent_text, sent_doc in zip(sentence_batch, docs):
             cands = process_with_chunks(sent_doc)
+
+            if gazetteer_matcher is not None:
+                gz = gazetteer_candidates(sent_text, gazetteer_matcher)
+                if len(gz):
+                    print(gz)
+                    cands.extend(gz)
+
             if not cands:
                 continue
             batch_results.append({"sentence": sent_text, "candidates": cands})
         print(f'Processed {len(batch_results)} sentences with spaCy chunks')
         return batch_results
+
 
     # NER mode (+ optional NP fallback)
     if candidates_from == "ner":
@@ -465,35 +506,42 @@ def process_sentences_batch(
         # Collect indices with no NER spans (eligible for fallback)
         empty_idx = [i for i, spans in enumerate(spans_lists) if not spans]
 
-        # fall back to NP chunks if enabled and no NER spans
         fallback_maps: Dict[int, List[Dict[str, Any]]] = {}
         if np_fallback and empty_idx:
-            nlp = get_spacy_model(spacy_model)
-            # pipe only the empty sentences
-            empty_sents = [sentence_batch[i] for i in empty_idx]
-            empty_docs = list(nlp.pipe(empty_sents))
-            for j, doc in enumerate(empty_docs):
-                i = empty_idx[j]
-                cands = process_with_chunks(doc)
-                # NOTE: keep chunk candidates untyped; LLM prompt will use DEFAULT path
-                fallback_maps[i] = cands
+            fallback_maps = _build_np_fallback(sentence_batch, spacy_model, empty_idx)
 
         # build unified results
         for i, sent_text in enumerate(sentence_batch):
             spans = spans_lists[i]
+
+            gz = gazetteer_candidates(sent_text, gazetteer_matcher) if gazetteer_matcher is not None else []
+
             if spans:
-                # NER-proposed typed spans
+                # Combine NER + gazetteer candidates
+                if len(gz):
+                    spans = spans + gz
+                # Also add BioC spans if available
+                if use_bioc and bioc_index:
+                    spans = bioc_index.get(sent_text, [])
+                    norm_spans = _normalize_bioc_spans(spans, sent_text)
+                    if norm_spans:
+                        spans = spans + norm_spans
                 batch_results.append({"sentence": sent_text, "candidates": spans})
             else:
                 # Fallback (if any), else leave candidates=None
                 if np_fallback:
                     cands = fallback_maps.get(i, [])
+                    if gz:
+                        cands = cands + gz
                     if cands:
                         batch_results.append({"sentence": sent_text, "candidates": cands})
                     else:
                         batch_results.append({"sentence": sent_text, "candidates": None})
                 else:
-                    batch_results.append({"sentence": sent_text, "candidates": None})
+                    if gz:
+                        batch_results.append({"sentence": sent_text, "candidates": gz})
+                    else:
+                        batch_results.append({"sentence": sent_text, "candidates": None})
         return batch_results
 
     # candidates_from == "none"
@@ -561,6 +609,25 @@ def _dedupe_bioc_index(
 
 
 
+def gazetteer_candidates(sentence: str, gazetteer: GazetteerMatcher) -> list[dict]:
+    if gazetteer is None:
+        return []
+    hits = gazetteer.match(sentence)  # already returns start/end/text/type/source/rule_id
+    # normalize + tag provenance
+    out = []
+    for h in hits:
+        out.append({
+            "start_char": int(h["start_char"]),
+            "end_char": int(h["end_char"]),
+            "text": h["text"],
+            "type": h.get("type"),              # filename-as-type (e.g., 'Mountain', 'Biome', ...)
+            "source": "gazetteer",
+            "meta": {"rule_id": h.get("rule_id"), "backend": h.get("source")},
+        })
+    return out
+
+
+
 def main():
     global client, model_name
 
@@ -581,6 +648,7 @@ def main():
     # ==== BioC ====
     ap.add_argument("--bioc_candidates_dir", type=str, default=None,
                     help = "Directory with BioC JSON files. We will extract sentence->spans as candidates.")
+    ap.add_argument("--use_bioc", action="store_true", help="When using NER candidates, also add BioC spans if available.")
 
     ap.add_argument("--schema_csv", type=str, default=None,
                     help="Optional schema CSV passed to the converter.")
@@ -602,8 +670,12 @@ def main():
     ap.add_argument("--np_fallback", action="store_true",
                     help="If NER finds no entities in a sentence, fill candidates with NP chunks.")
 
+    # ==== Gazetteer ====
+    ap.add_argument("--gaz_dir", type=str, default=None,
+                    help="Directory with CSV/TSV gazetteers; filename is used as entity type.")
 
     args = ap.parse_args()
+
 
     # Initialize LLM client
     try:
@@ -612,6 +684,16 @@ def main():
     except Exception as e:
         print(f"Error initializing {args.model_type} client: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if args.gaz_dir:
+        gaz_rules = load_gaz_rules_from_dir(
+            dir_path=args.gaz_dir,
+        )
+        gaz_matcher = GazetteerMatcher(gaz_rules)
+        print(f"[gazetteer] Loaded {len(gaz_rules)} rules from {args.gaz_dir} "
+              f"(phrase={len(gaz_matcher.phrase_rules)}, regex={len(gaz_matcher.regex_rules)})")
+    else:
+        gaz_matcher = None
 
     # Validate spaCy model
     if args.use_chunks:
@@ -624,10 +706,9 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
 
-
     Path(os.path.dirname(args.out_jsonl) or ".").mkdir(parents=True, exist_ok=True)
 
-    #
+    # Load BioC candidates if requested
     bioc_index = None
     if args.candidates_from == "bioc":
         if not args.bioc_candidates_dir:
@@ -641,7 +722,6 @@ def main():
         after = len(bioc_index)
         print(f"[BioC] deduped unique sentences: {after} (from {before})")
 
-
     # NER runtime (loaded once)
     ner_runtime = None
     if args.candidates_from == "ner":
@@ -649,7 +729,6 @@ def main():
             print("Provide --ner_model_dir for candidates_from=ner", file=sys.stderr)
             sys.exit(1)
         ner_runtime = _load_ner(args.ner_model_dir)
-
 
     docs_written = 0
 
@@ -680,7 +759,9 @@ def main():
                     ner_max_length=args.ner_max_length,
                     ner_runtime_batch_size=args.ner_batch_size,
                     np_fallback=args.np_fallback,
-                    bioc_index=bioc_index
+                    bioc_index=bioc_index,
+                    gazetteer_matcher=gaz_matcher,
+                    use_bioc=args.use_bioc
                 )
 
                 assert len(candidate_results) == len(batch), \
