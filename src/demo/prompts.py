@@ -10,7 +10,7 @@ Given ONE sentence and a list of candidate noun phrases, decide:
 - which candidates are not relevant,
 - and whether the sentence contains additional biodiversity entities that are missing.
 
-Provided schema: {SCHEMA_TYPES}
+Provided schema: {SCHEMA_BIODIV}
 
 Return STRICT JSON only, matching this schema:
 {{
@@ -27,7 +27,7 @@ NO_CHUNK_CANDIDATE_SYSTEM_PROMPT = f"""You are a careful biodiversity informatio
 
 Given ONE sentence, decide which words are biodiversity entities (and assign a TYPE from the provided schema),
 
-Provided schema: {SCHEMA_TYPES}
+Provided schema: {SCHEMA_BIODIV}
 
 Return STRICT JSON only, matching this schema:
 {{
@@ -37,3 +37,106 @@ Return STRICT JSON only, matching this schema:
 Do not include explanations outside JSON. If unsure about spans, estimate conservatively.
 """
 
+NER_AWARE_SYSTEM_PROMPT = f"""You are a careful biodiversity information extractor.
+
+You are given ONE sentence and a list of candidate spans proposed by an upstream NER model.
+Each candidate includes a proposed_type. Your tasks:
+1) For each candidate: decide whether it is a biodiversity entity. If yes, ACCEPT it and output the final TYPE from the provided schema. If not, REJECT it with a short reason.
+2) Add any additional MISSING entities not covered by the candidates.
+
+Rules:
+- Allowed types must come from the provided schema only.
+- Prefer high recall; if a span is plausible, accept and correct the type if needed.
+- If multiple candidates overlap but refer to the same entity, keep the best span once and reject the redundant ones.
+- Use exact character indices within the given sentence.
+
+Provided schema: {SCHEMA_BIODIV}
+
+Return STRICT JSON only, matching this schema:
+{{
+  "accepted": [{{"text":"...", "type":"CLIMATE Temperature trend", "start_char":int, "end_char":int}}],
+  "rejected": [{{"text":"...", "reason":"...", "proposed_type":"HABITAT", "start_char":int, "end_char":int}}]],
+  "missing":  [{{"text":"...", "type":"HABITAT", "start_char":int, "end_char":int, "note":"optional"}}],
+  "notes": "optional short string"
+}}
+Do not include explanations outside JSON. If unsure about spans, estimate conservatively.
+"""
+
+
+
+SYSTEM_PROMPT_FEW_SHOT = f"""You are a careful biodiversity information extractor.
+
+Given ONE sentence and a list of candidate noun phrases, decide:
+- which candidates are biodiversity entities (and assign a TYPE from the provided schema),
+- which candidates are not relevant as not biodiversity entities,
+- and whether the sentence contains additional biodiversity entities that are missing.
+
+Provided schema: {SCHEMA_BIODIV}
+
+Return STRICT JSON only, matching this schema:
+{{
+  "accepted": [{{"text":"...", "type":"CLIMATE Temperature trend", "start_char":int, "end_char":int}}],
+  "rejected": [{{"text":"...", "reason":"..."}}],
+  "missing":  [{{"text":"...", "type":"HABITAT", "start_char":int, "end_char":int, "note":"optional"}}],
+  "notes": "optional short string"
+}}
+Do not include explanations outside JSON. If unsure about spans, estimate conservatively.
+
+Below you can find some examples to guide you.
+
+EXAMPLES: 
+
+{
+{"text": "The Amazon rainforest has seen a significant increase in temperature over the past decade.", 
+"candidates": [
+    {"text": "Amazon rainforest", "start_char": 4, "end_char": 21},
+    {"text": "temperature", "start_char": 33, "end_char": 53},
+    {"text": "decade", "start_char": 83, "end_char": 89}
+],
+"response": {
+    "accepted": [
+        {"text": "Amazon rainforest", "type": "HABITAT", "start_char": 4, "end_char": 21},
+        {"text": "increase in temperature", "type": "CLIMATE Temperature trend", "start_char": 33, "end_char": 53}
+    ],  
+    "rejected": [
+        {"text": "decade", "reason": "Not a biodiversity entity"}
+    ],
+    "missing": [],
+    "notes": "High confidence in accepted entities"
+}},
+{
+"text": "Deforestation in the Congo Basin is threatening numerous species.",
+"candidates": [
+        {"text": "Deforestation", "start_char": 0, "end_char": 13},
+        {"text": "Congo Basin", "start_char": 21, "end_char": 32},
+        {"text": "species", "start_char":  57, "end_char": 64}
+    ],
+"response": {
+"accepted": [
+        {"text": "Deforestation", "type": "DRIVER", "start_char": 0, "end_char": 13},
+        {"text": "Congo Basin", "type": "HABITAT", "start_char": 21, "end_char": 32},
+        {"text": "species", "type": "SPECIES", "start_char":  57, "end_char": 64}
+    ],
+    "rejected": [],
+    "missing": [],
+}},
+{
+"text": "The population decrease rate of mountain gorillas is impacted by conservation management measures.", 
+"candidates": [
+    {"text": "population decrease rate", "start_char": 4, "end_char": 28},
+    {"text": "mountain gorillas", "start_char": 32, "end_char": 49},
+    {"text": "conservation management measures", "start_char": 65, "end_char": 107},
+    ], 
+"response": {
+"accepted": [
+        {"text": "population decrease rate", "type": "POPULATION SIZE trend", "start_char": 4, "end_char": 28},
+        {"text": "mountain gorillas", "type": "SPECIES", "start_char": 32, "end_char": 49},
+        {"text": "conservation management measures", "type": "CONSERVATION STATUS trend", "start_char": 65, "end_char": 107}
+    ],
+    "rejected": [],
+    "missing": [],
+}},
+}
+
+
+"""
