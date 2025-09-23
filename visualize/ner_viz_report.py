@@ -1,4 +1,3 @@
-
 import json, argparse, html
 from collections import defaultdict
 
@@ -7,7 +6,8 @@ def span_len(a, b):
     return max(0, b - a)
 
 def overlap(a0, a1, b0, b1):
-    s = max(a0, b0); e = min(a1, b1)
+    s = max(a0, b0)
+    e = min(a1, b1)
     return max(0, e - s)
 
 def dice(a0, a1, b0, b1):
@@ -60,7 +60,6 @@ def extract_gold_spans(value_list):
         out.extend([normalize_span(x) for x in (inst.get("spans", []) or [])])
     return out
 
-
 def normalize_span(s):
     # Normalize label key under 'type'
     if "type" not in s or s.get("type") in (None, "", "UNK"):
@@ -93,6 +92,7 @@ def categorize_spans(gold_spans, pred_spans, thr, metric="dice", require_type=Tr
             s = score_pair(p, g, metric)
             if s >= thr:
                 pairs.append((s, pi, gi))
+
     # Greedy by descending score, 1-1
     pairs.sort(reverse=True, key=lambda x: x[0])
     matched_g = {}   # gi -> pi
@@ -200,7 +200,7 @@ def build_sentence_block(sent_id, text, tp, fp, fn):
     </div>
     """
 
-def html_report(items, overall_counts, output_path):
+def html_report(items, overall_counts, output_path, predicted_only=False):
     css = r"""
     <style>
     :root {
@@ -230,8 +230,9 @@ def html_report(items, overall_counts, output_path):
     .badge{background:#0e1730;border:1px solid #2a355e;border-radius:999px;padding:3px 8px}
     .sent-body{padding:8px;border-radius:10px;background:#0e1730;border:1px dashed #2a355e}
     .single-layer{white-space:pre-wrap;word-break:break-word; word-spacing: var(--ws);}
-    .mark{border-radius:4px;padding:0;} /* padding 0 => no width change */
+    .mark{border-radius:4px;padding:0;}
     footer{color:var(--muted);font-size:12px;padding:16px 20px}
+    .pill{background:#0e1730;border:1px solid #2a355e;border-radius:999px;padding:2px 8px;font-size:12px;color:var(--muted)}
     </style>
     """
     js = r"""
@@ -263,8 +264,8 @@ def html_report(items, overall_counts, output_path):
       }
 
       function updateVisibility(){
-        const enabled = { tp: tpT.checked, fp: fpT.checked, fn: fnT.checked };
-        const q=(search.value||"").toLowerCase();
+        const enabled = { tp: tpT?.checked ?? true, fp: fpT?.checked ?? false, fn: fnT?.checked ?? false };
+        const q=(search?.value||"").toLowerCase();
         $$(".sentence").forEach(card=>{
           const text=card.querySelector(".single-layer").textContent.toLowerCase();
           const show = text.includes(q);
@@ -279,30 +280,30 @@ def html_report(items, overall_counts, output_path):
         });
       }
 
-      thr.addEventListener("input", ()=>{ thrVal.textContent = thr.value; });
-      function applyWs(){ document.documentElement.style.setProperty("--ws", ws.value + "em"); wsVal.textContent = ws.value; }
-      ws.addEventListener("input", applyWs); applyWs();
+      thr?.addEventListener("input", ()=>{ if(thrVal) thrVal.textContent = thr.value; });
+      function applyWs(){ if(ws) { document.documentElement.style.setProperty("--ws", ws.value + "em"); if(wsVal) wsVal.textContent = ws.value; } }
+      ws?.addEventListener("input", applyWs); applyWs();
 
-      [search,tpT,fpT,fnT].forEach(el=> el.addEventListener("input", updateVisibility));
+      [search,tpT,fpT,fnT].forEach(el=> el?.addEventListener("input", updateVisibility));
       updateVisibility();
     })();
     </script>
     """
-    head = f"""
-    <!doctype html>
-    <html lang="en">
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>NER Overlap Report</title>
-    {css}
-    <body>
-    <header>
-      <div class="wrap">
-        <h1>NER Overlap Report</h1>
-        <div class="meta">
-          <div>Total sentences: {len(items)}</div>
-          <div>TP: {overall_counts['tp']} &nbsp; FP: {overall_counts['fp']} &nbsp; FN: {overall_counts['fn']}</div>
+    # Controls differ slightly in predictions-only mode
+    if predicted_only:
+        controls = f"""
+        <div class="controls">
+          <label class="toggle"><input id="toggle-tp" type="checkbox" checked> Show predictions</label>
+          <div class="slider">
+            <span>Word spacing</span>
+            <input id="ws" type="range" min="0" max="0.2" step="0.01" value="0.06">
+            <span id="ws-val">0.06</span><span>em</span>
+          </div>
+          <div class="search"><input id="search" placeholder="Search sentence text..."></div>
         </div>
+        """
+    else:
+        controls = f"""
         <div class="controls">
           <label class="toggle"><input id="toggle-tp" type="checkbox" checked> Show TP</label>
           <label class="toggle"><input id="toggle-fp" type="checkbox" checked> Show FP</label>
@@ -319,6 +320,26 @@ def html_report(items, overall_counts, output_path):
           </div>
           <div class="search"><input id="search" placeholder="Search sentence text..."></div>
         </div>
+        """
+
+    mode_pill = '<span class="pill">Mode: predictions-only</span>' if predicted_only else ''
+    head = f"""
+    <!doctype html>
+    <html lang="en">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>NER Overlap Report</title>
+    {css}
+    <body>
+    <header>
+      <div class="wrap">
+        <h1>NER Overlap Report</h1>
+        <div class="meta">
+          <div>Total sentences: {len(items)}</div>
+          <div>TP: {overall_counts['tp']} &nbsp; FP: {overall_counts['fp']} &nbsp; FN: {overall_counts['fn']}</div>
+          {mode_pill}
+        </div>
+        {controls}
       </div>
     </header>
     <main class="wrap"><div class="grid">
@@ -326,9 +347,14 @@ def html_report(items, overall_counts, output_path):
     body = []
     for it in items:
         body.append(build_sentence_block(it["sent_id"], it["text"], it["tp"], it["fp"], it["fn"]))
+    footer_note = (
+        "Predictions-only view: showing model spans as a single layer. FP/FN disabled."
+        if predicted_only else
+        "Greedy global matching (Dice score by default). Many-to-one containment on; nested FP shards suppressed."
+    )
     tail = f"""
     </div></main>
-    <footer class="wrap">Greedy global matching (Dice score by default), type match required. Many-to-one containment on; nested FP shards suppressed. Adjust word spacing if needed.</footer>
+    <footer class="wrap">{footer_note}</footer>
     {js}
     </body></html>
     """
@@ -337,7 +363,7 @@ def html_report(items, overall_counts, output_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gold_file", required=True)
+    ap.add_argument("--gold_file", help="Optional gold JSONL; omit for predictions-only mode", required=False)
     ap.add_argument("--model_file", required=True)
     ap.add_argument("--output_html", required=True)
     ap.add_argument("--overlap_threshold", type=float, default=0.5)
@@ -351,31 +377,43 @@ def main():
     ap.add_argument("--no_suppress_nested_fp", dest="suppress_nested_fp", action="store_false")
     args = ap.parse_args()
 
-    gold = load_spans(args.gold_file)
+    gold = load_spans(args.gold_file) if args.gold_file else {}
     model = load_spans(args.model_file)
 
-    keys = sorted(set(gold.keys()) | set(model.keys()))
+    keys = sorted(set(gold.keys()) | set(model.keys())) if gold else sorted(set(model.keys()))
     items = []
     counts = {"tp":0, "fp":0, "fn":0, "overlap_threshold": args.overlap_threshold}
 
+    # Detect predictions-only mode if no gold provided OR there are zero gold spans overall
+    gold_total_spans = 0
+    if gold:
+        for k in gold.keys():
+            gold_total_spans += len(extract_gold_spans(gold.get(k, [])))
+    predictions_only = (not gold) or (gold_total_spans == 0)
+
+
     for k in keys:
-        g_list = gold.get(k, [])
+        g_list = gold.get(k, []) if gold else []
         m_list = model.get(k, [])
         text = extract_sentence_text(g_list or m_list)
-        g_spans = extract_gold_spans(g_list)
+        g_spans = extract_gold_spans(g_list) if not predictions_only else []
         p_spans = extract_model_spans(m_list, args.pred_source)
 
-        tp, fp, fn = categorize_spans(
-            g_spans, p_spans, args.overlap_threshold,
-            metric=args.metric, require_type=args.require_type,
-            allow_many_to_one=args.allow_many_to_one,
-            suppress_nested_fp=args.suppress_nested_fp
-        )
+        if predictions_only:
+            # Just show predictions as a single layer (use TP channel for color)
+            tp, fp, fn = p_spans, [], []
+        else:
+            tp, fp, fn = categorize_spans(
+                g_spans, p_spans, args.overlap_threshold,
+                metric=args.metric, require_type=args.require_type,
+                allow_many_to_one=args.allow_many_to_one,
+                suppress_nested_fp=args.suppress_nested_fp
+            )
         counts["tp"] += len(tp); counts["fp"] += len(fp); counts["fn"] += len(fn)
 
         items.append({"sent_id": f"{k[0]}:{k[1]}", "text": text or "", "tp": tp, "fp": fp, "fn": fn})
 
-    html_report(items, counts, args.output_html)
+    html_report(items, counts, args.output_html, predicted_only=predictions_only)
 
 if __name__ == "__main__":
     main()
