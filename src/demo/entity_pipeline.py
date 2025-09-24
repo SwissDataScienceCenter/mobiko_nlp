@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple, Optional, Any
 import threading
 from pathlib import Path
 import re, unicodedata
+from collections import defaultdict
 
 
 import spacy
@@ -19,10 +20,13 @@ from ner.ner_infer import NerInferencer
 from preprocess.gazetteer_matcher import Rule as GazetteerRule, load_gaz_rules_from_dir, GazetteerMatcher
 
 
-from prompts import DEFAULT_SYSTEM_PROMPT, NO_CHUNK_CANDIDATE_SYSTEM_PROMPT, NER_AWARE_SYSTEM_PROMPT
+from prompts import *
 import glob
 
 
+
+IOU_THR = 0.7  # span merge tolerance
+DEFAULT_SOURCE_WEIGHTS = {"gazetteer": 0.9, "ner": 0.7, "chunks": 0.6, "bioc": 0.8, "unknown": 0.6}
 
 
 # Model configurations
@@ -260,7 +264,7 @@ def remove_thinking_blocks(content: str) -> str:
     return cleaned
 
 
-def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict]) -> List[Dict]:
+def call_llm_batch(client, model_name: str, model_type: str, few_shot: bool, requests: List[Dict]) -> List[Dict]:
     """Process multiple LLM requests efficiently."""
     results = []
 
@@ -295,14 +299,16 @@ def call_llm_batch(client, model_name: str, model_type: str, requests: List[Dict
                     cand_objs.append(obj)
                 user_payload = {"sentence": sentence, "candidates": cand_objs}
             else:
-                # Legacy chunks path: no types proposed
-                system_prompt = DEFAULT_SYSTEM_PROMPT
+                if few_shot:
+                    system_prompt = SYSTEM_PROMPT_FEW_SHOT_NEW
+                else:
+                    # Legacy chunks path: no types proposed
+                    system_prompt = DEFAULT_SYSTEM_PROMPT_NEW
                 cand_objs = [
                     {"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]}
                     for c in candidates
                 ]
                 user_payload = {"sentence": sentence, "candidates": cand_objs}
-
 
         # Modify system prompt for Qwen 32B
         if model_type == "qwen3-32B":
@@ -363,7 +369,8 @@ def process_with_chunks(sent):
         cands.append({
             "start_char": np.start_char,
             "end_char": np.end_char,
-            "text": np_text
+            "text": np_text,
+            "source": "chunks"
         })
     return cands
 
@@ -401,6 +408,7 @@ def _normalize_bioc_spans(spans: List[Dict[str, Any]], sent_text: str) -> List[D
                 "start_char": int(s["start"]),
                 "end_char": int(s["end"]),
                 "type": s.get("type"),  # may be None; prompt handles both
+                "source": "bioc"
             })
     return fix_span_indices(norm_spans, sent_text)
 
@@ -439,6 +447,8 @@ def process_sentences_batch(
     bioc_index: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     gazetteer_matcher: GazetteerMatcher | None = None,
     use_bioc: bool = False,
+    type_map: Optional[Dict[str, str]] = None,
+    source_weights: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Build candidates for a batch of sentences.
@@ -482,7 +492,13 @@ def process_sentences_batch(
 
             if not cands:
                 continue
-            batch_results.append({"sentence": sent_text, "candidates": cands})
+
+            fused = fuse_candidates(
+                cands,
+                type_map=type_map,
+                source_weights=source_weights
+            )
+            batch_results.append({"sentence": sent_text, "candidates": fused})
         print(f'Processed {len(batch_results)} sentences with spaCy chunks')
         return batch_results
 
@@ -514,6 +530,10 @@ def process_sentences_batch(
         for i, sent_text in enumerate(sentence_batch):
             spans = spans_lists[i]
 
+            # Set source for NER spans
+            for c in spans or []:
+                c.setdefault("source", "ner")
+
             gz = gazetteer_candidates(sent_text, gazetteer_matcher) if gazetteer_matcher is not None else []
 
             if spans:
@@ -526,7 +546,13 @@ def process_sentences_batch(
                     norm_spans = _normalize_bioc_spans(spans, sent_text)
                     if norm_spans:
                         spans = spans + norm_spans
-                batch_results.append({"sentence": sent_text, "candidates": spans})
+
+                fused = fuse_candidates(
+                    spans,
+                    type_map=type_map,
+                    source_weights=source_weights
+                )
+                batch_results.append({"sentence": sent_text, "candidates": fused})
             else:
                 # Fallback (if any), else leave candidates=None
                 if np_fallback:
@@ -534,7 +560,12 @@ def process_sentences_batch(
                     if gz:
                         cands = cands + gz
                     if cands:
-                        batch_results.append({"sentence": sent_text, "candidates": cands})
+                        fused = fuse_candidates(
+                            cands,
+                            type_map=type_map,
+                            source_weights=source_weights
+                        )
+                        batch_results.append({"sentence": sent_text, "candidates": fused})
                     else:
                         batch_results.append({"sentence": sent_text, "candidates": None})
                 else:
@@ -551,7 +582,6 @@ def process_sentences_batch(
     return batch_results
 
 
-
 _WS = re.compile(r"\s+")
 _PUNCT = str.maketrans({
     "“":"\"", "”":"\"", "‘":"'", "’":"'",
@@ -565,7 +595,6 @@ def _canon(s: str) -> str:
     s = unicodedata.normalize("NFKC", s).translate(_PUNCT)
     s = _WS.sub(" ", s).strip().lower()
     return s
-
 
 
 def _dedupe_bioc_index(
@@ -627,6 +656,136 @@ def gazetteer_candidates(sentence: str, gazetteer: GazetteerMatcher) -> list[dic
     return out
 
 
+# Helpers for candidate fusion
+
+def _normalize_text_min(s: str) -> str:
+    # light canonicalization for dedupe
+    s = unicodedata.normalize("NFKC", s).strip().lower()
+    return " ".join(s.split())
+
+
+def _iou(a: tuple[int,int], b: tuple[int,int]) -> float:
+    (s1,e1),(s2,e2) = a,b
+    inter = max(0, min(e1,e2) - max(s1,s2))
+    if inter <= 0:
+        return 0.0
+    union = (e1 - s1) + (e2 - s2) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _noisy_or(ps: list[float]) -> float:
+    prod = 1.0
+    for p in ps:
+        p = max(0.0, min(1.0, p))
+        prod *= (1.0 - p)
+    return 1.0 - prod
+
+
+def _map_type(raw_type: Optional[str], tmap: Dict[str,str]) -> Optional[str]:
+    if not raw_type:
+        return None
+    return tmap.get(raw_type, raw_type)
+
+
+def fuse_candidates(
+    cands: List[Dict[str,Any]],
+    type_map: Dict[str,str] | None = None,
+    source_weights: Dict[str,float] | None = None,
+    iou_thr: float = IOU_THR,
+) -> List[Dict[str,Any]]:
+    """
+    Merge duplicate spans coming from different sources into a single candidate.
+    Keeps provenance and aggregates type hypotheses via noisy-OR.
+    """
+    if not cands:
+        return []
+
+    tmap = type_map or {}
+    sweights = source_weights or DEFAULT_SOURCE_WEIGHTS
+
+    # normalize + copy
+    items = []
+    for c in cands:
+        s = int(c["start_char"]); e = int(c["end_char"])
+        if e <= s:  # guard
+            continue
+        txt = c["text"]
+        src = c.get("source", "unknown")
+        score = float(c.get("score", 1.0))
+        mapped = _map_type(c.get("type"), tmap)
+        items.append({
+            "text": txt,
+            "text_norm": _normalize_text_min(txt),
+            "start_char": s, "end_char": e,
+            "type": mapped,
+            "source": src,
+            "score": score,
+            "meta": c.get("meta", {})
+        })
+
+    # cluster by (text_norm) and IoU
+    items.sort(key=lambda x: (x["text_norm"], x["start_char"], -(x["end_char"]-x["start_char"])))
+    clusters: list[list[dict]] = []
+    for it in items:
+        placed = False
+        for cl in clusters:
+            if cl[0]["text_norm"] != it["text_norm"]:
+                continue
+            # IoU with cluster leader OR exact match with any member
+            if _iou((it["start_char"], it["end_char"]),
+                    (cl[0]["start_char"], cl[0]["end_char"])) >= iou_thr or \
+               any(m["start_char"]==it["start_char"] and m["end_char"]==it["end_char"] for m in cl):
+                cl.append(it); placed = True; break
+        if not placed:
+            clusters.append([it])
+
+    fused: list[dict] = []
+
+    for cl in clusters:
+        # choose canonical span: prefer longest; tiebreak by highest score
+        can = max(cl, key=lambda x: (x["end_char"] - x["start_char"], x["score"]))
+        s,e = can["start_char"], can["end_char"]
+        text = can["text"]
+
+        # evidence per type
+        type_scores: dict[str, list[float]] = defaultdict(list)
+        sources = []
+
+        for m in cl:
+            t = m["type"]
+            w = sweights.get(m["source"], sweights.get("unknown", 0.6))
+            if t:
+                type_scores[t].append(w * m["score"])
+            sources.append({
+                "name": m["source"], "type": t,
+                "score": m["score"], "meta": m.get("meta", {})
+            })
+
+        type_votes = {t: _noisy_or(vs) for t,vs in type_scores.items()}
+
+        aliases = []
+        for m in cl:
+            if (m["start_char"], m["end_char"]) != (s,e):
+                aliases.append({
+                    "text": m["text"],
+                    "start_char": m["start_char"],
+                    "end_char": m["end_char"],
+                    "source": m["source"],
+                    "type": m["type"]
+                })
+
+        fused.append({
+            "text": text,
+            "start_char": s, "end_char": e,
+            "span_policy": "longest",
+            "type_votes": type_votes,      # multiple hypotheses preserved
+            "sources": sources,            # provenance
+            "aliases": aliases             # optional / informative
+        })
+
+    return fused
+
+
 
 def main():
     global client, model_name
@@ -674,7 +833,40 @@ def main():
     ap.add_argument("--gaz_dir", type=str, default=None,
                     help="Directory with CSV/TSV gazetteers; filename is used as entity type.")
 
+    # ==== Few-shot ====
+    ap.add_argument("--few_shot", action="store_true", help="Use few-shot examples in system prompt.")
+
+    # ==== Fusion ====
+    ap.add_argument("--type_map_json", type=str, default=None,
+                    help="JSON file mapping external labels to canonical schema (e.g., {'Biomes':'HABITAT'}).")
+    ap.add_argument("--source_weights_json", type=str, default=None,
+                    help="JSON file mapping source->weight (e.g., {'gazetteer':0.9,'ner':0.7}).")
+
+
     args = ap.parse_args()
+
+    type_map = {
+          "Biomes": "HABITAT",
+          "Biota": "TAXON",
+          "Mountains": "HABITAT",
+          "MountainRange": "HABITAT",
+          "geography": "HABITAT",
+          "ENV_FEATURE": "ENV_FEATURE",
+          "POPULATION": "POPULATION",
+          "TAXON": "TAXON",
+          "LOCATION": "LOCATION",
+          "HABITAT": "HABITAT",
+          "THREAT": "THREAT"
+        }
+    if args.type_map_json:
+        with open(args.type_map_json, "r", encoding="utf-8") as f:
+            type_map = json.load(f)
+
+    source_weights = DEFAULT_SOURCE_WEIGHTS.copy()
+    if args.source_weights_json:
+        with open(args.source_weights_json, "r", encoding="utf-8") as f:
+            source_weights.update(json.load(f))
+
 
 
     # Initialize LLM client
@@ -761,13 +953,15 @@ def main():
                     np_fallback=args.np_fallback,
                     bioc_index=bioc_index,
                     gazetteer_matcher=gaz_matcher,
-                    use_bioc=args.use_bioc
+                    use_bioc=args.use_bioc,
+                    type_map=type_map,
+                    source_weights=source_weights
                 )
 
                 assert len(candidate_results) == len(batch), \
                     f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
 
-                llm_results = call_llm_batch(client, model_name, args.model_type, candidate_results)
+                llm_results = call_llm_batch(client, model_name, args.model_type, args.few_shot, candidate_results)
                 if len(llm_results) != len(candidate_results):
                     raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
 
