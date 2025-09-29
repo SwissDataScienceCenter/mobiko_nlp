@@ -34,14 +34,12 @@ Rules:
 - Prefer HIGH RECALL. If plausible but uncertain, include and set "uncertain": true in a note.
 - Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
 - If no entities are accepted but any are plausible, you MUST populate "missing".
-- Always fill the "coverage" map over the major types (true/false) to indicate whether the sentence likely contains each type.
 
 Return STRICT JSON only, this is the output schema:
 {{
   "accepted": [{{"text":"...", "type":"<ONE OF ALLOWED>", "start_char":int, "end_char":int, "note":"optional", "uncertain": false}}],
   "rejected": [{{"text":"...", "reason":"..."}}],
   "missing":  [{{"text":"...", "type":"<ONE OF ALLOWED>", "start_char":int, "end_char":int, "note":"optional"}}],
-  "coverage": {{"TAXON": false, "HABITAT": false, "LOCATION": false, "POPULATION": false, "THREAT": false, "ENV_FEATURE": false}},
   "candidates_all": [{{"text":"...", "start_char":int, "end_char":int, "why":"np/heuristic"}}],
   "notes": "optional short string"
 }}
@@ -185,7 +183,7 @@ Return STRICT JSON only, matching this schema:
 
 Guidelines:
 - Prefer HIGH RECALL. If uncertain about type or span, still include the entity with a note.
-- Spans use 0-based [start_char, end_char) indices.
+- Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
 - Do not invent new types beyond the schema. 
 - Types of candidates are suggestions only, correct if needed using the schema.
 - Missing list is for entities clearly present but absent from candidates.
