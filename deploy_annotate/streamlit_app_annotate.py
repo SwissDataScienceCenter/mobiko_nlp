@@ -277,6 +277,9 @@ def merge_span_into_gold(gold_spans: List[Dict], new_span: Dict, metric="dice", 
     return dedup_exact(out)
 
 # -------------------- UI --------------------
+
+
+
 st.set_page_config(page_title="NER Annotation (Promote Predictions)", layout="wide")
 st.title("NER Annotation — Approve Model Spans into Gold")
 
@@ -407,6 +410,86 @@ html_block = build_single_layer_html(
 st.components.v1.html(html_block, height=260, scrolling=True)
 
 colG, colP = st.columns(2)
+
+# --- Helper: find all occurrences of a substring with context previews ---
+def _find_occurrences(text: str, query: str, window: int = 40):
+    out = []
+    if not query:
+        return out
+    start = 0
+    while True:
+        i = text.find(query, start)
+        if i == -1:
+            break
+        j = i + len(query)
+        left = max(0, i - window)
+        right = min(len(text), j + window)
+        preview = f"{text[left:i]}[ {text[i:j]} ]{text[j:right]}"
+        out.append({"start": i, "end": j, "preview": preview})
+        start = i + 1
+    return out
+
+st.divider()
+st.markdown("### ➕ Add manual span (not proposed by the model)")
+
+with st.container(border=True):
+    mode = st.radio("Add by…", ["Text match", "Offsets"], horizontal=True, key=f"add_mode_{idx}")
+
+    # Label chooser (reuse discovered labels, allow custom)
+    lab = st.selectbox("Label", options=label_options + ["(custom)"], key=f"add_lab_{idx}")
+    if lab == "(custom)":
+        lab = st.text_input("Custom label", value="", key=f"add_lab_custom_{idx}")
+
+    if mode == "Text match":
+        q = st.text_input("Exact text to add (case-sensitive substring)", key=f"add_q_{idx}")
+        matches = _find_occurrences(text, q) if q else []
+        if matches:
+            pick = st.selectbox(
+                "Choose occurrence (shows local context)",
+                options=list(range(len(matches))),
+                format_func=lambda k: matches[k]["preview"],
+                key=f"add_pick_{idx}"
+            )
+            chosen = matches[pick]
+            a, b = chosen["start"], chosen["end"]
+            st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
+        else:
+            chosen = None
+            if q:
+                st.warning("No matches found in this sentence.")
+
+    else:  # Offsets
+        a = st.number_input("Start char", min_value=0, max_value=len(text), value=0, step=1, key=f"add_a_{idx}")
+        b = st.number_input("End char", min_value=0, max_value=len(text), value=min(len(text), 1), step=1, key=f"add_b_{idx}")
+        chosen = {"start": int(a), "end": int(b)} if int(a) < int(b) else None
+        if chosen:
+            aa, bb = chosen["start"], chosen["end"]
+            st.caption(f"Preview: `[{aa},{bb})` → `{text[aa:bb]}`")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        snap = st.checkbox("Auto-merge if overlaps same label", value=merge_same_label, key=f"add_merge_{idx}")
+    with c2:
+        go_next = st.checkbox("After adding, jump to next sentence", value=False, key=f"add_next_{idx}")
+
+    can_add = (lab is not None and lab != "" and chosen is not None)
+    btn = st.button("Add manual span", type="primary", disabled=not can_add, key=f"add_btn_{idx}")
+    if btn and can_add:
+        new_span = {"start_char": int(chosen["start"]), "end_char": int(chosen["end"]), "type": lab}
+        st.session_state.aug_gold[cur_key] = merge_span_into_gold(
+            st.session_state.aug_gold[cur_key],
+            new_span,
+            metric=metric,
+            thr=merge_thr,
+            do_merge=snap
+        )
+        st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
+        _maybe_autosave()
+        if go_next and idx < len(keys) - 1:
+            # move the slider forward programmatically
+            st.experimental_set_query_params(sent=str(idx+1))
+        force_rerun()
+
 
 with colP:
     st.markdown("### Proposed additions (" + ("model spans" if predictions_only else "model FPs") + ")")
