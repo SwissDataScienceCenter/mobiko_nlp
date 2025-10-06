@@ -7,38 +7,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- dirs & users
-ENV APP_DIR=/app \
-    VENV=/opt/venv
-RUN useradd -m -s /bin/bash appuser && mkdir -p $APP_DIR /var/log/supervisor
+ARG BASIC_AUTH_USER=anisia
+ARG BASIC_AUTH_PASS_HASH
+RUN mkdir -p /mydata/mobiko/anisia/deploy_annotate \
+ && printf "%s:%s\n" "$BASIC_AUTH_USER" "$BASIC_AUTH_PASS_HASH" > /mydata/mobiko/anisia/deploy_annotate/htpasswd \
+ && chmod 600 /mydata/mobiko/anisia/deploy_annotate/htpasswd
+
+ENV APP_DIR=/app
 WORKDIR $APP_DIR
 
-# --- python env
-RUN python -m venv $VENV
-ENV PATH="$VENV/bin:$PATH"
+RUN useradd -m -s /bin/bash appuser && mkdir -p $APP_DIR /var/log/supervisor
 
-# --- copy code and configs
-# If your app is elsewhere, COPY it in:
+COPY requirements.txt /app/
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt
 
-COPY streamlit_app_annotate.py $APP_DIR/streamlit_app_annotate.py
-COPY requirements.txt $APP_DIR/
-COPY nginx.conf /etc/nginx/nginx.conf
+COPY streamlit_app_annotate.py /app/
+
+RUN rm -f /etc/nginx/conf.d/default.conf
+
+COPY nginx.conf /etc/nginx/conf.d/streamlit.conf
+COPY nginx_main.conf /etc/nginx/nginx.conf
+
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-# --- python deps
-RUN pip install --no-cache-dir -r requirements.txt
-
-# --- nginx auth file (mounted at runtime or generated from env)
-# We'll expect /etc/nginx/.htpasswd to be provided at runtime,
-# or generate it from BASIC_AUTH_USER/PASSWORD in /start.sh
 
 # --- permissions
 RUN chown -R appuser:appuser $APP_DIR /var/log/nginx /var/lib/nginx /var/log/supervisor
 
 USER appuser
 
-# Streamlit listens on 8502 internally, nginx on 80
+# Streamlit listens on 8502 internally, nginx on 8000
 ENV STREAMLIT_SERVER_PORT=8502 \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
