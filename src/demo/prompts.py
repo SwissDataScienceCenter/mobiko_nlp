@@ -183,7 +183,7 @@ Return STRICT JSON only, matching this schema:
 
 Guidelines:
 - Prefer HIGH RECALL. If uncertain about type or span, still include the entity with a note.
-- Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
+- Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate, but respect the text. Do not invent spans which are not present in the text.
 - Do not invent new types beyond the schema. 
 - Types of candidates are suggestions only, correct if needed using the schema.
 - Missing list is for entities clearly present but absent from candidates.
@@ -200,13 +200,13 @@ EXAMPLES:
 "response": {{
     "accepted": [
         {{"text": "Amazon rainforest", "type": "HABITAT", "start_char": 4, "end_char": 21}},
-        {{"text": "increase in temperature", "type": "ENV_FEATURE", "start_char": 33, "end_char": 53}}
+        {{"text": "increase in temperature", "type": "TEMPERATURE TREND", "start_char": 33, "end_char": 53}}
     ],
     "rejected": [
         {{"text": "decade", "reason": "Not a biodiversity entity"}}
     ],
     "missing": [],
-    "notes": "temperature mapped to ENV_FEATURE"
+    "notes": "temperature mapped to TEMPERATURE TREND"
 }}}}
 
 {{
@@ -220,7 +220,7 @@ EXAMPLES:
     "accepted": [
         {{"text": "Deforestation", "type": "DRIVER", "start_char": 0, "end_char": 13}},
         {{"text": "Congo Basin", "type": "LOCATION", "start_char": 21, "end_char": 32}},
-        {{"text": "species", "type": "TAXON", "start_char": 57, "end_char": 64}}
+        {{"text": "species", "type": "SPECIES", "start_char": 57, "end_char": 64}}
     ],
     "rejected": [],
     "missing": [],
@@ -237,8 +237,8 @@ EXAMPLES:
 "response": {{
     "accepted": [
         {{"text": "population decrease rate", "type": "POPULATION", "start_char": 4, "end_char": 28}},
-        {{"text": "mountain gorillas", "type": "TAXON", "start_char": 32, "end_char": 49}},
-        {{"text": "conservation management measures", "type": "STATUS", "start_char": 65, "end_char": 107}}
+        {{"text": "mountain gorillas", "type": "SPECIES", "start_char": 32, "end_char": 49}},
+        {{"text": "conservation management measures", "type": "CONSERVATION STATUS", "start_char": 65, "end_char": 107}}
     ],
     "rejected": [],
     "missing": [],
@@ -254,8 +254,8 @@ EXAMPLES:
 ],
 "response": {{
     "accepted": [
-        {{"text": "hunting", "type": "THREAT", "start_char": 8, "end_char": 15}},
-        {{"text": "snow leopards", "type": "TAXON", "start_char": 19, "end_char": 32}},
+        {{"text": "hunting", "type": "DRIVER", "start_char": 8, "end_char": 15}},
+        {{"text": "snow leopards", "type": "SPECIES", "start_char": 19, "end_char": 32}},
         {{"text": "Central Asia", "type": "LOCATION", "start_char": 52, "end_char": 63}}
     ],
     "rejected": [],
