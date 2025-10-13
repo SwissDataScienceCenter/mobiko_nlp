@@ -7,7 +7,7 @@ import streamlit.components.v1 as components
 import streamlit as st
 
 # ---------- Persist options defaults ----------
-SAVE_PATH = "/s3/mobiko/mobiko-data/augmented_gold.jsonl"
+SAVE_PATH = "/mydata/mobiko/anisia/data/augmented_gold.jsonl"
 
 # Autosave is always on; change SAVE_PATH above if needed.
 if "autosave" not in st.session_state:
