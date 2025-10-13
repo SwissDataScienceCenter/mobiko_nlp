@@ -7,7 +7,7 @@ import streamlit.components.v1 as components
 import streamlit as st
 
 # ---------- Persist options defaults ----------
-SAVE_PATH = "/mydata/mobiko/anisia/data/augmented_gold.jsonl"
+SAVE_PATH = "/s3/mobiko/mobiko-data/augmented_gold.jsonl"
 
 # Autosave is always on; change SAVE_PATH above if needed.
 if "autosave" not in st.session_state:
@@ -278,52 +278,6 @@ def merge_to_fragments(text, tp, fp, fn):
             merged.append((seg,cats,pl,gl))
     return merged
 
-# def build_single_layer_html(text, tp, fp, fn, show_tp, show_fp, show_fn, word_spacing_em=0.06, light_bg=True, doc_id=None, sent_idx=None):
-#     import html as html_mod
-#     fragments=merge_to_fragments(text,tp,fp,fn)
-#     enabled={"tp":show_tp,"fp":show_fp,"fn":show_fn}
-#     mix = 0.35 if light_bg else 0.25
-#     def style_for_cats(cats):
-#         on=[c for c in cats if enabled.get(c, False)]
-#         if len(on)==0: return ("transparent", "none")
-#         if len(on)==1:
-#             c=on[0]
-#             return (f"color-mix(in srgb, var(--{c}) {int(mix*100)}%, transparent)",
-#                     f"inset 0 0 0 1px color-mix(in srgb, var(--{c}) 60%, {'white' if light_bg else 'black'})")
-#         step=6
-#         seq=", ".join([f"var(--{c}) {i*step}px {(i+1)*step}px" for i,c in enumerate(on)])
-#         return (f"repeating-linear-gradient(135deg, {seq})", "inset 0 0 0 1px #0003")
-#     parts=[]
-#     for seg,cats,p_labels,g_labels in fragments:
-#         esc=html_mod.escape(seg)
-#         if not cats: parts.append(esc); continue
-#         bg, box = style_for_cats(cats)
-#         pred_lbl = ", ".join(sorted(p_labels)) if p_labels else "—"
-#         gold_lbl = ", ".join(sorted(g_labels)) if g_labels else "—"
-#         title = f"Pred: {pred_lbl}\\nGold: {gold_lbl}"
-#         parts.append(f'<span class="mark" style="background:{bg}; box-shadow:{box};" title="{html_mod.escape(title)}">{esc}</span>')
-#     if light_bg:
-#         css = f"""
-#         <style>
-#         :root {{ --tp:#2e7d32; --fp:#c62828; --fn:#6a1b9a; }}
-#         .sent-card {{ background: #f7f9ff; border: 1px solid #dbe1ff; border-radius: 12px; padding: 12px; }}
-#         .single-layer {{ white-space: pre-wrap; word-break: break-word; font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Arial; color: #0c1222; word-spacing: {word_spacing_em}em; }}
-#         .mark {{ border-radius: 4px; padding: 0; }}
-#         .mark:hover {{ outline: 2px solid #0002; cursor: help; }}
-#         </style>
-#         """
-#     else:
-#         css = f"""
-#         <style>
-#         :root {{ --tp:#2e7d32; --fp:#c62828; --fn:#6a1b9a; }}
-#         .sent-card {{ background: #0e1730; border: 1px dashed #2a355e; border-radius: 10px; padding: 10px; }}
-#         .single-layer {{ white-space: pre-wrap; word-break: break-word; font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Arial; color: #e6ecff; word-spacing: {word_spacing_em}em; }}
-#         .mark {{ border-radius: 4px; padding: 0; }}
-#         .mark:hover {{ outline: 2px solid #fff3; cursor: help; }}
-#         </style>
-#         """
-#     return f"{css}<div class='sent-card'><div class='single-layer' data-doc='{doc_id}' data-idx='{sent_idx}'>{''.join(parts)}</div></div>" + ("\n<script>\n(function(){\n  const root = document.currentScript.closest('div'); // within the component\n  const card = root.querySelector('.single-layer');\n  if (!card) return;\n  const DOC = %(doc_json)s;\n  const IDX = %(idx_json)s;\n\n  function getOffsetsWithin(el){\n    const sel = window.getSelection();\n    if (!sel || sel.rangeCount === 0) return null;\n    const range = sel.getRangeAt(0);\n    // Build a range from start of container to selection start to count text length\n    const preRange = document.createRange();\n    preRange.selectNodeContents(el);\n    preRange.setEnd(range.startContainer, range.startOffset);\n    const a = (preRange.toString() || \"\").length;\n\n    const preRange2 = document.createRange();\n    preRange2.selectNodeContents(el);\n    preRange2.setEnd(range.endContainer, range.endOffset);\n    const b = (preRange2.toString() || \"\").length;\n\n    if (b <= a) return null;\n    return {a, b};\n  }\n\n  function hotAdd(jumpNext){\n    const offs = getOffsetsWithin(card);\n    if (!offs) return;\n    // Build query and navigate; Streamlit will pick it up via query_params()\n    const qp = new URLSearchParams(window.location.search);\n    qp.set(\"hotadd\", DOC + \"|\" + IDX + \"|\" + offs.a + \"|\" + offs.b);\n    if (jumpNext) {\n      qp.set(\"jump\", \"1\");\n    }\n    const url = window.location.pathname + \"?\" + qp.toString();\n    window.top.location.href = url;\n  }\n\n  window.addEventListener('keydown', function(e){\n    // Ctrl+Enter -> accept\n    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {\n      hotAdd(false);\n      e.preventDefault();\n      return;\n    }\n    // Alt+Enter -> accept & jump\n    if (e.key === 'Enter' && e.altKey) {\n      hotAdd(true);\n      e.preventDefault();\n      return;\n    }\n  });\n})();\n</script>\n" % {'doc_json': json.dumps(doc_id), 'idx_json': json.dumps(sent_idx)})
-
 
 def build_single_layer_html(text, tp, fp, fn, show_tp, show_fp, show_fn,
                             word_spacing_em=0.06, light_bg=True, doc_id=None, sent_idx=None):
@@ -470,8 +424,6 @@ def build_single_layer_html(text, tp, fp, fn, show_tp, show_fp, show_fn,
 """ % {"doc": _json.dumps(doc_id), "idx": _json.dumps(sent_idx)}
 
     return html_core + js
-
-
 
 
 
@@ -626,23 +578,6 @@ label_options = collect_labels() or ["ORG","PER","LOC","MISC"]
 # Sentence navigation
 idx = st.slider("Sentence index", 0, len(keys)-1, 0, 1)
 cur_key = keys[idx]
-
-# # Optional: jump to next sentence if 'jump=1' was set by Alt+Enter
-# try:
-#     _q = st.query_params()
-#     if (_q.get("jump") or ["0"])[0] == "1":
-#         # clear jump flag immediately
-#         _keep = {}
-#         if (_q.get("sent") or [None])[0] is not None: _keep["sent"] = (_q.get("sent") or [""])[0]
-#         st.experimental_set_query_params(**_keep)
-#         # advance idx if possible
-#         if idx < len(keys) - 1:
-#             idx = idx + 1
-#             cur_key = keys[idx]
-# except Exception:
-#     pass
-
-
 
 text = extract_text(gold.get(cur_key, []) or model.get(cur_key, []))
 gold_spans = st.session_state.aug_gold[cur_key]
