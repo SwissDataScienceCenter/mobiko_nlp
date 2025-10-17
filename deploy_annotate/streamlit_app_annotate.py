@@ -3,7 +3,6 @@ from collections import defaultdict
 from typing import Dict, List, Tuple, Any
 import io
 import streamlit.components.v1 as components
-
 import streamlit as st
 
 # ---------- Persist options defaults ----------
@@ -88,7 +87,6 @@ def _apply_hotadd_from_query(cur_key, text, proposals, default_label_options):
     return True
 
 
-
 # ---------- Rerun compatibility ----------
 def force_rerun():
     if hasattr(st, "rerun"):
@@ -123,20 +121,26 @@ def _maybe_autosave():
         with open(SAVE_PATH, "w", encoding="utf-8") as f:
             f.write(export_augmented_jsonl())
 
+
 # -------------------- Span math --------------------
 def span_len(a, b): return max(0, int(b) - int(a))
+
 def overlap(a0, a1, b0, b1):
     s = max(int(a0), int(b0)); e = min(int(a1), int(b1))
     return max(0, e - s)
+
 def dice(a0, a1, b0, b1):
     inter = overlap(a0,a1,b0,b1); denom = span_len(a0,a1) + span_len(b0,b1)
     return (2*inter/denom) if denom > 0 else 0.0
+
 def iou(a0, a1, b0, b1):
     inter = overlap(a0,a1,b0,b1); uni = span_len(a0,a1) + span_len(b0,b1) - inter
     return (inter/uni) if uni > 0 else 0.0
+
 def overlap_min(a0,a1,b0,b1):
     inter = overlap(a0,a1,b0,b1); denom = min(span_len(a0,a1), span_len(b0,b1))
     return (inter/denom) if denom > 0 else 0.0
+
 def score_pair(p, g, metric):
     a0,a1 = int(p["start_char"]), int(p["end_char"])
     b0,b1 = int(g["start_char"]), int(g["end_char"])
@@ -426,7 +430,6 @@ def build_single_layer_html(text, tp, fp, fn, show_tp, show_fp, show_fn,
     return html_core + js
 
 
-
 # -------------------- Annotation helpers --------------------
 def dedup_exact(spans: list[dict]) -> list[dict]:
     seen = set()
@@ -505,10 +508,8 @@ def render_html(html: str):
 # -------------------- UI --------------------
 
 
-st.set_page_config(page_title="NER Annotation — Minimal", layout="wide")
-
-
-st.title("NER Annotation — Minimal")
+st.set_page_config(page_title="BioNER Annotation", layout="wide")
+st.title("BioNER Annotation")
 
 # --- Minimal input (single JSONL uploader) ---
 st.markdown("### Input")
@@ -628,7 +629,7 @@ html_block = build_single_layer_html(
     doc_id=cur_key[0], sent_idx=cur_key[1]
 )
 
-render_html(html_block)
+# components.html(html_block)
 
 colG, colP = st.columns(2)
 
@@ -654,44 +655,27 @@ st.divider()
 st.markdown("### ➕ Add manual span (not proposed by the model)")
 
 with st.container(border=True):
-    mode = st.radio("Add by…", ["Text match", "Offsets"], horizontal=True, key=f"add_mode_{idx}")
-
     # Label chooser (reuse discovered labels, allow custom)
     lab = st.selectbox("Label", options=label_options + ["(custom)"], key=f"add_lab_{idx}")
     if lab == "(custom)":
         lab = st.text_input("Custom label", value="", key=f"add_lab_custom_{idx}")
 
-    if mode == "Text match":
-        q = st.text_input("Exact text to add (case-sensitive substring)", key=f"add_q_{idx}")
-        matches = _find_occurrences(text, q) if q else []
-        if matches:
-            pick = st.selectbox(
-                "Choose occurrence (shows local context)",
-                options=list(range(len(matches))),
-                format_func=lambda k: matches[k]["preview"],
-                key=f"add_pick_{idx}"
-            )
-            chosen = matches[pick]
-            a, b = chosen["start"], chosen["end"]
-            st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
-        else:
-            chosen = None
-            if q:
-                st.warning("No matches found in this sentence.")
-
-    else:  # Offsets
-        a = st.number_input("Start char", min_value=0, max_value=len(text), value=0, step=1, key=f"add_a_{idx}")
-        b = st.number_input("End char", min_value=0, max_value=len(text), value=min(len(text), 1), step=1, key=f"add_b_{idx}")
-        chosen = {"start": int(a), "end": int(b)} if int(a) < int(b) else None
-        if chosen:
-            aa, bb = chosen["start"], chosen["end"]
-            st.caption(f"Preview: `[{aa},{bb})` → `{text[aa:bb]}`")
-
-    c1, c2 = st.columns([1,1])
-    with c1:
-        snap = st.checkbox("Auto-merge if overlaps same label", value=merge_same_label, key=f"add_merge_{idx}")
-    with c2:
-        go_next = st.checkbox("After adding, jump to next sentence", value=False, key=f"add_next_{idx}")
+    q = st.text_input("Exact text to add (case-sensitive substring)", key=f"add_q_{idx}")
+    matches = _find_occurrences(text, q) if q else []
+    if matches:
+        pick = st.selectbox(
+            "Choose occurrence (shows local context)",
+            options=list(range(len(matches))),
+            format_func=lambda k: matches[k]["preview"],
+            key=f"add_pick_{idx}"
+        )
+        chosen = matches[pick]
+        a, b = chosen["start"], chosen["end"]
+        st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
+    else:
+        chosen = None
+        if q:
+            st.warning("No matches found in this sentence.")
 
     can_add = (lab is not None and lab != "" and chosen is not None)
     btn = st.button("Add manual span", type="primary", disabled=not can_add, key=f"add_btn_{idx}")
@@ -702,14 +686,11 @@ with st.container(border=True):
             new_span,
             metric=metric,
             thr=merge_thr,
-            do_merge=snap
+            do_merge=merge_same_label
         )
         st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
         st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
         _maybe_autosave()
-        if go_next and idx < len(keys) - 1:
-            # move the slider forward programmatically
-            st.experimental_set_query_params(sent=str(idx+1))
         force_rerun()
 
 
@@ -827,5 +808,3 @@ st.caption(f"Autosaving to {SAVE_PATH} on every change.")
 
 st.download_button("Download augmented_gold.jsonl", data=aug_jsonl.encode("utf-8"),
                    file_name="augmented_gold.jsonl", mime="application/jsonl")
-
-st.caption("Approve **candidates** (left) to build gold, edit/delete in **Current gold** (right), then **Download** or **Save**. In predictions-only mode, all model spans are candidates; in gold+model mode, candidates are FPs against the current gold.")
