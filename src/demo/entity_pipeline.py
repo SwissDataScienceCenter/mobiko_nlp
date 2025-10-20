@@ -67,6 +67,12 @@ MODEL_CONFIGS = {
         "api_key": None,  # Will use OPENAI_API_KEY env var
         "model_name": "gpt-4o"
     },
+    "qwen3-32B-vllm": {
+        "base_url": "https://vllm-gateway.runai-codev-llm.inference.compute.datascience.ch/v1",
+        "api_key": None,  # read from env
+        "model_name": "Qwen/Qwen3-32B-AWQ"  # use the exact id your gateway serves
+    }
+
 }
 
 
@@ -297,7 +303,7 @@ def _overlaps_any(span: tuple[int,int], spans: list[tuple[int,int]], iou_thr: fl
 
 
 def _is_ner(cand: dict) -> bool:
-    return cand.get("source") == "ner"
+    return any([s.get("name") == "ner" for s in cand.get("sources", [])])
 
 
 def _as_accepted(c: dict, forced_type: Optional[str] = None) -> dict:
@@ -353,7 +359,7 @@ def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
             if _is_gazetteer(c):
                 continue
             s, e = int(c["start_char"]), int(c["end_char"])
-            if any(_iou_tuple((s, e), gs) >= iou_thr for gs in gaz_spans):
+            if any(_iou_tuple((s, e), gs) >= iou_thr for gs in gaz_spans): # take both
                 # conflict with gazetteer → gaz wins; skip this NER span
                 continue
             if _is_ner(c):
@@ -504,7 +510,7 @@ def call_llm_batch_revision(client, model_name, model_type, requests, temperatur
         payload = {"sentence": req["sentence"], "previous": req["prev_json"],
                    "prev_notes": req.get("prev_notes", "")  # short running notes
 }
-        if model_type == "qwen3-32B":
+        if "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
         content = client.chat.completions.create(
@@ -515,7 +521,7 @@ def call_llm_batch_revision(client, model_name, model_type, requests, temperatur
             timeout=360,
         ).choices[0].message.content
 
-        if model_type in ("qwen3-32B", "gpt4o"):
+        if model_type in ("qwen3-32B", "gpt4o", "qwen3-32B-vllm"):
             content = remove_thinking_blocks(content)
         obj = safe_json_from_llm(content, kind="extract")  # or kind="revision"
         obj["missing"] = fix_span_indices(obj.get("missing", []), req["sentence"])
@@ -533,7 +539,7 @@ def call_llm_batch_consolidate(client, model_name, model_type, requests):
             - Merge overlapping duplicates; keep one with best boundaries
             """
         payload = {"sentence": req["sentence"], "proposals": req["proposals"]}
-        if model_type == "qwen3-32B":
+        if "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
         content = client.chat.completions.create(
@@ -544,7 +550,7 @@ def call_llm_batch_consolidate(client, model_name, model_type, requests):
             timeout=360
         ).choices[0].message.content
 
-        if model_type in ("qwen3-32B", "gpt4o"):
+        if model_type in ("qwen3-32B", "gpt4o", "qwen3-32B-vllm"):
             content = remove_thinking_blocks(content)
         obj = json.loads(content)
 
@@ -596,7 +602,8 @@ def call_llm_batch_two_path(
     few_shot: bool,
     requests: List[Dict],
     lock_over_iou: float = 0.5,
-    decoding: Optional[Dict[str, Any]] = None
+    decoding: Optional[Dict[str, Any]] = None,
+    gaz_lock: bool = False,
 ) -> List[Dict]:
     """
     Two-path inference:
@@ -618,9 +625,13 @@ def call_llm_batch_two_path(
             per_req_locked.append({"locked": [], "locked_spans": []})
             continue
 
-        # Identify fused gazetteer candidates
-        locked = [c for c in cands if _is_gazetteer(c)]
-        to_llm = [c for c in cands if not _is_gazetteer(c)]
+        if gaz_lock is True:
+            # Identify fused gazetteer candidates
+            locked = [c for c in cands if _is_gazetteer(c)]
+            to_llm = [c for c in cands if not _is_gazetteer(c)]
+        else:
+            locked = []
+            to_llm  = cands[:]
 
         # Materialize locked accepteds now
         lock_accepteds = []
@@ -640,8 +651,8 @@ def call_llm_batch_two_path(
             locked_spans.append((int(c["start_char"]), int(c["end_char"])))
 
 
-        print(f"Locked spans for sent: {len(lock_accepteds)}")
-        print(f"To LLM spans for sent: {len(to_llm)}")
+        # print(f"Locked spans for sent: {len(lock_accepteds)}")
+        # print(f"To LLM spans for sent: {len(to_llm)}")
         # Build a request for LLM with only non-gaz candidates
         if to_llm:
             filtered_reqs.append({"sentence": sent, "candidates": to_llm})
@@ -708,7 +719,7 @@ def call_llm_batch(
 
 
     # Configure model-specific parameters
-    if model_type in ["qwen3-32B", "gpt4o"]:
+    if model_type in ["qwen3-32B", "gpt4o", "qwen3-32B-vllm"]:
         max_tokens = 1024
     else:
         max_tokens = 500
@@ -750,7 +761,7 @@ def call_llm_batch(
                 user_payload = {"sentence": sentence, "candidates": cand_objs}
 
         # Modify system prompt for Qwen 32B
-        if model_type == "qwen3-32B":
+        if "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
         full_prompt = f"{system_prompt}\n\nUser input: {json.dumps(user_payload, ensure_ascii=False)}"
@@ -774,7 +785,7 @@ def call_llm_batch(
             content = response.choices[0].message.content
 
             # Postprocess content for Qwen 32B to remove thinking blocks
-            if model_type == "qwen3-32B" or model_type == "gpt4o":
+            if "qwen3-32B" in model_type or model_type == "gpt4o":
                 content = remove_thinking_blocks(content)
 
             llm_result = json.loads(content)
@@ -1476,7 +1487,7 @@ def classify_clauses_llm(client, model_name, model_type, clauses: list[dict]) ->
         "- SPECULATIVE: hypotheses, assumptions, theories, plans, hedged claims (may/might/could), open questions.\n"
         "Return STRICT JSON list of labels, same order as input."
     )
-    if model_type == "qwen3-32B":
+    if "qwen3-32B" in model_type:
         sys_prompt = "<no_think/>\n\n" + sys_prompt
     payload = {"clauses": [c["text"] for c in clauses]}
 
@@ -1485,7 +1496,7 @@ def classify_clauses_llm(client, model_name, model_type, clauses: list[dict]) ->
             messages=[{"role":"user","content": f"{sys_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
             temperature=0.0, max_tokens=256
         ).choices[0].message.content
-    if model_type in ("qwen3-32B","gpt4o"):
+    if model_type in ("qwen3-32B","gpt4o", "qwen3-32B-vllm"):
         content = remove_thinking_blocks(content)
     return json.loads(content)
 
@@ -1502,7 +1513,7 @@ def classify_sentences_fact_llm(client, model_name, model_type, sents: List[str]
         "- SPECULATIVE: hypotheses, assumptions, theories, plans, hedged claims (may/might/could), open questions.\n"
         "Return STRICT JSON list of labels, same order as input."
     )
-    if model_type == "qwen3-32B":
+    if "qwen3-32B" in model_type:
         sys_prompt = "<no_think/>\n\n" + sys_prompt
 
     for chunk_start in range(0, len(sents), 20):
@@ -1514,7 +1525,7 @@ def classify_sentences_fact_llm(client, model_name, model_type, sents: List[str]
             temperature=0.0,
             max_tokens=256
         ).choices[0].message.content
-        if model_type in ("qwen3-32B","gpt4o"):
+        if model_type in ("qwen3-32B", "gpt4o", "qwen3-32B-vllm"):
             content = remove_thinking_blocks(content)
         labels = json.loads(content)
         out.extend(labels)
@@ -1530,7 +1541,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
-    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq"], default="gpt4o", help="LLM model to use")
+    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq", "qwen3-32B-vllm"], default="gpt4o", help="LLM model to use")
     ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
     ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
     ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
@@ -1571,6 +1582,7 @@ def main():
                     help="Directory with CSV/TSV gazetteers; filename is used as entity type.")
     ap.add_argument("--general_table_dir", type=str, default=None,
                     help="Directory with general term table CSV.")
+    ap.add_argument("--gaz_locked", action="store_true", help="Lock gazetteer candidates (no LLM changes).")
 
     # ==== Few-shot ====
     ap.add_argument("--few_shot", action="store_true", help="Use few-shot examples in system prompt.")
@@ -1823,7 +1835,7 @@ def main():
                         dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
                         llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
                                                               candidate_results, lock_over_iou=args.iou_thr, #todo: T = 0.4
-                                                              decoding=dec)
+                                                              decoding=dec, gaz_lock=args.gaz_locked)
                     elif cond == "C1":
                         llm_results = run_C1_vanilla(client, model_name, args.model_type, args.few_shot,
                                                      candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
