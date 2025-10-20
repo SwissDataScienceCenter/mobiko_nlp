@@ -6,8 +6,9 @@ from typing import List, Dict, Tuple, Optional, Any
 import threading
 from pathlib import Path
 import re, unicodedata
-from collections import defaultdict
+from collections import defaultdict, Counter
 
+from statistics import median
 
 import spacy
 from openai import OpenAI
@@ -18,11 +19,21 @@ sys.path.insert(0, str(src_path))
 from ner.labels import EntityLabel, build_bio_labels
 from ner.ner_infer import NerInferencer
 from preprocess.gazetteer_matcher import Rule as GazetteerRule, load_gaz_rules_from_dir, GazetteerMatcher
-
+import random, numpy as np, torch
 
 from prompts import *
 import glob
 
+
+
+def set_base_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
 
 IOU_THR = 0.7  # span merge tolerance
@@ -161,6 +172,129 @@ def _load_bioc_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str, Any]]]:
     return index
 
 
+# === Robust JSON parsing helpers ===
+_JSON_OBJ_RE = re.compile(r'\{.*\}', flags=re.DOTALL)
+
+def safe_json_from_llm(raw: str, kind: str = "extract") -> dict:
+    """
+    Best-effort parse. Returns a dict with accepted/rejected/missing; never raises.
+    - Strips code fences and preambles
+    - Normalizes curly quotes
+    - Extracts the first {...} block if there's extra text
+    - Removes trailing commas
+    - Tries a single-quote -> double-quote coercion path
+    - Falls back to empty structure with a note
+    """
+    # ... (helper uses _extract_first_json, _remove_trailing_commas, etc.)
+    return {"accepted": [], "rejected": [], "missing": [], "notes": "json_repair_failed"}
+
+
+
+#---- Strategies ------------
+
+# === Decoding profiles & consensus merge ===
+
+def _decoding_profile(pass_idx: int, condition: str) -> dict:
+    """
+    Return decoding params per pass/condition.
+    - C1: fixed low-temp (vanilla)
+    - C2: diversity-forced grid across passes
+    - C3: like C1 for first pass; revision uses its own temp
+    - C4: handled separately (multiple samples)
+    """
+    if condition in ("C1", "C3"):
+        return dict(temperature=0.7, top_p=0.95, presence_penalty=0.0)
+    if condition == "C2":
+        grid = [
+            dict(temperature=0.3, top_p=0.90, presence_penalty=0.0),
+            dict(temperature=0.6, top_p=0.95, presence_penalty=0.7),
+            dict(temperature=0.9, top_p=0.98, presence_penalty=1.0),
+        ]
+        return grid[(pass_idx - 1) % len(grid)]
+    # fallback
+    return dict(temperature=0.7, top_p=0.95, presence_penalty=0.0)
+
+
+def _span_iou_char(a, b) -> float:
+    s = max(int(a["start_char"]), int(b["start_char"]))
+    e = min(int(a["end_char"]), int(b["end_char"]))
+    inter = max(0, e - s)
+    if inter <= 0:
+        return 0.0
+    ua = int(a["end_char"]) - int(a["start_char"])
+    ub = int(b["end_char"]) - int(b["start_char"])
+    union = ua + ub - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _consensus_merge_by_type(spans_list: List[List[Dict[str,Any]]],
+                             iou_thr: float = 0.5) -> List[Dict[str,Any]]:
+    """
+    Merge many accepted-span lists (from passes or parallel samples) into one.
+    Group by TYPE, then greedy IoU clustering. Boundaries = median of members.
+    """
+    pool = []
+    for spans in spans_list:
+        for s in spans or []:
+            if "type" in s and s.get("type"):
+                pool.append({**s, "confidence": float(s.get("confidence", 1.0))})
+
+    # simple greedy clustering per type
+    out = []
+    used = [False]*len(pool)
+    for i, si in enumerate(pool):
+        if used[i]:
+            continue
+        group = [si]; used[i] = True
+        for j, sj in enumerate(pool):
+            if used[j] or sj.get("type") != si.get("type"):
+                continue
+            if _span_iou_char(si, sj) >= iou_thr:
+                used[j] = True
+                group.append(sj)
+        starts = sorted(int(g["start_char"]) for g in group)
+        ends   = sorted(int(g["end_char"]) for g in group)
+        merged = {
+            "text": group[0]["text"],  # optional: can slice original sentence later if needed
+            "type": group[0]["type"],
+            "start_char": int(median(starts)),
+            "end_char":   int(median(ends)),
+            "confidence": sum(g.get("confidence", 1.0) for g in group)/len(group),
+            "votes": len(group)
+        }
+        out.append(merged)
+    return out
+
+
+def _is_gazetteer(fused_cand: dict) -> bool:
+    """True if any provenance source is 'gazetteer'."""
+    for s in fused_cand.get("sources", []):
+        if s.get("name") == "gazetteer":
+            return True
+    return fused_cand.get("source") == "gazetteer"
+
+
+def _choose_gaz_type(fused_cand: dict, fallback_argmax: bool = True) -> Optional[str]:
+    """Pick a definitive type for a locked gazetteer span."""
+    gaz_types = [s.get("type") for s in fused_cand.get("sources", []) if s.get("name") == "gazetteer" and s.get("type")]
+    gaz_types = [t for t in gaz_types if t]
+    if gaz_types:
+        t, _ = Counter(gaz_types).most_common(1)[0]
+        return t
+    if fallback_argmax:
+        tv = fused_cand.get("type_votes") or {}
+        if tv:
+            return max(tv.items(), key=lambda kv: kv[1])[0]
+    return None
+
+
+def _overlaps_any(span: tuple[int,int], spans: list[tuple[int,int]], iou_thr: float = 0.5) -> bool:
+    s, e = span
+    for (s2, e2) in spans:
+        if _iou_tuple((s, e), (s2, e2)) >= iou_thr:
+            return True
+    return False
+
 
 def get_openai_client(model_type: str):
     config = MODEL_CONFIGS.get(model_type)
@@ -264,9 +398,244 @@ def remove_thinking_blocks(content: str) -> str:
     return cleaned
 
 
-def call_llm_batch(client, model_name: str, model_type: str, few_shot: bool, requests: List[Dict]) -> List[Dict]:
+# --------- Multi-pass code ---------
+
+
+def _iou(a, b):
+    s = max(a["start_char"], b["start_char"])
+    e = min(a["end_char"], b["end_char"])
+    inter = max(0, e - s)
+    union = (a["end_char"] - a["start_char"]) + (b["end_char"] - b["start_char"]) - inter
+    return inter / union if union else 0.0
+
+
+def merge_spans(primary, additions, iou_thr=0.5):
+    merged = primary[:]
+    for cand in additions:
+        if not any(_iou(cand, m) >= iou_thr for m in merged):
+            merged.append(cand)
+    return merged
+
+
+
+def call_llm_batch_revision(client, model_name, model_type, requests, temperature=0.3):
+    results = []
+    for req in requests:
+        system_prompt = """You are revising an earlier extraction.
+        Return STRICT JSON:
+        {"missing": [...], "notes": "short rationale ≤160 chars"}
+            Rules:
+            - Consider the previous output AND the running notes.
+            - DO NOT DELETE earlier accepted spans.
+            - Only propose NEW or CORRECTED spans (no duplicates).
+            - Prefer precise boundaries; don't re-state identical spans.    
+            - Use the same TYPE schema as before.
+            """
+        payload = {"sentence": req["sentence"], "previous": req["prev_json"],
+                   "prev_notes": req.get("prev_notes", "")  # short running notes
+}
+        if model_type == "qwen3-32B":
+            system_prompt = f"<no_think/>\n\n{system_prompt}"
+
+        content = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
+            temperature=temperature,
+            max_tokens=512,
+            timeout=360,
+        ).choices[0].message.content
+
+        if model_type in ("qwen3-32B", "gpt4o"):
+            content = remove_thinking_blocks(content)
+        obj = safe_json_from_llm(content, kind="extract")  # or kind="revision"
+        obj["missing"] = fix_span_indices(obj.get("missing", []), req["sentence"])
+        results.append(obj)
+    return results
+
+
+def call_llm_batch_consolidate(client, model_name, model_type, requests):
+    results = []
+    for req in requests:
+        system_prompt = """Consolidate proposed spans.
+            Return STRICT JSON:
+            {"accepted":[{"text":"...", "type":"...", "start_char":int, "end_char":int}], "rejected":[...], "missing":[], "notes":"optional"}
+            Rules:
+            - Merge overlapping duplicates; keep one with best boundaries
+            """
+        payload = {"sentence": req["sentence"], "proposals": req["proposals"]}
+        if model_type == "qwen3-32B":
+            system_prompt = f"<no_think/>\n\n{system_prompt}"
+
+        content = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
+            temperature=0.0,
+            max_tokens=768,
+            timeout=360
+        ).choices[0].message.content
+
+        if model_type in ("qwen3-32B", "gpt4o"):
+            content = remove_thinking_blocks(content)
+        obj = json.loads(content)
+
+        for k in ("accepted", "rejected"):
+            obj[k] = fix_span_indices(obj.get(k, []), req["sentence"])
+        obj["missing"] = []
+        results.append(obj)
+    return results
+
+
+def call_llm_multipass(client, model_name, model_type, requests, passes=3, temp1=0.3):
+    # Pass 1
+    p1 = call_llm_batch(client, model_name, model_type, requests)
+
+    # Build revision prompts (Pass 2): same requests, but include previous JSON and ask for "missing" only
+    rev_requests = []
+    for req, out in zip(requests, p1):
+        rev_requests.append({
+            "sentence": req["sentence"],
+            "candidates": req.get("candidates"),
+            "prev_json": out  # include accepted/rejected/missing
+        })
+    p2 = call_llm_batch_revision(client, model_name, model_type, rev_requests, temperature=temp1)
+
+    # Merge P1 accepted + P2 missing
+    merged_after_p2 = []
+    for o1, o2, req in zip(p1, p2, requests):
+        accepted = o1.get("accepted", [])
+        missing = o2.get("missing", [])
+        merged = merge_spans(accepted, missing, iou_thr=0.5)
+        merged_after_p2.append({"accepted": merged, "notes": ""})
+
+    # Pass 3: consolidation/type-check using unioned spans as "proposal"
+    cons_requests = []
+    for req, uni in zip(requests, merged_after_p2):
+        cons_requests.append({
+            "sentence": req["sentence"],
+            "proposals": uni["accepted"]
+        })
+    p3 = call_llm_batch_consolidate(client, model_name, model_type, cons_requests)
+
+    return p3
+
+
+def call_llm_batch_two_path(
+    client,
+    model_name: str,
+    model_type: str,
+    few_shot: bool,
+    requests: List[Dict],
+    lock_over_iou: float = 0.5,
+    decoding: Optional[Dict[str, Any]] = None
+) -> List[Dict]:
+    """
+    Two-path inference:
+      - Gazetteer-backed candidates are auto-accepted (locked).
+      - LLM evaluates only non-gazetteer candidates.
+      - On overlap, gazetteer wins.
+    """
+    # Split requests into (locked gaz, to_llm) per sentence
+    filtered_reqs = []
+    per_req_locked = []   # keep locked spans and their geometry
+
+    for req in requests:
+        sent = req["sentence"]
+        cands = req.get("candidates")
+
+        if not cands:
+            # Nothing to lock/ask; let base function handle None path
+            filtered_reqs.append(req)
+            per_req_locked.append({"locked": [], "locked_spans": []})
+            continue
+
+        # Identify fused gazetteer candidates
+        locked = [c for c in cands if _is_gazetteer(c)]
+        to_llm = [c for c in cands if not _is_gazetteer(c)]
+
+        # Materialize locked accepteds now
+        lock_accepteds = []
+        locked_spans = []
+        for c in locked:
+            t = _choose_gaz_type(c, fallback_argmax=True)
+            if not t:
+                # If no type could be chosen, skip locking
+                continue
+            lock_accepteds.append({
+                "text": c["text"],
+                "type": t,
+                "start_char": int(c["start_char"]),
+                "end_char": int(c["end_char"]),
+                "source": "gazetteer"
+            })
+            locked_spans.append((int(c["start_char"]), int(c["end_char"])))
+
+
+        print(f"Locked spans for sent: {len(lock_accepteds)}")
+        print(f"To LLM spans for sent: {len(to_llm)}")
+        # Build a request for LLM with only non-gaz candidates
+        if to_llm:
+            filtered_reqs.append({"sentence": sent, "candidates": to_llm})
+        else:
+            filtered_reqs.append({"sentence": sent, "candidates": []})  # keeps alignment
+
+        per_req_locked.append({"locked": lock_accepteds, "locked_spans": locked_spans})
+
+    # Call your existing batch function
+    llm_outs = call_llm_batch(client, model_name, model_type, few_shot, filtered_reqs, decoding)
+
+    # Merge locked + llm_out, gaz wins on overlaps
+    merged_outs: List[Dict] = []
+    for info, llm_res in zip(per_req_locked, llm_outs):
+        locked_acc = info["locked"]
+        locked_spans = info["locked_spans"]
+
+        if not llm_res:
+            merged_outs.append({"accepted": locked_acc, "rejected": [], "missing": [], "notes": "llm_empty"})
+            continue
+
+        merged_accepted = list(locked_acc)
+        for a in llm_res.get("accepted", []):
+            if not _overlaps_any((int(a["start_char"]), int(a["end_char"])), locked_spans, iou_thr=lock_over_iou):
+                merged_accepted.append(a)
+
+        merged_rejected = []
+        for r in llm_res.get("rejected", []):
+            sc = int(r.get("start_char", -1)); ec = int(r.get("end_char", -1))
+            if sc >= 0 and ec >= 0 and _overlaps_any((sc, ec), locked_spans, iou_thr=lock_over_iou):
+                continue  # ignore rejection that conflicts with a lock
+            merged_rejected.append(r)
+
+        merged_missing = []
+        for m in llm_res.get("missing", []):
+            if not _overlaps_any((int(m["start_char"]), int(m["end_char"])), locked_spans, iou_thr=lock_over_iou):
+                merged_missing.append(m)
+
+        merged_outs.append({
+            "accepted": merged_accepted,
+            "rejected": merged_rejected,
+            "missing": merged_missing,
+            "notes": llm_res.get("notes", "")
+        })
+
+    return merged_outs
+
+
+def call_llm_batch(
+        client,
+        model_name: str,
+        model_type: str,
+        few_shot: bool,
+        requests: List[Dict],
+        decoding: Optional[Dict[str, Any]] = None,
+) -> List[Dict]:
     """Process multiple LLM requests efficiently."""
     results = []
+
+    decoding = decoding or {}
+    temperature = float(decoding.get("temperature", 0.7))
+    top_p = float(decoding.get("top_p", 0.95))
+    presence_penalty = float(decoding.get("presence_penalty", 0.0))
+
 
     # Configure model-specific parameters
     if model_type in ["qwen3-32B", "gpt4o"]:
@@ -324,7 +693,9 @@ def call_llm_batch(client, model_name: str, model_type: str, few_shot: bool, req
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": full_prompt}],
-                temperature=0.0,
+                temperature=temperature,
+                top_p=top_p,
+                presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
                 timeout=800
 
@@ -354,6 +725,196 @@ def call_llm_batch(client, model_name: str, model_type: str, few_shot: bool, req
             })
 
     return results
+
+
+# === ADD: Multi-pass runners ===
+
+def run_C1_vanilla(
+    client, model_name, model_type, few_shot, candidate_results, T: int = 3, lock_over_iou: float = 0.5) -> List[Dict]:
+    """
+    Vanilla multi-pass:
+      P1: standard two-path call
+      P2..T: 'revision' (missing-only) then consolidate
+    """
+    # P1
+    dec = _decoding_profile(1, "C1")
+    p1 = call_llm_batch_two_path(client, model_name, model_type, few_shot,
+                                 candidate_results, lock_over_iou=lock_over_iou, decoding=dec)
+
+    if T == 1:
+        return p1
+
+    # Build revision requests from P1
+    rev_reqs = []
+    for req, out in zip(candidate_results, p1):
+        rev_reqs.append({"sentence": req["sentence"], "prev_json": out})
+
+    p2 = call_llm_batch_revision(client, model_name, model_type, rev_reqs, temperature=0.7)
+
+    # Merge P1 accepted + P2 missing
+    merged_after_p2 = []
+    for o1, o2, req in zip(p1, p2, candidate_results):
+        merged = merge_spans(o1.get("accepted", []), o2.get("missing", []), iou_thr=0.5)
+        merged_after_p2.append({"sentence": req["sentence"], "accepted": merged})
+        print(merged_after_p2)
+
+    # Consolidate (optional final pass if T>=3)
+    if T >= 3:
+        cons_requests = [{"sentence": m["sentence"], "proposals": m["accepted"]} for m in merged_after_p2]
+        p3 = call_llm_batch_consolidate(client, model_name, model_type, cons_requests)
+        return p3
+    else:
+        # fabricate consolidate-like structure
+        return [{"accepted": m["accepted"], "rejected": [], "missing": [], "notes": "C1-P2"} for m in merged_after_p2]
+
+
+def run_C2_diverse(
+    client, model_name, model_type, few_shot, candidate_results, T: int = 3, lock_over_iou=0.5) -> List[Dict]:
+    """
+    Diversity-forced multi-pass: each pass uses a different decoding profile,
+    aggregate with NMS-style consensus by type.
+    """
+    pass_accepteds_per_sent = [[] for _ in candidate_results]
+
+    for t in range(1, T+1):
+        dec = _decoding_profile(t, "C2")
+        out = call_llm_batch_two_path(client, model_name, model_type, few_shot,
+                                      candidate_results, lock_over_iou=lock_over_iou, decoding=dec)
+        for i, o in enumerate(out):
+            pass_accepteds_per_sent[i].append(o.get("accepted", []))
+
+    # consensus merge per sentence
+    merged = []
+    for i, req in enumerate(candidate_results):
+        merged_acc = _consensus_merge_by_type(pass_accepteds_per_sent[i], iou_thr=0.5)
+        merged.append({"accepted": merged_acc, "rejected": [], "missing": [], "notes": f"C2-T{T}"})
+    return merged
+
+
+# def run_C3_critique_revise(
+#     client, model_name, model_type, few_shot, candidate_results, T: int = 3
+# ) -> List[Dict]:
+#     """
+#     Critique-and-revise: P1 as usual, then iterative 'missing-only' revisions,
+#     finally consolidate.
+#     """
+#     # P1 (fixed profile)
+#     dec = _decoding_profile(1, "C3")
+#     p = call_llm_batch_two_path(client, model_name, model_type, few_shot,
+#                                 candidate_results, lock_over_iou=0.5, decoding=dec)
+#
+#     # P2..T-1: iterative revise -> union
+#     current = []
+#     for i, o in enumerate(p):
+#         current.append({"sentence": candidate_results[i]["sentence"], "accepted": o.get("accepted", [])})
+#
+#     for t in range(2, max(2, T)):
+#         rev_reqs = []
+#         for i, cur in enumerate(current):
+#             prev_json = {"accepted": cur["accepted"], "rejected": [], "missing": []}
+#             rev_reqs.append({"sentence": cur["sentence"], "prev_json": prev_json, "prev_notes": cur.get("notes", "")})
+#         rev = call_llm_batch_revision(client, model_name, model_type, rev_reqs, temperature=0.9)
+#         # union with IoU
+#         for i, r in enumerate(rev):
+#             acc = current[i]["accepted"]
+#             add = r.get("missing", [])
+#             current[i]["accepted"] = merge_spans(acc, add, iou_thr=0.5)
+#
+#     # Final consolidate
+#     cons_requests = [{"sentence": cur["sentence"], "proposals": cur["accepted"]} for cur in current]
+#     final = call_llm_batch_consolidate(client, model_name, model_type, cons_requests)
+#     return final
+
+def run_C3_critique_revise(client, model_name, model_type, few_shot, candidate_results, T: int = 3,
+                           lock_over_iou: float = 0.5) -> List[Dict]:
+    # P1: normal two-path extraction (already returns {"accepted": [...], "notes": "..."} via safe_json_from_llm)
+    dec = _decoding_profile(1, "C3")
+    p = call_llm_batch_two_path(client, model_name, model_type, few_shot,
+                                candidate_results, lock_over_iou=lock_over_iou, decoding=dec)
+
+    # Keep rolling state per sentence
+    state = []
+    for i, base in enumerate(p):
+        state.append({
+            "sentence": candidate_results[i]["sentence"],
+            "accepted": base.get("accepted", []),
+            "notes": (base.get("notes") or "").strip()
+        })
+
+    # P2..T-1: critique→revise with notes
+    for t in range(2, max(2, T)):
+        rev_reqs = []
+        for s in state:
+            prev_json = {"accepted": s["accepted"], "rejected": [], "missing": []}
+            rev_reqs.append({
+                "sentence": s["sentence"],
+                "prev_json": prev_json,
+                "prev_notes": s["notes"]  # <<<<<< pass the rolling notes
+            })
+
+        rev = call_llm_batch_revision(client, model_name, model_type, rev_reqs, temperature=0.9)
+
+        # union spans and append new notes
+        for i, r in enumerate(rev):
+            new_missing = r.get("missing", [])
+            state[i]["accepted"] = merge_spans(state[i]["accepted"], new_missing, iou_thr=lock_over_iou)
+            note_add = (r.get("notes") or "").strip()
+            if note_add:
+                # keep notes compact but cumulative
+                if state[i]["notes"]:
+                    state[i]["notes"] = (state[i]["notes"] + " | " + note_add)[:240]
+                else:
+                    state[i]["notes"] = note_add[:240]
+
+    # Final consolidate pass can also see notes if you want (optional)
+    cons_requests = []
+    for s in state:
+        cons_requests.append({
+            "sentence": s["sentence"],
+            "proposals": s["accepted"],
+            # Optional: include notes so the consolidator can resolve conflicts
+            "prev_notes": s["notes"]
+        })
+    final = call_llm_batch_consolidate(client, model_name, model_type, cons_requests)
+
+    # Preserve rolled notes into the final objects (for logging/analysis)
+    for i, obj in enumerate(final):
+        if state[i]["notes"]:
+            obj["notes"] = (obj.get("notes") or "")
+            if obj["notes"]:
+                obj["notes"] = (obj["notes"] + " | " + state[i]["notes"])[:300]
+            else:
+                obj["notes"] = state[i]["notes"][:300]
+
+    return final
+
+
+def run_C4_self_consistency(
+    client, model_name, model_type, few_shot, candidate_results, K: int = 5
+) -> List[Dict]:
+    """
+    Self-consistency in one pass: sample K independent outputs, then consensus merge.
+    """
+    samples_per_sent = [[] for _ in candidate_results]
+    # Use a small diverse grid across K
+    grid = [
+        dict(temperature=0.3, top_p=0.90, presence_penalty=0.0),
+        dict(temperature=0.6, top_p=0.95, presence_penalty=0.7),
+        dict(temperature=0.9, top_p=0.98, presence_penalty=1.0),
+    ]
+    for k in range(K):
+        dec = grid[k % len(grid)]
+        out = call_llm_batch_two_path(client, model_name, model_type, few_shot,
+                                      candidate_results, lock_over_iou=0.5, decoding=dec)
+        for i, o in enumerate(out):
+            samples_per_sent[i].append(o.get("accepted", []))
+
+    merged = []
+    for i, req in enumerate(candidate_results):
+        merged_acc = _consensus_merge_by_type(samples_per_sent[i], iou_thr=0.5)
+        merged.append({"accepted": merged_acc, "rejected": [], "missing": [], "notes": f"C4-K{K}"})
+    return merged
+
 
 
 def process_with_chunks(sent):
@@ -664,7 +1225,7 @@ def _normalize_text_min(s: str) -> str:
     return " ".join(s.split())
 
 
-def _iou(a: tuple[int,int], b: tuple[int,int]) -> float:
+def _iou_tuple(a: tuple[int,int], b: tuple[int,int]) -> float:
     (s1,e1),(s2,e2) = a,b
     inter = max(0, min(e1,e2) - max(s1,s2))
     if inter <= 0:
@@ -732,7 +1293,7 @@ def fuse_candidates(
             if cl[0]["text_norm"] != it["text_norm"]:
                 continue
             # IoU with cluster leader OR exact match with any member
-            if _iou((it["start_char"], it["end_char"]),
+            if _iou_tuple((it["start_char"], it["end_char"]),
                     (cl[0]["start_char"], cl[0]["end_char"])) >= iou_thr or \
                any(m["start_char"]==it["start_char"] and m["end_char"]==it["end_char"] for m in cl):
                 cl.append(it); placed = True; break
@@ -786,9 +1347,115 @@ def fuse_candidates(
     return fused
 
 
+#--------- Fact classification ---------
+
+
+def split_into_clauses_spacy(sentence: str, nlp) -> list[dict]:
+    """
+    Return list of clauses as dicts: {"start": int, "end": int, "text": str}
+    Uses dependency-based subtrees around clausal heads; falls back to punctuation splits.
+    """
+    doc = nlp(sentence)
+    if len(doc) == 0:
+        return [{"start":0, "end":len(sentence), "text":sentence}]
+
+    # collect clause roots (finite verbs, conj roots, clausal dependents)
+    clause_heads = []
+    for t in doc:
+        if t.dep_ in ("ROOT","conj","parataxis","ccomp","xcomp","advcl","acl","relcl"):
+            clause_heads.append(t)
+
+    spans = []
+    for h in clause_heads or [doc[0]]:
+        subtree_tokens = list(h.subtree)
+        s = min(tok.idx for tok in subtree_tokens)
+        e = max(tok.idx + len(tok) for tok in subtree_tokens)
+        spans.append((s,e))
+
+    # also add punctuation-based splits for ';' ':' '—'
+    for m in re.finditer(r"[;:]", sentence):
+        cut = m.start()
+        spans.extend([(0, cut), (cut+1, len(sentence))])
+
+    # normalize/merge overlapping spans
+    spans = sorted(set(spans), key=lambda x: (x[0], x[1]))
+    merged = []
+    for s,e in spans:
+        if not merged or s > merged[-1][1]:
+            merged.append([s,e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+
+    # de-overlap hard: clip to [0, len]
+    out = []
+    for s,e in merged:
+        s = max(0, s); e = min(len(sentence), e)
+        if e > s:
+            out.append({"start": s, "end": e, "text": sentence[s:e]})
+
+    # fallback: whole sentence if weird
+    if not out:
+        out = [{"start":0, "end":len(sentence), "text":sentence}]
+    return out
+
+
+def classify_clauses_llm(client, model_name, model_type, clauses: list[dict]) -> list[str]:
+    sys_prompt = (
+        "Label each clause as FACT, SPECULATIVE, or UNSURE.\n"
+        "- FACT: reports observed findings/results.\n"
+        "- SPECULATIVE: hypotheses, assumptions, theories, plans, hedged claims (may/might/could), open questions.\n"
+        "Return STRICT JSON list of labels, same order as input."
+    )
+    if model_type == "qwen3-32B":
+        sys_prompt = "<no_think/>\n\n" + sys_prompt
+    payload = {"clauses": [c["text"] for c in clauses]}
+
+    content = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role":"user","content": f"{sys_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
+            temperature=0.0, max_tokens=256
+        ).choices[0].message.content
+    if model_type in ("qwen3-32B","gpt4o"):
+        content = remove_thinking_blocks(content)
+    return json.loads(content)
+
+
+def classify_sentences_fact_llm(client, model_name, model_type, sents: List[str]) -> List[str]:
+    """
+    Return one of {'FACT','SPECULATIVE','UNSURE'} per sentence using the chat model.
+    Batched naively (small lists) to keep it simple.
+    """
+    out = []
+    sys_prompt = (
+        "Label each sentence as FACT, SPECULATIVE, or UNSURE.\n"
+        "- FACT: reports findings, measurements, observed results.\n"
+        "- SPECULATIVE: hypotheses, assumptions, theories, plans, hedged claims (may/might/could), open questions.\n"
+        "Return STRICT JSON list of labels, same order as input."
+    )
+    if model_type == "qwen3-32B":
+        sys_prompt = "<no_think/>\n\n" + sys_prompt
+
+    for chunk_start in range(0, len(sents), 20):
+        chunk = sents[chunk_start:chunk_start+20]
+        payload = {"sentences": chunk}
+        content = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role":"user","content": f"{sys_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
+            temperature=0.0,
+            max_tokens=256
+        ).choices[0].message.content
+        if model_type in ("qwen3-32B","gpt4o"):
+            content = remove_thinking_blocks(content)
+        labels = json.loads(content)
+        out.extend(labels)
+    return out
+
+
+
 
 def main():
     global client, model_name
+
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
@@ -843,8 +1510,28 @@ def main():
                     help="JSON file mapping source->weight (e.g., {'gazetteer':0.9,'ner':0.7}).")
 
 
+    # ==== Fact checking ====
+    ap.add_argument("--fact_filter", choices=["off", "llm"], default="off",
+                    help="Filter candidates to FACT-only sentences. 'rule' uses cue-phrases, 'llm' uses the chat model, 'off' disables.")
+    ap.add_argument("--fact_filter_policy", choices=["strict", "lenient"], default="strict",
+                    help="If 'strict', only FACT passes. If 'lenient', FACT or UNSURE passes.")
+    ap.add_argument("--fact_filter_scope", choices=["sentence", "clause"], default="clause",
+                    help="Gate at sentence or clause level. Use 'clause' for mixed sentences.")
+
+
+    # ==== LLM multi-pass strategy ====
+    ap.add_argument("--llm_condition", choices=["C0", "C1", "C2", "C3", "C4"], default="C0",
+                    help="C0=single pass (current two-path); C1=vanilla multipass; C2=diversity multipass; C3=critique-revise; C4=self-consistency.")
+    ap.add_argument("--passes", type=int, default=3, help="Number of passes for C1/C2/C3.")
+    ap.add_argument("--samples_k", type=int, default=5, help="Number of parallel samples for C4.")
+
+    ap.add_argument("--base_seed", type=int, default=0, help="Random seed.")
+
+    ap.add_argument("--iou_thr", type=float, default=0.5, help="IoU threshold for span merging.")
+
     args = ap.parse_args()
 
+    set_base_seed(args.base_seed)
     type_map = {
           "Biomes": "HABITAT",
           "Biota": "TAXON",
@@ -941,6 +1628,20 @@ def main():
             for bidx, i in enumerate(range(0, len(sentences), args.batch_size), start=1):
                 batch = sentences[i:i + args.batch_size]
 
+                # # ---- FACT FILTER: classify sentences in this batch
+                # if args.fact_filter == "llm":
+                #     fact_labels = classify_sentences_fact_llm(client, model_name, args.model_type, batch)
+                # else:
+                #     fact_labels = ["FACT"] * len(batch)  # no filtering
+                #
+                # def _passes(label: str) -> bool:
+                #     if args.fact_filter == "off":
+                #         return True
+                #     if args.fact_filter_policy == "strict":
+                #         return label == "FACT"
+                #     # lenient: FACT or UNSURE
+                #     return label in ("FACT", "UNSURE")
+
                 # === Candidate generation in-batch (spaCy tokenization for both modes)
                 candidate_results = process_sentences_batch(
                     batch,
@@ -958,18 +1659,109 @@ def main():
                     source_weights=source_weights
                 )
 
+                # === FACT-GATE at clause level ===
+                if args.fact_filter != "off":
+                    nlp = get_spacy_model(args.spacy_model)  # already used elsewhere
+                    for idx, cr in enumerate(candidate_results):
+                        sent = cr["sentence"]
+                        cands = cr.get("candidates")
+                        if not cands:
+                            cr["notes"] = (cr.get("notes", "") + "|fact_gate:no_cands").strip("|")
+                            continue
+
+                        # derive sentence/clause labels
+                        if args.fact_filter_scope == "sentence":
+                            def _passes_label(lbl: str) -> bool:
+                                return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
+                                            lbl in ("FACT", "UNSURE"))
+
+                            lbl = classify_clauses_llm(client, model_name, args.model_type,
+                                                             [{"text": sent, "start": 0, "end": len(sent)}])[0]
+                            if not _passes_label(lbl):
+                                cr["candidates"] = None
+                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
+                                continue
+                            else:
+                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
+                                continue  # sentence-level all pass
+
+                        # clause scope
+                        clauses = split_into_clauses_spacy(sent, nlp)
+                        labels = classify_clauses_llm(client, model_name, args.model_type, clauses)
+
+                        def _passes(lbl: str) -> bool:
+                            return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
+                                        lbl in ("FACT", "UNSURE"))
+
+                        # build filtered candidate list
+                        filtered = []
+                        for c in cands:
+                            # take span midpoint to assign to a clause
+                            mid = int((int(c["start_char"]) + int(c["end_char"])) / 2)
+                            # find clause containing midpoint
+                            cl_idx = next((i for i, cl in enumerate(clauses) if cl["start"] <= mid < cl["end"]), None)
+                            lbl = labels[cl_idx] if cl_idx is not None else "UNSURE"
+                            if _passes(lbl):
+                                filtered.append(c)
+                        if filtered:
+                            cr["candidates"] = filtered
+                            # keep audit: per-clause labels
+                            cr["notes"] = (cr.get("notes", "") + f"|fact_gate_clauses:{labels}").strip("|")
+                        else:
+                            cr["candidates"] = None
+                            cr["notes"] = (cr.get("notes", "") + f"|fact_gate_all_filtered:{labels}").strip("|")
+
+                # # wipe ALL candidates (NER/NP/gaz/gold) for sentences that do not pass the fact gate
+                # for j, cr in enumerate(candidate_results):
+                #     label = fact_labels[j]
+                #     if not _passes(label):
+                #         # Remove all candidates; also stash a note for transparency
+                #         cr["candidates"] = None
+                #         cr["notes"] = f"filtered_out_by_fact_gate:{label}"
+                #     else:
+                #         cr["notes"] = f"fact_gate:{label}"
+
                 assert len(candidate_results) == len(batch), \
                     f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
 
-                llm_results = call_llm_batch(client, model_name, args.model_type, args.few_shot, candidate_results)
+                # llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
+                #                                       candidate_results, lock_over_iou=0.5)
+                cond = args.llm_condition
+                if cond == "C0":
+                    dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
+                    llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
+                                                          candidate_results, lock_over_iou=args.iou_thr, #todo: T = 0.4
+                                                          decoding=dec)
+                elif cond == "C1":
+                    llm_results = run_C1_vanilla(client, model_name, args.model_type, args.few_shot,
+                                                 candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                elif cond == "C2":
+                    llm_results = run_C2_diverse(client, model_name, args.model_type, args.few_shot,
+                                                 candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                elif cond == "C3":
+                    llm_results = run_C3_critique_revise(client, model_name, args.model_type, args.few_shot,
+                                                         candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                elif cond == "C4":
+                    llm_results = run_C4_self_consistency(client, model_name, args.model_type, args.few_shot,
+                                                          candidate_results, K=args.samples_k, lock_over_iou=args.iou_thr)
+                else:
+                    raise ValueError(f"Unknown --llm_condition {cond}")
+
+
+
+
                 if len(llm_results) != len(candidate_results):
                     raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
 
-                for spacy_result, llm_result in zip(candidate_results, llm_results):
+                for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
                     sentence_data = {
                         "text": spacy_result["sentence"],
-                        "llm": llm_result
+                        "llm": llm_result,
                     }
+                    # if "notes" in spacy_result:
+                    #     sentence_data["notes"] = spacy_result["notes"]
+                    if "fact_clause_labels" in spacy_result:
+                        sentence_data["fact_clause_labels"] = spacy_result["fact_clause_labels"]
                     if spacy_result["candidates"] is not None:
                         sentence_data["candidates"] = spacy_result["candidates"]
                     out_sents.append(sentence_data)
