@@ -353,81 +353,82 @@ def build_single_layer_html(text, tp, fp, fn, show_tp, show_fp, show_fn,
         f"</div>"
     )
 
-    # Use % formatting to avoid f-string brace escaping
-    js = """
-<script>
-(function(){
-  function ready(fn){ if (document.readyState !== 'loading') fn(); else document.addEventListener('DOMContentLoaded', fn); }
-  ready(function(){
-    try{
-      console.log("[hotkey] init start");
-      const wrap = document.getElementById('sent-wrap');
-      const card = document.querySelector('.single-layer');
-      const btn  = document.getElementById('acceptBtn');
-      const DOC = %(doc)s;
-      const IDX = %(idx)s;
+#     # Use % formatting to avoid f-string brace escaping
+#     js = """
+# <script>
+# (function(){
+#   function ready(fn){ if (document.readyState !== 'loading') fn(); else document.addEventListener('DOMContentLoaded', fn); }
+#   ready(function(){
+#     try{
+#       console.log("[hotkey] init start");
+#       const wrap = document.getElementById('sent-wrap');
+#       const card = document.querySelector('.single-layer');
+#       const btn  = document.getElementById('acceptBtn');
+#       const DOC = %(doc)s;
+#       const IDX = %(idx)s;
+#
+#       if (!wrap || !card) { console.warn("[hotkey] wrap/card missing"); return; }
+#
+#       // Make sure the container can receive key events:
+#       try { wrap.focus({preventScroll:true}); } catch(_) {}
+#       console.log("[hotkey] focused wrapper");
+#
+#       function selectionOffsetsWithin(el){
+#         const sel = window.getSelection();
+#         if (!sel || sel.rangeCount === 0) return null;
+#         const rng = sel.getRangeAt(0);
+#         if (!el.contains(rng.startContainer) || !el.contains(rng.endContainer)) return null;
+#
+#         const preA = document.createRange();
+#         preA.selectNodeContents(el);
+#         preA.setEnd(rng.startContainer, rng.startOffset);
+#         const a = (preA.toString() || "").length;
+#
+#         const preB = document.createRange();
+#         preB.selectNodeContents(el);
+#         preB.setEnd(rng.endContainer, rng.endOffset);
+#         const b = (preB.toString() || "").length;
+#
+#         return (b > a) ? {a:a, b:b} : null;
+#       }
+#
+#       function hotAdd(){
+#         const offs = selectionOffsetsWithin(card);
+#         if (!offs) { console.warn("[hotkey] no selection or outside card"); return; }
+#         console.log("[hotkey] hotAdd", offs);
+#
+#         // Update URL and reload (requires st.html / non-sandbox)
+#         try {
+#           const qp = new URLSearchParams(window.location.search || "");
+#           qp.set('hotadd', String(DOC) + '|' + String(IDX) + '|' + String(offs.a) + '|' + String(offs.b));
+#           const url = window.location.pathname + '?' + qp.toString();
+#           console.log("[hotkey] navigate", url);
+#           window.location.href = url;
+#         } catch (e) {
+#           console.error("[hotkey] navigation failed", e);
+#         }
+#       }
+#
+#       // Multiple listeners to dodge framework event traps
+#       window.addEventListener('keydown', function(e){
+#         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); hotAdd(); }
+#       }, true);
+#       document.addEventListener('keydown', function(e){
+#         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); hotAdd(); }
+#       }, true);
+#       if (btn) btn.addEventListener('click', hotAdd);
+#
+#       console.log("[hotkey] listeners attached");
+#     } catch (err) {
+#       console.error("[hotkey] init error", err);
+#     }
+#   });
+# })();
+# </script>
+# """ % {"doc": _json.dumps(doc_id), "idx": _json.dumps(sent_idx)}
 
-      if (!wrap || !card) { console.warn("[hotkey] wrap/card missing"); return; }
-
-      // Make sure the container can receive key events:
-      try { wrap.focus({preventScroll:true}); } catch(_) {}
-      console.log("[hotkey] focused wrapper");
-
-      function selectionOffsetsWithin(el){
-        const sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0) return null;
-        const rng = sel.getRangeAt(0);
-        if (!el.contains(rng.startContainer) || !el.contains(rng.endContainer)) return null;
-
-        const preA = document.createRange();
-        preA.selectNodeContents(el);
-        preA.setEnd(rng.startContainer, rng.startOffset);
-        const a = (preA.toString() || "").length;
-
-        const preB = document.createRange();
-        preB.selectNodeContents(el);
-        preB.setEnd(rng.endContainer, rng.endOffset);
-        const b = (preB.toString() || "").length;
-
-        return (b > a) ? {a:a, b:b} : null;
-      }
-
-      function hotAdd(){
-        const offs = selectionOffsetsWithin(card);
-        if (!offs) { console.warn("[hotkey] no selection or outside card"); return; }
-        console.log("[hotkey] hotAdd", offs);
-
-        // Update URL and reload (requires st.html / non-sandbox)
-        try {
-          const qp = new URLSearchParams(window.location.search || "");
-          qp.set('hotadd', String(DOC) + '|' + String(IDX) + '|' + String(offs.a) + '|' + String(offs.b));
-          const url = window.location.pathname + '?' + qp.toString();
-          console.log("[hotkey] navigate", url);
-          window.location.href = url;
-        } catch (e) {
-          console.error("[hotkey] navigation failed", e);
-        }
-      }
-
-      // Multiple listeners to dodge framework event traps
-      window.addEventListener('keydown', function(e){
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); hotAdd(); }
-      }, true);
-      document.addEventListener('keydown', function(e){
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); hotAdd(); }
-      }, true);
-      if (btn) btn.addEventListener('click', hotAdd);
-
-      console.log("[hotkey] listeners attached");
-    } catch (err) {
-      console.error("[hotkey] init error", err);
-    }
-  });
-})();
-</script>
-""" % {"doc": _json.dumps(doc_id), "idx": _json.dumps(sent_idx)}
-
-    return html_core + js
+    # return html_core + js
+    return html_core
 
 
 # -------------------- Annotation helpers --------------------
@@ -630,6 +631,7 @@ html_block = build_single_layer_html(
 )
 
 # components.html(html_block)
+render_html(html_block)
 
 colG, colP = st.columns(2)
 
