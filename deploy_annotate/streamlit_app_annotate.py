@@ -630,10 +630,18 @@ html_block = build_single_layer_html(
     doc_id=cur_key[0], sent_idx=cur_key[1]
 )
 
-# components.html(html_block)
-render_html(html_block)
+
+colS, colA = st.columns([3, 2], gap="large")
+
+with colS:
+    # components.html(html_block)
+    render_html(html_block)
+
+
+st.divider()
 
 colG, colP = st.columns(2)
+
 
 # --- Helper: find all occurrences of a substring with context previews ---
 def _find_occurrences(text: str, query: str, window: int = 40):
@@ -653,47 +661,65 @@ def _find_occurrences(text: str, query: str, window: int = 40):
         start = i + 1
     return out
 
-st.divider()
-st.markdown("### ➕ Add manual span (not proposed by the model)")
+with colA:
+    st.markdown("### ➕ Add manual span (not proposed by the model)")
+    keyroot = f"{cur_key[0]}_{cur_key[1]}"
 
-with st.container(border=True):
-    # Label chooser (reuse discovered labels, allow custom)
-    lab = st.selectbox("Label", options=label_options + ["(custom)"], key=f"add_lab_{idx}")
-    if lab == "(custom)":
-        lab = st.text_input("Custom label", value="", key=f"add_lab_custom_{idx}")
+    # --- versioned keys to force remount/clear ---
+    ver_key = f"{keyroot}_ver"
+    if ver_key not in st.session_state:
+        st.session_state[ver_key] = 0
+    ver = st.session_state[ver_key]
 
-    q = st.text_input("Exact text to add (case-sensitive substring)", key=f"add_q_{idx}")
-    matches = _find_occurrences(text, q) if q else []
-    if matches:
-        pick = st.selectbox(
-            "Choose occurrence (shows local context)",
-            options=list(range(len(matches))),
-            format_func=lambda k: matches[k]["preview"],
-            key=f"add_pick_{idx}"
-        )
-        chosen = matches[pick]
-        a, b = chosen["start"], chosen["end"]
-        st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
-    else:
-        chosen = None
-        if q:
-            st.warning("No matches found in this sentence.")
+    # --- reset gate (must run BEFORE widgets are instantiated) ---
+    if st.session_state.get(f"{keyroot}_clear", False):
+        st.session_state.pop(f"{keyroot}_add_q", None)
+        st.session_state.pop(f"{keyroot}_add_pick", None)
+        st.session_state.pop(f"{keyroot}_add_lab", None)
+        st.session_state[ver_key] = ver + 1
+        st.session_state[f"{keyroot}_clear"] = False
 
-    can_add = (lab is not None and lab != "" and chosen is not None)
-    btn = st.button("Add manual span", type="primary", disabled=not can_add, key=f"add_btn_{idx}")
-    if btn and can_add:
-        new_span = {"start_char": int(chosen["start"]), "end_char": int(chosen["end"]), "type": lab}
-        st.session_state.aug_gold[cur_key] = merge_span_into_gold(
-            st.session_state.aug_gold[cur_key],
-            new_span,
-            metric=metric,
-            thr=merge_thr,
-            do_merge=merge_same_label
-        )
-        st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
-        st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
-        _maybe_autosave()
-        force_rerun()
+    with st.container(border=True):
+        # Label chooser (reuse discovered labels, allow custom)
+        lab = st.selectbox("Label", options=label_options + ["(custom)"], key=f"{keyroot}_add_lab")
+        if lab == "(custom)":
+            lab = st.text_input("Custom label", value="", key=f"{keyroot}_add_lab_custom")
+
+        q_key = f"{keyroot}_add_q_{st.session_state[ver_key]}"
+        q = st.text_input("Exact text to add (case-sensitive substring)", key=q_key)
+        matches = _find_occurrences(text, q) if q else []
+        if matches:
+            pick = st.selectbox(
+                "Choose occurrence (shows local context)",
+                options=list(range(len(matches))),
+                format_func=lambda k: matches[k]["preview"],
+                key=f"{keyroot}_add_pick"
+            )
+            chosen = matches[pick]
+            a, b = chosen["start"], chosen["end"]
+            st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
+        else:
+            chosen = None
+            if q:
+                st.warning("No matches found in this sentence.")
+
+        can_add = (lab is not None and lab != "" and chosen is not None)
+        btn = st.button("Add manual span", type="primary", disabled=not can_add, key=f"{keyroot}_add_btn")
+        if btn and can_add:
+            new_span = {"start_char": int(chosen["start"]), "end_char": int(chosen["end"]), "type": lab}
+            st.session_state.aug_gold[cur_key] = merge_span_into_gold(
+                st.session_state.aug_gold[cur_key],
+                new_span,
+                metric=metric,
+                thr=merge_thr,
+                do_merge=merge_same_label
+            )
+            st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
+            st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
+            _maybe_autosave()
+
+            st.session_state[f"{keyroot}_clear"] = True
+            force_rerun()
 
 
 with colP:
