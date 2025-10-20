@@ -32,6 +32,7 @@ class Rule:
     phrase_key: Optional[str] = None
     re_flags: int = 0
     re_obj: Optional[re.Pattern] = None
+    meta: Dict[str, Any] | None = None
 
 # Escapes Python's 're' understands (single-letter and common forms)
 _PY_ESC_ONE = set(list("AbBdDsSwWZGAfnrtv"))  # \A \b \B \d \D \s \S \w \W \Z \G and \a \f \n \r \t \v
@@ -240,6 +241,76 @@ def load_gaz_rules_from_dir(
         rid_base += len(rules)
         all_rules.extend(rules)
     return all_rules
+
+
+def load_general_rules_from_csv(
+    path: str,
+    delimiter: str = ",",
+    pattern_col: str = "regexsearch",
+    keyword_col: str = "keyword",
+    # Which column provides the "type/label"? If None, use filename stem as before.
+    label_col: Optional[str] = None,
+    # Keep only these metadata columns (None = keep all non-empty).
+    keep_meta_cols: Optional[List[str]] = None,
+    # Case-insensitive matching by default, because your examples look case-agnostic.
+    default_re_flags: int = re.IGNORECASE,
+) -> List[Rule]:
+    """
+    Load a 'big table' where each row may have a regex in `pattern_col` or a plain keyword.
+    Fallback: if regex is empty → build a word-boundary literal from keyword.
+    Attach row metadata (filtered by keep_meta_cols) on each Rule.meta.
+    """
+    rules: List[Rule] = []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter=delimiter)
+        rid_local = 0
+        for row in reader:
+            raw_pat = (row.get(pattern_col) or "").strip()
+
+            if not raw_pat:
+                kw = (row.get(keyword_col) or "").strip()
+                if not kw:
+                    continue
+                # Word-boundary literal fallback for keyword
+                raw_pat = r"\b" + re.escape(kw) + r"\b"
+                ptype, phrase_key = classify_rule(raw_pat)
+            else:
+                ptype, phrase_key = classify_rule(raw_pat)
+
+            # Decide label/type source
+            if label_col and (label_col in row) and row[label_col]:
+                label = str(row[label_col]).strip()
+            else:
+                label = _infer_type_from_path(path)
+
+            # Build metadata payload
+            if keep_meta_cols is None:
+                meta = {k: v for k, v in row.items() if v not in (None, "", "nan", "None")}
+            else:
+                meta = {k: row[k] for k in keep_meta_cols
+                        if (k in row) and (str(row[k]) not in ("", "nan", "None"))}
+
+            # Try to compile regex if needed
+            re_obj = None
+            flags = default_re_flags
+            if ptype == "regex":
+                # make pattern Python-compatible if needed
+                fixed = _sanitize_pattern_for_python(raw_pat)
+                re_obj = re.compile(fixed, flags=flags)
+
+            rules.append(Rule(
+                rule_id=rid_local,
+                label=label,
+                pattern=raw_pat,
+                pattern_type=ptype,
+                phrase_key=phrase_key,
+                re_flags=flags,
+                re_obj=re_obj,
+                meta=meta,
+            ))
+            rid_local += 1
+    return rules
+
 
 
 # -----------------------------

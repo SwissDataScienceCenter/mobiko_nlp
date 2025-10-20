@@ -18,12 +18,12 @@ sys.path.insert(0, str(src_path))
 
 from ner.labels import EntityLabel, build_bio_labels
 from ner.ner_infer import NerInferencer
-from preprocess.gazetteer_matcher import Rule as GazetteerRule, load_gaz_rules_from_dir, GazetteerMatcher
+from preprocess.gazetteer_matcher import Rule as GazetteerRule, load_gaz_rules_from_dir, GazetteerMatcher, load_general_rules_from_csv
+from tables.thesaurus.general_cols import general_columns
 import random, numpy as np, torch
 
 from prompts import *
 import glob
-
 
 
 def set_base_seed(seed: int):
@@ -294,6 +294,76 @@ def _overlaps_any(span: tuple[int,int], spans: list[tuple[int,int]], iou_thr: fl
         if _iou_tuple((s, e), (s2, e2)) >= iou_thr:
             return True
     return False
+
+
+def _is_ner(cand: dict) -> bool:
+    return cand.get("source") == "ner"
+
+
+def _as_accepted(c: dict, forced_type: Optional[str] = None) -> dict:
+    return {
+        "text": c["text"],
+        "type": forced_type if forced_type else c.get("type"),
+        "start_char": int(c["start_char"]),
+        "end_char": int(c["end_char"]),
+        "source": c.get("source", "unknown"),
+    }
+
+
+def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
+                     mode: str,
+                     iou_thr: float = 0.5) -> Dict[str, Any]:
+    """
+    Return {"accepted": [...], "rejected": [], "missing": [], "notes": "..."}.
+    - gaz_only: keep only gazetteer; type chosen via _choose_gaz_type()
+    - ner_only: keep only NER spans; keep their 'type' as predicted
+    - gaz_ner: union; when IoU>=thr with any gaz span, gazetteer wins (type+geometry)
+    """
+    if not cands:
+        return {"accepted": [], "rejected": [], "missing": [], "notes": f"ablation:{mode}|no_cands"}
+
+    if mode == "gaz_only":
+        gaz = [c for c in cands if _is_gazetteer(c)]
+        acc = []
+        for g in gaz:
+            t = _choose_gaz_type(g, fallback_argmax=True)
+            if t:
+                acc.append(_as_accepted(g, forced_type=t))
+        return {"accepted": acc, "rejected": [], "missing": [], "notes": f"ablation:{mode}"}
+
+    if mode == "ner_only":
+        ner = [c for c in cands if _is_ner(c)]
+        acc = [_as_accepted(n) for n in ner]
+        return {"accepted": acc, "rejected": [], "missing": [], "notes": f"ablation:{mode}"}
+
+    if mode == "gaz_ner":
+        gaz = []
+        gaz_spans = []
+        for c in cands:
+            if _is_gazetteer(c):
+                t = _choose_gaz_type(c, fallback_argmax=True)
+                if not t:
+                    continue
+                a = _as_accepted(c, forced_type=t)
+                gaz.append(a)
+                gaz_spans.append((a["start_char"], a["end_char"]))
+
+        acc = list(gaz)
+        for c in cands:
+            if _is_gazetteer(c):
+                continue
+            s, e = int(c["start_char"]), int(c["end_char"])
+            if any(_iou_tuple((s, e), gs) >= iou_thr for gs in gaz_spans):
+                # conflict with gazetteer → gaz wins; skip this NER span
+                continue
+            if _is_ner(c):
+                acc.append(_as_accepted(c))
+        return {"accepted": acc, "rejected": [], "missing": [], "notes": f"ablation:{mode}"}
+
+    # Fallback (shouldn't happen)
+    return {"accepted": [], "rejected": [], "missing": [], "notes": f"ablation:{mode}|unhandled"}
+
+
 
 
 def get_openai_client(model_type: str):
@@ -1499,6 +1569,8 @@ def main():
     # ==== Gazetteer ====
     ap.add_argument("--gaz_dir", type=str, default=None,
                     help="Directory with CSV/TSV gazetteers; filename is used as entity type.")
+    ap.add_argument("--general_table_dir", type=str, default=None,
+                    help="Directory with general term table CSV.")
 
     # ==== Few-shot ====
     ap.add_argument("--few_shot", action="store_true", help="Use few-shot examples in system prompt.")
@@ -1528,6 +1600,13 @@ def main():
     ap.add_argument("--base_seed", type=int, default=0, help="Random seed.")
 
     ap.add_argument("--iou_thr", type=float, default=0.5, help="IoU threshold for span merging.")
+
+    ap.add_argument(
+        "--ablation",
+        choices=["off", "gaz_only", "ner_only", "gaz_ner"],
+        default="off",
+        help="Skip LLM and directly accept spans: gaz_only | ner_only | gaz_ner."
+    )
 
     args = ap.parse_args()
 
@@ -1568,7 +1647,11 @@ def main():
         gaz_rules = load_gaz_rules_from_dir(
             dir_path=args.gaz_dir,
         )
-        gaz_matcher = GazetteerMatcher(gaz_rules)
+        general_gaz_rules = load_general_rules_from_csv(
+            path=args.general_table_dir,
+            keep_meta_cols=general_columns
+        )
+        gaz_matcher = GazetteerMatcher(gaz_rules + general_gaz_rules)
         print(f"[gazetteer] Loaded {len(gaz_rules)} rules from {args.gaz_dir} "
               f"(phrase={len(gaz_matcher.phrase_rules)}, regex={len(gaz_matcher.regex_rules)})")
     else:
@@ -1726,28 +1809,35 @@ def main():
 
                 # llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
                 #                                       candidate_results, lock_over_iou=0.5)
-                cond = args.llm_condition
-                if cond == "C0":
-                    dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
-                    llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
-                                                          candidate_results, lock_over_iou=args.iou_thr, #todo: T = 0.4
-                                                          decoding=dec)
-                elif cond == "C1":
-                    llm_results = run_C1_vanilla(client, model_name, args.model_type, args.few_shot,
-                                                 candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
-                elif cond == "C2":
-                    llm_results = run_C2_diverse(client, model_name, args.model_type, args.few_shot,
-                                                 candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
-                elif cond == "C3":
-                    llm_results = run_C3_critique_revise(client, model_name, args.model_type, args.few_shot,
-                                                         candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
-                elif cond == "C4":
-                    llm_results = run_C4_self_consistency(client, model_name, args.model_type, args.few_shot,
-                                                          candidate_results, K=args.samples_k, lock_over_iou=args.iou_thr)
+
+                if args.ablation != "off":
+                    llm_results = []
+                    for cr in candidate_results:
+                        llm_results.append(
+                            _ablation_accept(cr.get("candidates"), args.ablation, iou_thr=args.iou_thr)
+                        )
                 else:
-                    raise ValueError(f"Unknown --llm_condition {cond}")
 
-
+                    cond = args.llm_condition
+                    if cond == "C0":
+                        dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
+                        llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
+                                                              candidate_results, lock_over_iou=args.iou_thr, #todo: T = 0.4
+                                                              decoding=dec)
+                    elif cond == "C1":
+                        llm_results = run_C1_vanilla(client, model_name, args.model_type, args.few_shot,
+                                                     candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                    elif cond == "C2":
+                        llm_results = run_C2_diverse(client, model_name, args.model_type, args.few_shot,
+                                                     candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                    elif cond == "C3":
+                        llm_results = run_C3_critique_revise(client, model_name, args.model_type, args.few_shot,
+                                                             candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                    elif cond == "C4":
+                        llm_results = run_C4_self_consistency(client, model_name, args.model_type, args.few_shot,
+                                                              candidate_results, K=args.samples_k, lock_over_iou=args.iou_thr)
+                    else:
+                        raise ValueError(f"Unknown --llm_condition {cond}")
 
 
                 if len(llm_results) != len(candidate_results):
