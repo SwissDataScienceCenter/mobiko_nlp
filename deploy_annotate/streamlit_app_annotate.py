@@ -8,6 +8,12 @@ import streamlit as st
 # ---------- Persist options defaults ----------
 SAVE_PATH = "/mydata/mobiko/anisia/data/augmented_gold.jsonl"
 
+CUSTOM = "(custom)"
+
+SCHEMA_TYPES_SHORT = ["BIODIVERSITY", "SPECIES", "GENE", "ECOSYSTEM", "HABITAT", "FEEDING REGIME", "LIFE HISTORY", "DIVERSITY",
+                    "POPULATION DISTRIBUTION", "CONSERVATION STATUS", "DRIVER", "FUNCTIONS",
+                    "ECOSYSTEM SERVICES", "CLIMATE EVENTS",]
+
 # Autosave is always on; change SAVE_PATH above if needed.
 if "autosave" not in st.session_state:
     st.session_state.autosave = True
@@ -74,11 +80,11 @@ def _apply_hotadd_from_query(cur_key, text, proposals, default_label_options):
         if len(overlaps) == 1 and overlaps[0].get("type"):
             label = overlaps[0]["type"]
     if label is None:
-        label = st.session_state.get("hot_lbl") or (default_label_options[0] if default_label_options else "MISC")
+        label = st.session_state.get("hot_lbl") or next((x for x in default_label_options if x != CUSTOM), "MISC")
 
     new_span = {"start_char": a, "end_char": b, "type": label}
     st.session_state.aug_gold[cur_key] = merge_span_into_gold(
-        st.session_state.aug_gold[cur_key], new_span, metric="dice", thr=0.8, do_merge=True
+        st.session_state.aug_gold[cur_key], new_span, metric="dice", thr=0.8, do_merge=True, text=text
     )
     _maybe_autosave()
 
@@ -111,15 +117,32 @@ def export_augmented_jsonl():
         sentences=[]
         for (i, _spans) in items:
             text_here = extract_text(gold.get((doc_id,i), []) or model.get((doc_id,i), []))
-            sentences.append({"text": text_here, "spans": _spans})
+            fixed_spans, _ = enforce_text_consistency(_spans, text_here, repair=True)
+            sentences.append({"text": text_here, "spans": fixed_spans})
         rec = {"doc_id": doc_id, "sentences": sentences}
         buf.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return buf.getvalue()
 
+
 def _maybe_autosave():
-    if st.session_state.get("autosave", True):
-        with open(SAVE_PATH, "w", encoding="utf-8") as f:
-            f.write(export_augmented_jsonl())
+    if not st.session_state.get("autosave", True):
+        return
+    # Validate & repair all sentences before export
+    any_mismatch = False
+    repaired = {}
+    for (doc, idx2), spans in st.session_state.aug_gold.items():
+        text_here = extract_text(gold.get((doc,idx2), []) or model.get((doc,idx2), []))
+        fixed, mism = enforce_text_consistency(spans, text_here, repair=True)
+        if mism:
+            any_mismatch = True
+        repaired[(doc, idx2)] = fixed
+    if any_mismatch:
+        st.info("Some spans had mismatched 'text' vs indices; corrected before save.")
+    st.session_state.aug_gold.update(repaired)
+
+    with open(SAVE_PATH, "w", encoding="utf-8") as f:
+        f.write(export_augmented_jsonl())
+
 
 
 # -------------------- Span math --------------------
@@ -352,86 +375,50 @@ def build_single_layer_html(text, tp, fp, fn, show_tp, show_fp, show_fn,
         f"  </div>"
         f"</div>"
     )
-
-#     # Use % formatting to avoid f-string brace escaping
-#     js = """
-# <script>
-# (function(){
-#   function ready(fn){ if (document.readyState !== 'loading') fn(); else document.addEventListener('DOMContentLoaded', fn); }
-#   ready(function(){
-#     try{
-#       console.log("[hotkey] init start");
-#       const wrap = document.getElementById('sent-wrap');
-#       const card = document.querySelector('.single-layer');
-#       const btn  = document.getElementById('acceptBtn');
-#       const DOC = %(doc)s;
-#       const IDX = %(idx)s;
-#
-#       if (!wrap || !card) { console.warn("[hotkey] wrap/card missing"); return; }
-#
-#       // Make sure the container can receive key events:
-#       try { wrap.focus({preventScroll:true}); } catch(_) {}
-#       console.log("[hotkey] focused wrapper");
-#
-#       function selectionOffsetsWithin(el){
-#         const sel = window.getSelection();
-#         if (!sel || sel.rangeCount === 0) return null;
-#         const rng = sel.getRangeAt(0);
-#         if (!el.contains(rng.startContainer) || !el.contains(rng.endContainer)) return null;
-#
-#         const preA = document.createRange();
-#         preA.selectNodeContents(el);
-#         preA.setEnd(rng.startContainer, rng.startOffset);
-#         const a = (preA.toString() || "").length;
-#
-#         const preB = document.createRange();
-#         preB.selectNodeContents(el);
-#         preB.setEnd(rng.endContainer, rng.endOffset);
-#         const b = (preB.toString() || "").length;
-#
-#         return (b > a) ? {a:a, b:b} : null;
-#       }
-#
-#       function hotAdd(){
-#         const offs = selectionOffsetsWithin(card);
-#         if (!offs) { console.warn("[hotkey] no selection or outside card"); return; }
-#         console.log("[hotkey] hotAdd", offs);
-#
-#         // Update URL and reload (requires st.html / non-sandbox)
-#         try {
-#           const qp = new URLSearchParams(window.location.search || "");
-#           qp.set('hotadd', String(DOC) + '|' + String(IDX) + '|' + String(offs.a) + '|' + String(offs.b));
-#           const url = window.location.pathname + '?' + qp.toString();
-#           console.log("[hotkey] navigate", url);
-#           window.location.href = url;
-#         } catch (e) {
-#           console.error("[hotkey] navigation failed", e);
-#         }
-#       }
-#
-#       // Multiple listeners to dodge framework event traps
-#       window.addEventListener('keydown', function(e){
-#         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); hotAdd(); }
-#       }, true);
-#       document.addEventListener('keydown', function(e){
-#         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); hotAdd(); }
-#       }, true);
-#       if (btn) btn.addEventListener('click', hotAdd);
-#
-#       console.log("[hotkey] listeners attached");
-#     } catch (err) {
-#       console.error("[hotkey] init error", err);
-#     }
-#   });
-# })();
-# </script>
-# """ % {"doc": _json.dumps(doc_id), "idx": _json.dumps(sent_idx)}
-
-    # return html_core + js
     return html_core
 
 
 # -------------------- Annotation helpers --------------------
+
+def set_span_text(s: dict, text: str) -> dict:
+    """Return span with 'text' field set from [start_char:end_char] on provided text."""
+    a = int(s.get("start_char", 0))
+    b = int(s.get("end_char", 0))
+    a = max(0, min(len(text), a))
+    b = max(0, min(len(text), b))
+    if b < a:  # normalize bad order if any
+        a, b = b, a
+    s["start_char"] = a
+    s["end_char"] = b
+    s["text"] = text[a:b]
+    return s
+
+
+def enforce_text_consistency(spans: list[dict], text: str, *, repair: bool = True) -> tuple[list[dict], list[dict]]:
+    """
+    Ensure span['text'] == text[start:end].
+    If repair=True, overwrite 'text' to match indices and clamp indices to text bounds.
+    Returns (fixed_spans, mismatches_list) where each mismatch is {'uid', 'was', 'now', 'a', 'b'}.
+    """
+    fixed = []
+    mismatches = []
+    n = len(text)
+    for s in spans:
+        a = max(0, min(n, int(s.get("start_char", 0))))
+        b = max(0, min(n, int(s.get("end_char", 0))))
+        if b < a:
+            a, b = b, a
+        expected = text[a:b]
+        was = s.get("text", None)
+        if was != expected:
+            mismatches.append({"uid": s.get("uid"), "was": was, "now": expected, "a": a, "b": b})
+        if repair:
+            s = dict(s)  # avoid mutating caller unexpectedly
+            s["start_char"], s["end_char"], s["text"] = a, b, expected
+        fixed.append(s)
+    return fixed, mismatches
+
+
 def dedup_exact(spans: list[dict]) -> list[dict]:
     seen = set()
     out  = []
@@ -445,7 +432,7 @@ def dedup_exact(spans: list[dict]) -> list[dict]:
 
 
 def merge_span_into_gold(gold_spans: list[dict], new_span: dict,
-                         metric="dice", thr=0.8, do_merge=True) -> list[dict]:
+                         metric="dice", thr=0.8, do_merge=True, text: str | None = None) -> list[dict]:
     """Merge new_span; preserve UIDs on existing spans; if we merge INTO an existing span, keep that span's UID."""
     ns = {
         "start_char": int(new_span["start_char"]),
@@ -458,6 +445,7 @@ def merge_span_into_gold(gold_spans: list[dict], new_span: dict,
 
     out = []
     merged = False
+
     for g in gold_spans:
         same_type = (g.get("type","") == ns.get("type",""))
         if same_type and score_pair(ns, g, metric) >= thr:
@@ -477,24 +465,12 @@ def merge_span_into_gold(gold_spans: list[dict], new_span: dict,
         out.append(ns)
 
     out = dedup_exact(out)
-    return ensure_uids(out)
+    out = ensure_uids(out)
 
-
-def _label_options(cur_key, proposals):
-    """Return sorted list of candidate labels for the hotkey UI."""
-    opts = set()
-    # Current accepted gold for this sentence
-    for s in st.session_state.aug_gold.get(cur_key, []) or []:
-        t = (s.get("type") or "").strip()
-        if t:
-            opts.add(t)
-    # Current proposals shown to the annotator (FPs)
-    for s in (proposals or []):
-        t = (s.get("type") or s.get("label") or s.get("entity") or s.get("category") or "").strip()
-        if t:
-            opts.add(t)
-    return sorted(opts) if opts else ["MISC"]
-
+    # If sentence text known, enforce text fields for all spans
+    if text is not None:
+        out, _ = enforce_text_consistency(out, text, repair=True)
+    return out
 
 def render_html(html: str):
     # Use st.html (no sandbox) if available; otherwise fallback to components.html (sandboxed)
@@ -562,20 +538,43 @@ if "aug_gold" not in st.session_state:
         working[k] = ensure_uids(base)  # << add this
     st.session_state.aug_gold = working
 
-# Label options from existing gold + model
-def collect_labels():
-    labs=set()
-    for k in keys:
-        for s in st.session_state.aug_gold.get(k, []):
-            if s.get("type"): labs.add(s["type"])
-        for inst in model.get(k, []):
-            llm = inst.get("llm", {}) or {}
-            for seq in (llm.get("accepted", []) or []) + (llm.get("missing", []) or []):
-                t=(seq.get("type") or seq.get("label") or seq.get("ent_type") or seq.get("entity") or seq.get("category"))
-                if t: labs.add(t)
-    return sorted(labs)
 
-label_options = collect_labels() or ["ORG","PER","LOC","MISC"]
+def _label_options(cur_key, proposals):
+    """Return sorted list of candidate labels for the hotkey UI."""
+    opts = set()
+    # Current accepted gold for this sentence
+    for s in st.session_state.aug_gold.get(cur_key, []) or []:
+        t = (s.get("type") or "").strip()
+        if t and t != CUSTOM:
+            opts.add(t)
+    # Current proposals shown to the annotator (FPs)
+    for s in (proposals or []):
+        t = (s.get("type") or s.get("label") or s.get("entity") or s.get("category") or "").strip()
+        if t and t != CUSTOM:
+            opts.add(t)
+    model_labels = sorted(opts)
+    result_labels = []
+    for lab in model_labels:
+        if lab in SCHEMA_TYPES_SHORT:
+            result_labels.append(lab)
+    for lab in SCHEMA_TYPES_SHORT:
+        if lab not in model_labels:
+            result_labels.append(lab)
+
+    seen = set()
+    cleaned = []
+    for lab in result_labels:
+        if not lab:
+            continue
+        if lab.lower() in {"custom", "(custom)"}:
+            continue
+        if lab not in seen:
+            seen.add(lab)
+            cleaned.append(lab)
+
+    cleaned.append(CUSTOM)  # ensure present and last
+    return cleaned
+
 
 # Sentence navigation
 idx = st.slider("Sentence index", 0, len(keys)-1, 0, 1)
@@ -606,7 +605,7 @@ else:
 
 # --- Global hotkey defaults for this page (rendered once) ---
 if "hot_lbl" not in st.session_state:
-    st.session_state.hot_lbl = (label_options[0] if label_options else "MISC")
+    st.session_state.hot_lbl = next((x for x in label_options if x != CUSTOM), "MISC")
 
 
 
@@ -681,8 +680,8 @@ with colA:
 
     with st.container(border=True):
         # Label chooser (reuse discovered labels, allow custom)
-        lab = st.selectbox("Label", options=label_options + ["(custom)"], key=f"{keyroot}_add_lab")
-        if lab == "(custom)":
+        lab = st.selectbox("Label", options=label_options, key=f"{keyroot}_add_lab")
+        if lab == CUSTOM:
             lab = st.text_input("Custom label", value="", key=f"{keyroot}_add_lab_custom")
 
         q_key = f"{keyroot}_add_q_{st.session_state[ver_key]}"
@@ -712,7 +711,8 @@ with colA:
                 new_span,
                 metric=metric,
                 thr=merge_thr,
-                do_merge=merge_same_label
+                do_merge=merge_same_label,
+                text=text
             )
             st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
             st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
@@ -740,15 +740,16 @@ with colP:
                 # Label selector (keyed by sig, not index)
                 with c1:
                     # compute a stable default index
-                    all_opts = label_options + ["(custom)"]
-                    idx_default = all_opts.index(default_label) if default_label in all_opts else len(label_options)
+                    all_opts = label_options
+                    idx_default = all_opts.index(default_label) if default_label in label_options else 0
+
                     new_lbl = st.selectbox(
                         "Label",
                         options=all_opts,
                         index=idx_default,
                         key=wkey("fp_lab", sig),
                     )
-                    if new_lbl == "(custom)":
+                    if new_lbl == CUSTOM:
                         new_lbl = st.text_input("Custom", value=default_label, key=wkey("fp_custom", sig))
 
                 # Start/end inputs (keyed by sig)
@@ -769,6 +770,7 @@ with colP:
                             metric=metric,
                             thr=merge_thr,
                             do_merge=merge_same_label,
+                            text=text
                         )
                         st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
                         _maybe_autosave()
@@ -790,11 +792,17 @@ with colG:
             st.write(f"`{text[a:b]}`  [{a},{b})")
             c1, c2, c3, c4 = st.columns([2,2,2,2])
             with c1:
-                new_lbl = st.selectbox(f"Label #{j}",
-                    options=label_options + ["(custom)"],
-                    index=(label_options+["(custom)"]).index(lbl) if lbl in label_options else len(label_options),
-                    key=f"g_lab_{uid}")  # << uid here
-                if new_lbl == "(custom)":
+                opts = label_options  # CUSTOM guaranteed at end
+
+                idx = all_opts.index(lbl) if lbl in opts else 0
+
+                new_lbl = st.selectbox(
+                    f"Label #{j}",
+                    options=opts,
+                    index=idx,
+                    key=f"g_lab_{uid}",
+                )
+                if new_lbl == CUSTOM:
                     new_lbl = st.text_input(f"Custom g#{j}", value=lbl, key=f"g_custom_{uid}")  # << uid
             with c2:
                 new_a = st.number_input(f"Start g#{j}", value=a, step=1, key=f"g_a_{uid}")  # << uid
@@ -806,10 +814,9 @@ with colG:
                 b_delete = st.button("Delete", key=f"g_del_{uid}")   # << uid
 
             if b_update:
-                st.session_state.aug_gold[cur_key][j] = {
-                    "start_char": int(new_a), "end_char": int(new_b),
-                    "type": new_lbl, "uid": uid  # preserve uid
-                }
+                updated = {"start_char": int(new_a), "end_char": int(new_b), "type": new_lbl, "uid": uid}
+                updated = set_span_text(updated, text)  # ← ensure "text" matches the indices
+                st.session_state.aug_gold[cur_key][j] = updated
                 st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
                 st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
                 _maybe_autosave()
