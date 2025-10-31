@@ -23,7 +23,8 @@ NGINX_AUTH_FILE="${NGINX_AUTH_FILE:-/mydata/mobiko/anisia/deploy_annotate/htpass
 [ -r "$NGINX_AUTH_FILE" ] || { echo "Auth file not readable: $NGINX_AUTH_FILE"; exit 1; }
 
 # Streamlit on 0.0.0.0:8502 and behind /annotate
-STREAMLIT_SERVER_ADDRESS="${STREAMLIT_SERVER_ADDRESS:-0.0.0.0}"
+STREAMLIT_SERVER_ADDRESS="${STREAMLIT_SERVER_ADDRESS:-127.0.0.1}"
+
 STREAMLIT_SERVER_PORT="${STREAMLIT_SERVER_PORT:-8502}"
 STREAMLIT_BASE_PATH="${STREAMLIT_BASE_PATH:-annotate}"
 

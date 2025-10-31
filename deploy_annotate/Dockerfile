@@ -53,8 +53,9 @@ USER root
 
 # Streamlit listens on 8502 internally, nginx on 8000
 ENV STREAMLIT_SERVER_PORT=8502 \
-    STREAMLIT_SERVER_ADDRESS=0.0.0.0
+    STREAMLIT_SERVER_ADDRESS=127.0.0.1
 
-EXPOSE 80
+
+EXPOSE 8000
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/start.sh"]
