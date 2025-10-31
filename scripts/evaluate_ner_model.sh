@@ -4,10 +4,10 @@
 set -e  # Exit on error
 
 # Default values
-MODEL_DIR="models/ner_roberta"
-TEST_JSONL="data/ner_data/splits/test.jsonl"
-BATCH_SIZE="16"
-REPORT_PATH="results/test_report.txt"
+MODEL_DIR="${MODEL_DIR:-models/ner_roberta}"
+TEST_JSONL="${TEST_JSONL:-data/ner_data/splits/test.jsonl}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+REPORT_PATH="${REPORT_PATH:-results/test_report.txt}"
 
 # Create results directory
 mkdir -p "$(dirname "$REPORT_PATH")"

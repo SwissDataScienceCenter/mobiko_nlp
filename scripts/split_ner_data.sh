@@ -4,14 +4,11 @@
 set -e  # Exit on error
 
 # Default values
-TRAIN_JSONL="data/ner_data/splits/train.jsonl"
-VALID_JSONL="data/ner_data/splits/dev.jsonl"
-
-INPUT_JSONL="data/ner_data/bioc_conll.jsonl"
-OUT_DIR="data/ner_data/splits"
-TRAIN_RATIO="-0.8"
-DEV_RATIO="-0.1"
-SEED="-13"
+INPUT_JSONL="${INPUT_JSONL:data/ner_data/bioc_conll.jsonl}"
+OUT_DIR="${OUT_DIR:data/ner_data/splits}"
+TRAIN_RATIO="${TRAIN_RATIO:-0.8}"
+DEV_RATIO="${DEV_RATIO:-0.1}"
+SEED="${SEED:-13}"
 
 echo "Splitting dataset: $INPUT_JSONL"
 
