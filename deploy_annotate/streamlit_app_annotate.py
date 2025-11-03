@@ -17,7 +17,6 @@ SCHEMA_TYPES_SHORT = ["BIODIVERSITY", "SPECIES", "GENE", "ECOSYSTEM", "HABITAT",
                     "POPULATION DISTRIBUTION", "CONSERVATION STATUS", "DRIVER", "FUNCTIONS",
                     "ECOSYSTEM SERVICES", "CLIMATE EVENTS",]
 
-# Autosave is always on; change SAVE_PATH above if needed.
 if "autosave" not in st.session_state:
     st.session_state.autosave = True
 
@@ -280,21 +279,28 @@ def categorize_spans(gold_spans, pred_spans, thr, metric="dice", require_type=Fa
     for pi, p in enumerate(pred_spans):
         pt = p.get("type")
         for gi, g in enumerate(gold_spans):
-            if require_type and pt != g.get("type"): continue
+            if require_type and pt != g.get("type"):
+                continue
             s = score_pair(p, g, metric)
-            if s >= thr: pairs.append((s, pi, gi))
+            if s >= thr:
+                pairs.append((s, pi, gi))
     pairs.sort(reverse=True, key=lambda x: x[0])
     matched_g, matched_p = {}, {}
     for s, pi, gi in pairs:
-        if gi in matched_g or pi in matched_p: continue
-        matched_g[gi] = pi; matched_p[pi] = gi
+        if gi in matched_g or pi in matched_p:
+            continue
+        matched_g[gi] = pi
+        matched_p[pi] = gi
     # containment credit
     if allow_many_to_one:
         for gi, g in enumerate(gold_spans):
-            if gi in matched_g: continue
+            if gi in matched_g:
+                continue
             for pi, p in enumerate(pred_spans):
-                if pi not in matched_p: continue
-                if require_type and p.get("type") != g.get("type"): continue
+                if pi not in matched_p:
+                    continue
+                if require_type and p.get("type") != g.get("type"):
+                    continue
                 a0,a1 = int(p["start_char"]), int(p["end_char"])
                 b0,b1 = int(g["start_char"]), int(g["end_char"])
                 if b0 >= a0 and b1 <= a1:
@@ -315,6 +321,7 @@ def categorize_spans(gold_spans, pred_spans, thr, metric="dice", require_type=Fa
     fp = [pred_spans[i] for i in fp_idx]
     fn = [gold_spans[i] for i in fn_idx]
     return tp, fp, fn
+
 
 # -------------------- Rendering (single layer + hover labels) --------------------
 
@@ -480,6 +487,17 @@ def dedup_exact(spans: list[dict]) -> list[dict]:
             continue
         seen.add(key)
         out.append(s)  # keep original dict with its uid
+    return out
+
+
+def dedup_proposals(proposals, text):
+    seen = set(); out = []
+    for s in proposals:
+        sig = prop_sig(s, text)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(s)
     return out
 
 
@@ -663,6 +681,9 @@ else:
     tp_view, fp_view, fn_view = tp, fp, fn
     proposals = fp
     label_options = _label_options(cur_key, proposals)
+
+proposals = dedup_proposals(proposals, text)
+
 
 # --- Global hotkey defaults for this page (rendered once) ---
 if "hot_lbl" not in st.session_state:
@@ -896,7 +917,6 @@ with colG:
 st.divider()
 st.subheader("Export augmented gold")
 
-# Autosave writes to SAVE_PATH; no manual server-path UI
 st.caption(f"Autosave: session file → {RUN_PATH}")
 st.caption(f"Latest snapshot → {LATEST_PATH}")
 
