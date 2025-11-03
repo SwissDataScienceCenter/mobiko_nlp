@@ -1,12 +1,15 @@
 import json
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any
+import os, datetime, tempfile
 import io
 import streamlit.components.v1 as components
 import streamlit as st
 
 # ---------- Persist options defaults ----------
-SAVE_PATH = "/mydata/mobiko/anisia/data/augmented_gold.jsonl"
+
+SAVE_DIR = "/mydata/mobiko/anisia/data/aug_runs"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 CUSTOM = "(custom)"
 
@@ -27,6 +30,7 @@ def wkey(*parts: str) -> str:
     doc, sent = cur_key
     return "w|" + str(doc) + "|" + str(sent) + "|" + "|".join(str(p) for p in parts)
 
+
 def prop_sig(span: dict, text: str) -> str:
     # Stable signature for a proposal row
     a = int(span.get("start_char", -1))
@@ -36,7 +40,6 @@ def prop_sig(span: dict, text: str) -> str:
     snippet = text[max(0, a):max(0, min(len(text), b))]
     h = zlib.crc32(snippet.encode("utf-8")) & 0xFFFFFFFF
     return f"{a}-{b}-{t}-{h:08x}"
-
 
 
 def _uid() -> str:
@@ -94,6 +97,7 @@ def _apply_hotadd_from_query(cur_key, text, proposals, default_label_options):
 
 
 # ---------- Rerun compatibility ----------
+
 def force_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -107,6 +111,40 @@ def force_rerun():
             pass
 
 # ---------- Export (define early so autosave can call it) ----------
+
+def _atomic_write(text: str, dst_path: str):
+    """Write text to a temp file and atomically replace dst_path."""
+    dirpath = os.path.dirname(dst_path)
+    fd, tmppath = tempfile.mkstemp(prefix=".tmp_", dir=dirpath, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmppath, dst_path)
+        # fsync the directory to persist the rename on crash/power loss
+        dir_fd = os.open(dirpath, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        # If anything exploded before replace, clean the tmp
+        if os.path.exists(tmppath):
+            try: os.remove(tmppath)
+            except Exception: pass
+
+
+def _prune_snapshots():
+    """Keep only the newest MAX_SNAPSHOTS aug_*.jsonl files."""
+    files = [f for f in os.listdir(SAVE_DIR) if f.startswith("aug_") and f.endswith(".jsonl")]
+    files = sorted(files, reverse=True)
+    for f in files[MAX_SNAPSHOTS:]:
+        try: os.remove(os.path.join(SAVE_DIR, f))
+        except Exception:
+            pass
+
+
 def export_augmented_jsonl():
     buf = io.StringIO()
     docs = defaultdict(list)
@@ -127,6 +165,7 @@ def export_augmented_jsonl():
 def _maybe_autosave():
     if not st.session_state.get("autosave", True):
         return
+
     # Validate & repair all sentences before export
     any_mismatch = False
     repaired = {}
@@ -140,12 +179,18 @@ def _maybe_autosave():
         st.info("Some spans had mismatched 'text' vs indices; corrected before save.")
     st.session_state.aug_gold.update(repaired)
 
-    with open(SAVE_PATH, "w", encoding="utf-8") as f:
-        f.write(export_augmented_jsonl())
+    payload = export_augmented_jsonl()
 
+    # 1) Write to this session's RUN_PATH
+    _atomic_write(payload, RUN_PATH)
+    # 2) Update the rolling latest pointer
+    _atomic_write(payload, LATEST_PATH)
+    # 3) Prune old snapshots
+    _prune_snapshots()
 
 
 # -------------------- Span math --------------------
+
 def span_len(a, b): return max(0, int(b) - int(a))
 
 def overlap(a0, a1, b0, b1):
@@ -172,6 +217,7 @@ def score_pair(p, g, metric):
     return dice(a0,a1,b0,b1)
 
 # -------------------- Normalization --------------------
+
 def normalize_span(s: Dict[str, Any]) -> Dict[str, Any]:
     s["start_char"] = int(s.get("start_char", 0))
     s["end_char"]   = int(s.get("end_char", 0))
@@ -182,6 +228,7 @@ def normalize_span(s: Dict[str, Any]) -> Dict[str, Any]:
     return s
 
 # -------------------- I/O --------------------
+
 def load_jsonl_grouped(path_or_buffer):
     """(doc_id, sent_idx) -> [sentence dicts]"""
     spans_by_key = defaultdict(list)
@@ -200,11 +247,13 @@ def load_jsonl_grouped(path_or_buffer):
             spans_by_key[(doc_id, i)].append(sent)
     return spans_by_key
 
+
 def extract_text(value_list: List[Dict]) -> str:
     for inst in value_list:
         t = inst.get("text") or ""
         if t: return t
     return ""
+
 
 def get_gold_spans(value_list: List[Dict]) -> List[Dict]:
     out = []
@@ -224,6 +273,7 @@ def get_pred_spans(value_list: List[Dict], source="accepted_and_missing") -> Lis
     return out
 
 # -------------------- Matching & categorization --------------------
+
 def categorize_spans(gold_spans, pred_spans, thr, metric="dice", require_type=False,
                      allow_many_to_one=True, suppress_nested_fp=True):
     pairs = []
@@ -267,12 +317,14 @@ def categorize_spans(gold_spans, pred_spans, thr, metric="dice", require_type=Fa
     return tp, fp, fn
 
 # -------------------- Rendering (single layer + hover labels) --------------------
+
 def _norm_spans_with_labels(text, spans):
     n=len(text); out=[]
     for s in spans:
         a=max(0,int(s["start_char"])); b=min(n,int(s["end_char"]))
         if a<b: out.append((a,b,s.get("type","")))
     return out
+
 
 def merge_to_fragments(text, tp, fp, fn):
     tpN=_norm_spans_with_labels(text,tp); fpN=_norm_spans_with_labels(text,fp); fnN=_norm_spans_with_labels(text,fn)
@@ -484,6 +536,15 @@ def render_html(html: str):
 
 # -------------------- UI --------------------
 
+if "run_id" not in st.session_state:
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    st.session_state.run_id = f"{ts}-{uuid.uuid4().hex[:6]}"
+
+
+RUN_PATH    = os.path.join(SAVE_DIR, f"aug_{st.session_state.run_id}.jsonl")
+LATEST_PATH = os.path.join(SAVE_DIR, "aug_latest.jsonl")
+
+MAX_SNAPSHOTS = 50
 
 st.set_page_config(page_title="BioNER Annotation", layout="wide")
 st.title("BioNER Annotation")
@@ -793,8 +854,7 @@ with colG:
             c1, c2, c3, c4 = st.columns([2,2,2,2])
             with c1:
                 opts = label_options  # CUSTOM guaranteed at end
-
-                idx = all_opts.index(lbl) if lbl in opts else 0
+                idx = opts.index(lbl) if lbl in opts else 0
 
                 new_lbl = st.selectbox(
                     f"Label #{j}",
@@ -836,10 +896,15 @@ with colG:
 st.divider()
 st.subheader("Export augmented gold")
 
+# Autosave writes to SAVE_PATH; no manual server-path UI
+st.caption(f"Autosave: session file → {RUN_PATH}")
+st.caption(f"Latest snapshot → {LATEST_PATH}")
+
 aug_jsonl = export_augmented_jsonl()
 
-# Autosave writes to SAVE_PATH; no manual server-path UI
-st.caption(f"Autosaving to {SAVE_PATH} on every change.")
-
-st.download_button("Download augmented_gold.jsonl", data=aug_jsonl.encode("utf-8"),
-                   file_name="augmented_gold.jsonl", mime="application/jsonl")
+st.download_button(
+    f"Download augmented_gold ({st.session_state.run_id}).jsonl",
+    data=aug_jsonl.encode("utf-8"),
+    file_name=f"augmented_gold_{st.session_state.run_id}.jsonl",
+    mime="application/jsonl",
+)
