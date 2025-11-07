@@ -3,17 +3,17 @@
 
 set -e  # Exit on error
 
-# Explicit configuration values
-TRAIN_JSONL="data/ner_data/splits/train.jsonl"
-VALID_JSONL="data/ner_data/splits/dev.jsonl"
-MODEL_NAME="roberta-base"
-OUTPUT_DIR="models/ner_roberta"
-EPOCHS="8"
-BATCH_SIZE="16"
-LEARNING_RATE="3e-5"
-GRAD_ACCUM="2"
-CLASS_WEIGHT_POWER="0.5"
-O_WEIGHT="0.2"
+# Default values
+TRAIN_JSONL="${TRAIN_JSONL:data/ner_data/splits/train.jsonl}"
+VALID_JSONL="${VALID_JSONL:data/ner_data/splits/dev.jsonl}"
+MODEL_NAME="${MODEL_NAME:-roberta-base}"
+OUTPUT_DIR="${OUTPUT_DIR:-models/ner_roberta}"
+EPOCHS="${EPOCHS:-8}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+LEARNING_RATE="${LEARNING_RATE:-3e-5}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
+CLASS_WEIGHT_POWER="${CLASS_WEIGHT_POWER:-0.5}"
+O_WEIGHT="${O_WEIGHT:-0.2}"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
