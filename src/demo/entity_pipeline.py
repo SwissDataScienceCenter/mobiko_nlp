@@ -22,6 +22,9 @@ from preprocess.gazetteer_matcher import Rule as GazetteerRule, load_gaz_rules_f
 from tables.thesaurus.general_cols import general_columns
 import random, numpy as np, torch
 
+import time, math, csv
+from dataclasses import dataclass, asdict
+
 from prompts import *
 import glob
 
@@ -193,6 +196,72 @@ def safe_json_from_llm(raw: str, kind: str = "extract") -> dict:
     """
     # ... (helper uses _extract_first_json, _remove_trailing_commas, etc.)
     return {"accepted": [], "rejected": [], "missing": [], "notes": "json_repair_failed"}
+
+
+# --- Metrics plumbing (lightweight) ---
+
+def _approx_tokens(text: str) -> int:
+    # Fallback when the server doesn't return usage; rough but consistent across methods.
+    # Rule of thumb: ~4 chars/token in English-ish text (UTF-8 safe).
+    return max(1, math.ceil(len(text) / 4))
+
+@dataclass
+class LLMCallMetric:
+    model_type: str
+    condition: str             # e.g., "C0"/"C1"/..., or "ablation:gaz_only"
+    pass_id: int               # 1..T (use 1 for single-pass)
+    sentence_idx: int          # index within the current document processing
+    num_candidates: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    latency_ms: float
+
+class MetricsLogger:
+    def __init__(self):
+        self.rows: list[LLMCallMetric] = []
+        self.doc_started_at = None
+        self.docs = 0
+        self.sentences = 0
+
+    def start_doc(self):
+        self.doc_started_at = time.perf_counter()
+
+    def end_doc(self):
+        self.docs += 1
+
+    def add_sentence(self):
+        self.sentences += 1
+
+    def log(self, **kwargs):
+        self.rows.append(LLMCallMetric(**kwargs))
+
+    def summary(self):
+        if not self.rows:
+            return {"docs": self.docs, "sentences": self.sentences, "calls": 0}
+        lat = [r.latency_ms for r in self.rows]
+        tot = [r.total_tokens for r in self.rows]
+        return {
+            "docs": self.docs,
+            "sentences": self.sentences,
+            "calls": len(self.rows),
+            "lat_ms_avg": sum(lat)/len(lat),
+            "lat_ms_p50": sorted(lat)[len(lat)//2],
+            "lat_ms_p90": sorted(lat)[int(len(lat)*0.9)],
+            "tok_total": sum(tot),
+            "tok_avg_per_call": sum(tot)/len(tot),
+            "tok_avg_per_sent": sum(tot)/max(1,self.sentences),
+        }
+
+    def dump_csv(self, path: str):
+        if not self.rows:
+            return
+        Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[*asdict(self.rows[0]).keys()])
+            w.writeheader()
+            for r in self.rows:
+                w.writerow(asdict(r))
 
 
 
@@ -654,6 +723,7 @@ def call_llm_batch_two_path(
         # print(f"Locked spans for sent: {len(lock_accepteds)}")
         # print(f"To LLM spans for sent: {len(to_llm)}")
         # Build a request for LLM with only non-gaz candidates
+
         if to_llm:
             filtered_reqs.append({"sentence": sent, "candidates": to_llm})
         else:
@@ -729,6 +799,7 @@ def call_llm_batch(
         sentence = req["sentence"]
         candidates = req.get("candidates")
 
+
         if candidates is None:
             system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
             user_payload = {"sentence": sentence}
@@ -759,6 +830,7 @@ def call_llm_batch(
                     for c in candidates
                 ]
                 user_payload = {"sentence": sentence, "candidates": cand_objs}
+
 
         # Modify system prompt for Qwen 32B
         if "qwen3-32B" in model_type:
@@ -810,8 +882,8 @@ def call_llm_batch(
 
 # === ADD: Multi-pass runners ===
 
-def run_C1_vanilla(
-    client, model_name, model_type, few_shot, candidate_results, T: int = 3, lock_over_iou: float = 0.5) -> List[Dict]:
+def run_C1_vanilla(client, model_name, model_type, few_shot, candidate_results, T: int = 3,
+        lock_over_iou: float = 0.5, gaz_lock: bool = False) -> List[Dict]:
     """
     Vanilla multi-pass:
       P1: standard two-path call
@@ -820,7 +892,7 @@ def run_C1_vanilla(
     # P1
     dec = _decoding_profile(1, "C1")
     p1 = call_llm_batch_two_path(client, model_name, model_type, few_shot,
-                                 candidate_results, lock_over_iou=lock_over_iou, decoding=dec)
+                                 candidate_results, lock_over_iou=lock_over_iou, decoding=dec, gaz_lock=gaz_lock)
 
     if T == 1:
         return p1
@@ -850,7 +922,8 @@ def run_C1_vanilla(
 
 
 def run_C2_diverse(
-    client, model_name, model_type, few_shot, candidate_results, T: int = 3, lock_over_iou=0.5) -> List[Dict]:
+    client, model_name, model_type, few_shot, candidate_results, T: int = 3,
+        lock_over_iou=0.5, gaz_lock: bool = True) -> List[Dict]:
     """
     Diversity-forced multi-pass: each pass uses a different decoding profile,
     aggregate with NMS-style consensus by type.
@@ -860,7 +933,8 @@ def run_C2_diverse(
     for t in range(1, T+1):
         dec = _decoding_profile(t, "C2")
         out = call_llm_batch_two_path(client, model_name, model_type, few_shot,
-                                      candidate_results, lock_over_iou=lock_over_iou, decoding=dec)
+                                      candidate_results, lock_over_iou=lock_over_iou,
+                                      decoding=dec, gaz_lock=gaz_lock)
         for i, o in enumerate(out):
             pass_accepteds_per_sent[i].append(o.get("accepted", []))
 
@@ -907,11 +981,11 @@ def run_C2_diverse(
 #     return final
 
 def run_C3_critique_revise(client, model_name, model_type, few_shot, candidate_results, T: int = 3,
-                           lock_over_iou: float = 0.5) -> List[Dict]:
+                           lock_over_iou: float = 0.5, gaz_lock: bool = True) -> List[Dict]:
     # P1: normal two-path extraction (already returns {"accepted": [...], "notes": "..."} via safe_json_from_llm)
     dec = _decoding_profile(1, "C3")
     p = call_llm_batch_two_path(client, model_name, model_type, few_shot,
-                                candidate_results, lock_over_iou=lock_over_iou, decoding=dec)
+                                candidate_results, lock_over_iou=lock_over_iou, decoding=dec, gaz_lock=gaz_lock)
 
     # Keep rolling state per sentence
     state = []
@@ -971,7 +1045,7 @@ def run_C3_critique_revise(client, model_name, model_type, few_shot, candidate_r
 
 
 def run_C4_self_consistency(
-    client, model_name, model_type, few_shot, candidate_results, K: int = 5
+    client, model_name, model_type, few_shot, candidate_results, K: int = 5, lock_over_iou = 0.5, gaz_lock: bool = True
 ) -> List[Dict]:
     """
     Self-consistency in one pass: sample K independent outputs, then consensus merge.
@@ -986,7 +1060,7 @@ def run_C4_self_consistency(
     for k in range(K):
         dec = grid[k % len(grid)]
         out = call_llm_batch_two_path(client, model_name, model_type, few_shot,
-                                      candidate_results, lock_over_iou=0.5, decoding=dec)
+                                      candidate_results, lock_over_iou=0.5, decoding=dec, gaz_lock=gaz_lock)
         for i, o in enumerate(out):
             samples_per_sent[i].append(o.get("accepted", []))
 
@@ -1619,8 +1693,11 @@ def main():
         default="off",
         help="Skip LLM and directly accept spans: gaz_only | ner_only | gaz_ner."
     )
+    ap.add_argument("--metrics_csv", type=str, default=None, help="Optional CSV file to log metrics.")
 
     args = ap.parse_args()
+
+    # metrics = MetricsLogger()
 
     set_base_seed(args.base_seed)
     type_map = {
@@ -1708,6 +1785,8 @@ def main():
 
     with open(args.out_jsonl, "w", encoding="utf-8") as fout:
         for doc_id, text in read_txt_files(args.in_dir):
+            # metrics.start_doc()
+
             if docs_written > 1:  # Debug limit
                 break
 
@@ -1834,20 +1913,29 @@ def main():
                     if cond == "C0":
                         dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
                         llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
-                                                              candidate_results, lock_over_iou=args.iou_thr, #todo: T = 0.4
+                                                              candidate_results,
+                                                              lock_over_iou=args.iou_thr, #todo: T = 0.4
                                                               decoding=dec, gaz_lock=args.gaz_locked)
                     elif cond == "C1":
                         llm_results = run_C1_vanilla(client, model_name, args.model_type, args.few_shot,
-                                                     candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                                                     candidate_results, T=args.passes,
+                                                     lock_over_iou=args.iou_thr,
+                                                     gaz_lock=args.gaz_locked)
                     elif cond == "C2":
                         llm_results = run_C2_diverse(client, model_name, args.model_type, args.few_shot,
-                                                     candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                                                     candidate_results, T=args.passes,
+                                                     lock_over_iou=args.iou_thr,
+                                                     gaz_lock=args.gaz_locked)
                     elif cond == "C3":
                         llm_results = run_C3_critique_revise(client, model_name, args.model_type, args.few_shot,
-                                                             candidate_results, T=args.passes, lock_over_iou=args.iou_thr)
+                                                             candidate_results, T=args.passes,
+                                                             lock_over_iou=args.iou_thr,
+                                                             gaz_lock=args.gaz_locked)
                     elif cond == "C4":
                         llm_results = run_C4_self_consistency(client, model_name, args.model_type, args.few_shot,
-                                                              candidate_results, K=args.samples_k, lock_over_iou=args.iou_thr)
+                                                              candidate_results, K=args.samples_k,
+                                                              lock_over_iou=args.iou_thr,
+                                                              gaz_lock=args.gaz_locked)
                     else:
                         raise ValueError(f"Unknown --llm_condition {cond}")
 
@@ -1884,10 +1972,14 @@ def main():
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             docs_written += 1
             print(f"Completed document {doc_id} with {len(out_sents)} sentences")
-
+            # metrics.end_doc()
 
     mode_str = "with chunks" if args.use_chunks else "without chunks"
     print(f"Done. Processed {docs_written} documents using {args.model_type} {mode_str} and wrote to {args.out_jsonl}")
+
+    # print("[EFFICIENCY]", metrics.summary())
+    # if args.metrics_csv:
+    #     metrics.dump_csv(args.metrics_csv)
 
 
 if __name__ == "__main__":
