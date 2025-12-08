@@ -17,6 +17,28 @@ SCHEMA_TYPES_SHORT = ["BIODIVERSITY", "SPECIES", "GENE", "ECOSYSTEM", "HABITAT",
                     "POPULATION DISTRIBUTION", "CONSERVATION STATUS", "DRIVER", "FUNCTIONS",
                     "ECOSYSTEM SERVICES", "CLIMATE EVENTS",]
 
+SCHEMA_TYPES_SHORT_TO_TEST = [
+    "ABIOTIC COLLECTIVE ENTITY",
+    "ABIOTIC ENTITY",
+    "ABIOTIC PROCESS",
+    "ABIOTIC PROPERTY",
+    "ANTHROPOGENIC MATERIAL ENTITY",
+    "ANTHROPOGENIC PROCESS",
+    "ANTHROPOGENIC PROPERTY",
+    "ANTHROPOGENIC SOCIAL INSTITUTION",
+    "BIOTIC COLLECTIVE ENTITY",
+    "BIOTIC ENTITY",
+    "BIOTIC PROCESS",
+    "BIOTIC PROPERTY",
+    "CONCEPT",
+    "SPATIAL ENTITY",
+    "SPATIAL PROPERTY",
+    "TEMPORAL ENTITY",
+    "TEMPORAL PROPERTY"
+]
+
+
+
 if "autosave" not in st.session_state:
     st.session_state.autosave = True
 
@@ -634,9 +656,9 @@ def _label_options(cur_key, proposals):
     model_labels = sorted(opts)
     result_labels = []
     for lab in model_labels:
-        if lab in SCHEMA_TYPES_SHORT:
+        if lab in SCHEMA_TYPES_SHORT_TO_TEST:
             result_labels.append(lab)
-    for lab in SCHEMA_TYPES_SHORT:
+    for lab in SCHEMA_TYPES_SHORT_TO_TEST:
         if lab not in model_labels:
             result_labels.append(lab)
 

@@ -51,7 +51,7 @@ MODEL_CONFIGS = {
         "model_name": "Qwen/Qwen3-4B-Instruct-2507"
     },
     "qwen3-32B": {
-        "base_url": "https://openwebui.runai-codev-llm.inference.compute.datascience.ch/api",
+        "base_url": "https://openwebui-runai-codev-llm.inference.compute.datascience.ch/api",
         "api_key": None,  # Will use OPEN_WEB_UI_API_KEY env var
         "model_name": "Qwen/Qwen3-32B-AWQ"
     },
@@ -71,7 +71,7 @@ MODEL_CONFIGS = {
         "model_name": "gpt-4o"
     },
     "qwen3-32B-vllm": {
-        "base_url": "https://vllm-gateway.runai-codev-llm.inference.compute.datascience.ch/v1",
+        "base_url": "https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
         "api_key": None,  # read from env
         "model_name": "Qwen/Qwen3-32B-AWQ"  # use the exact id your gateway serves
     }
@@ -801,35 +801,36 @@ def call_llm_batch(
 
 
         if candidates is None:
-            system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
+            system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT_2
             user_payload = {"sentence": sentence}
         else:
-            # Determine whether candidates include NER-proposed types
-            has_types = any("type" in c and c["type"] for c in candidates)
-            if has_types:
-                # NER-aware path: include proposed_type
-                system_prompt = NER_AWARE_SYSTEM_PROMPT
-                cand_objs = []
-                for c in candidates:
-                    obj = {
-                        "text": c["text"].strip(),
-                        "start_char": c["start_char"],
-                        "end_char": c["end_char"],
-                        "proposed_type": c.get("type", None)
-                    }
-                    cand_objs.append(obj)
-                user_payload = {"sentence": sentence, "candidates": cand_objs}
+            # # Determine whether candidates include NER-proposed types
+            # has_types = any("type" in c and c["type"] for c in candidates)
+            # if has_types:
+            #     # NER-aware path: include proposed_type
+            #     system_prompt = NER_AWARE_SYSTEM_PROMPT
+            #     cand_objs = []
+            #     for c in candidates:
+            #         obj = {
+            #             "text": c["text"].strip(),
+            #             "start_char": c["start_char"],
+            #             "end_char": c["end_char"],
+            #             "proposed_type": c.get("type", None)
+            #         }
+            #         cand_objs.append(obj)
+            #     user_payload = {"sentence": sentence, "candidates": cand_objs}
+            # else:
+            if few_shot:
+                system_prompt = SYSTEM_PROMPT_FEW_SHOT_2 # try new schema
+                # system_prompt = SYSTEM_PROMPT_FEW_SHOT_NEW
             else:
-                if few_shot:
-                    system_prompt = SYSTEM_PROMPT_FEW_SHOT_NEW
-                else:
-                    # Legacy chunks path: no types proposed
-                    system_prompt = DEFAULT_SYSTEM_PROMPT_NEW
-                cand_objs = [
-                    {"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]}
-                    for c in candidates
-                ]
-                user_payload = {"sentence": sentence, "candidates": cand_objs}
+                # Legacy chunks path: no types proposed
+                system_prompt = DEFAULT_SYSTEM_PROMPT_NEW_2
+            cand_objs = [
+                {"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]}
+                for c in candidates
+            ]
+            user_payload = {"sentence": sentence, "candidates": cand_objs}
 
 
         # Modify system prompt for Qwen 32B
@@ -1700,19 +1701,34 @@ def main():
     # metrics = MetricsLogger()
 
     set_base_seed(args.base_seed)
+    # type_map = {
+    #       "Biomes": "HABITAT",
+    #       "Biota": "TAXON",
+    #       "Mountains": "HABITAT",
+    #       "MountainRange": "HABITAT",
+    #       "geography": "HABITAT",
+    #       "ENV_FEATURE": "ENV_FEATURE",
+    #       "POPULATION": "POPULATION",
+    #       "TAXON": "TAXON",
+    #       "LOCATION": "LOCATION",
+    #       "HABITAT": "HABITAT",
+    #       "THREAT": "THREAT"
+    #     }
+    # TODO: this has to be changed!
     type_map = {
-          "Biomes": "HABITAT",
-          "Biota": "TAXON",
-          "Mountains": "HABITAT",
-          "MountainRange": "HABITAT",
-          "geography": "HABITAT",
-          "ENV_FEATURE": "ENV_FEATURE",
-          "POPULATION": "POPULATION",
-          "TAXON": "TAXON",
-          "LOCATION": "LOCATION",
-          "HABITAT": "HABITAT",
-          "THREAT": "THREAT"
+          "Biomes": "ABIOTIC ENTITY",
+          "Biota": "BIOTIC ENTITY",
+          "Mountains": "BIOTIC ENTITY",
+          "MountainRange": "BIOTIC ENTITY",
+          "geography": "SPATIAL ENTITY",
+          "ENV_FEATURE": "ABIOTIC PROPERTY",
+          "POPULATION": "BIOTIC COLLECTIVE ENTITY",
+          "TAXON": "BIOTIC ENTITY",
+          "LOCATION": "SPACIAL ENTITY",
+          "HABITAT": "BIOTIC PROPERTY",
+          "THREAT": "ANTHROPOGENIC PROCESS"
         }
+
     if args.type_map_json:
         with open(args.type_map_json, "r", encoding="utf-8") as f:
             type_map = json.load(f)
