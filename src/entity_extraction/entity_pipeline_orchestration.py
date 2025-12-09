@@ -1,0 +1,420 @@
+# entity_extraction/entity_pipeline.py
+from __future__ import annotations
+import os
+import sys
+import json
+import argparse
+from pathlib import Path
+from typing import Dict, Any, List
+import random
+import numpy as np
+import torch
+
+import spacy  # just for validation of model existence
+
+from llm.client import LLMClientFactory
+from llm.strategies import (
+    call_llm_batch_two_path,
+    run_C1_vanilla,
+    run_C2_diverse,
+    run_C3_critique_revise,
+    run_C4_self_consistency,
+)
+from candidates import process_sentences_batch
+from candidates.bioc import load_bioc_index_from_dir, dedupe_bioc_index
+from candidates.ner import load_ner
+from candidates.chunk import get_spacy_model
+from candidates.gazetteer import load_gazetteer_matcher
+from fusion import DEFAULT_SOURCE_WEIGHTS
+from fact_filter import split_into_clauses_spacy, classify_clauses_llm
+from llm.strategies import _ablation_accept
+# from .metrics import MetricsLogger
+from span_utils import dedupe_overlaps_longest
+try:
+    from . import __all__  # silence unused warning (package import)
+except Exception:
+    # fallback when running the file directly
+    try:
+        from entity_extraction import __all__  # type: ignore
+    except Exception:
+        __all__ = []
+
+
+def set_base_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
+def read_txt_files(indir: str):
+    for name in os.listdir(indir):
+        if not name.endswith(".txt"):
+            continue
+        path = os.path.join(indir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            yield os.path.splitext(name)[0], f.read()
+            
+            
+            
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
+    ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
+    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq", "qwen3-32B-vllm"],
+                    default="gpt4o", help="LLM model to use")
+    ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
+    ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
+    ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
+    ap.add_argument("--batch_size", type=int, default=15, help="Batch size for processing")
+    ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
+
+    # ==== Candidate source switch ====
+    ap.add_argument("--candidates_from", choices=["chunks", "ner", "bioc"], default="ner",
+                    help="Generate LLM candidates from spaCy noun chunks or NER predictions.")
+
+    # ==== BioC ====
+    ap.add_argument("--bioc_candidates_dir", type=str, default=None,
+                    help="Directory with BioC JSON files. We will extract sentence->spans as candidates.")
+    ap.add_argument("--use_bioc", action="store_true",
+                    help="When using NER candidates, also add BioC spans if available.")
+
+    ap.add_argument("--schema_csv", type=str, default=None,
+                    help="Optional schema CSV passed to the converter.")
+    ap.add_argument("--envo_gazetteer_csv", type=str, default=None,
+                    help="Optional ENVO gazetteer CSV passed to the converter.")
+    ap.add_argument("--prefer_spacy", action="store_true",
+                    help="Prefer spaCy PhraseMatcher inside the converter.")
+
+    # ==== NER path params ====
+    ap.add_argument("--ner_model_dir", type=str, default=None,
+                    help="HF token classification model directory (must contain labels.txt).")
+    ap.add_argument("--ner_batch_size", type=int, default=16)
+    ap.add_argument("--ner_max_length", type=int, default=512)
+
+    # ==== spaCy chunker params ===
+    ap.add_argument("--spacy_model", default="en_core_web_trf", help="spaCy model (needs parser for noun_chunks)")
+
+    ap.add_argument("--np_fallback", action="store_true",
+                    help="If NER finds no entities in a sentence, fill candidates with NP chunks.")
+
+    # ==== Gazetteer ====
+    ap.add_argument("--gaz_dir", type=str, default=None,
+                    help="Directory with CSV/TSV gazetteers; filename is used as entity type.")
+    ap.add_argument("--general_table_dir", type=str, default=None,
+                    help="Directory with general term table CSV.")
+    ap.add_argument("--gaz_locked", action="store_true", help="Lock gazetteer candidates (no LLM changes).")
+
+    # ==== Few-shot ====
+    ap.add_argument("--few_shot", action="store_true", help="Use few-shot examples in system prompt.")
+
+    # ==== Fusion ====
+    ap.add_argument("--type_map_json", type=str, default=None,
+                    help="JSON file mapping external labels to canonical schema (e.g., {'Biomes':'HABITAT'}).")
+    ap.add_argument("--source_weights_json", type=str, default=None,
+                    help="JSON file mapping source->weight (e.g., {'gazetteer':0.9,'ner':0.7}).")
+
+    # ==== Fact checking ====
+    ap.add_argument("--fact_filter", choices=["off", "llm"], default="off",
+                    help="Filter candidates to FACT-only sentences. 'rule' uses cue-phrases, 'llm' uses the chat model, 'off' disables.")
+    ap.add_argument("--fact_filter_policy", choices=["strict", "lenient"], default="strict",
+                    help="If 'strict', only FACT passes. If 'lenient', FACT or UNSURE passes.")
+    ap.add_argument("--fact_filter_scope", choices=["sentence", "clause"], default="clause",
+                    help="Gate at sentence or clause level. Use 'clause' for mixed sentences.")
+
+    # ==== LLM multi-pass strategy ====
+    ap.add_argument("--llm_condition", choices=["C0", "C1", "C2", "C3", "C4"], default="C0",
+                    help="C0=single pass (current two-path); C1=vanilla multipass; C2=diversity multipass; C3=critique-revise; C4=self-consistency.")
+    ap.add_argument("--passes", type=int, default=3, help="Number of passes for C1/C2/C3.")
+    ap.add_argument("--samples_k", type=int, default=5, help="Number of parallel samples for C4.")
+
+    ap.add_argument("--base_seed", type=int, default=0, help="Random seed.")
+
+    ap.add_argument("--iou_thr", type=float, default=0.5, help="IoU threshold for span merging.")
+
+    ap.add_argument(
+        "--ablation",
+        choices=["off", "gaz_only", "ner_only", "gaz_ner"],
+        default="off",
+        help="Skip LLM and directly accept spans: gaz_only | ner_only | gaz_ner."
+    )
+    ap.add_argument("--metrics_csv", type=str, default=None, help="Optional CSV file to log metrics.")
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+    set_base_seed(args.base_seed)
+
+    type_map = {
+          "Biomes": "ABIOTIC ENTITY",
+          "Biota": "BIOTIC ENTITY",
+          "Mountains": "BIOTIC ENTITY",
+          "MountainRange": "BIOTIC ENTITY",
+          "geography": "SPATIAL ENTITY",
+          "ENV_FEATURE": "ABIOTIC PROPERTY",
+          "POPULATION": "BIOTIC COLLECTIVE ENTITY",
+          "TAXON": "BIOTIC ENTITY",
+          "LOCATION": "SPACIAL ENTITY",
+          "HABITAT": "BIOTIC PROPERTY",
+          "THREAT": "ANTHROPOGENIC PROCESS"
+        }
+
+    if args.type_map_json:
+        with open(args.type_map_json, "r", encoding="utf-8") as f:
+            type_map = json.load(f)
+
+    source_weights = DEFAULT_SOURCE_WEIGHTS.copy()
+    if args.source_weights_json:
+        with open(args.source_weights_json, "r", encoding="utf-8") as f:
+            source_weights.update(json.load(f))
+
+    # Initialize LLM client
+    try:
+        llm = LLMClientFactory.create(args.model_type)
+        print(f"Using {args.model_type} model: {llm.model_name}")
+    except Exception as e:
+        print(f"Error initializing {args.model_type} client: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    gaz_matcher = load_gazetteer_matcher(args.gaz_dir, args.general_table_dir)
+
+    # Validate spaCy model
+    if args.use_chunks:
+        try:
+            test_nlp = spacy.load(args.spacy_model)
+            if "parser" not in test_nlp.pipe_names:
+                print("WARNING: spaCy parser not enabled; noun_chunks may be empty.", file=sys.stderr)
+        except OSError:
+            print(f"spaCy model '{args.spacy_model}' not found. Install with: python -m spacy download {args.spacy_model}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    Path(os.path.dirname(args.out_jsonl) or ".").mkdir(parents=True, exist_ok=True)
+
+    # Load BioC candidates if requested
+    bioc_index = None
+    if args.candidates_from == "bioc":
+        if not args.bioc_candidates_dir:
+            print("Provide --bioc_candidates_dir for candidates_from=bioc", file=sys.stderr)
+            sys.exit(1)
+        bioc_index = load_bioc_index_from_dir(args.bioc_candidates_dir)
+        print(f"Loaded BioC candidates for {len(bioc_index)} sentences from {args.bioc_candidates_dir}")
+
+        before = len(bioc_index)
+        bioc_index = dedupe_bioc_index(bioc_index)
+        after = len(bioc_index)
+        print(f"[BioC] deduped unique sentences: {after} (from {before})")
+
+    # NER runtime (loaded once)
+    ner_runtime = None
+    if args.candidates_from == "ner":
+        if not args.ner_model_dir:
+            print("Provide --ner_model_dir for candidates_from=ner", file=sys.stderr)
+            sys.exit(1)
+        ner_runtime = load_ner(args.ner_model_dir)
+
+    docs_written = 0
+
+    with open(args.out_jsonl, "w", encoding="utf-8") as fout:
+        for doc_id, text in read_txt_files(args.in_dir):
+            # metrics.start_doc()
+
+            if docs_written > 1:  # Debug limit
+                break
+
+            # Split text into lines (one sentence per line)
+            lines = text.strip().split('\n')
+            sentences = [line.strip() for line in lines if line.strip()]
+
+            out_sents = []
+            print(f"Processing {len(sentences)} sentences from lines")
+
+            total_batches = (len(sentences) + args.batch_size - 1) // args.batch_size
+
+            for bidx, i in enumerate(range(0, len(sentences), args.batch_size), start=1):
+                batch = sentences[i:i + args.batch_size]
+
+                # # ---- FACT FILTER: classify sentences in this batch
+                # if args.fact_filter == "llm":
+                #     fact_labels = classify_sentences_fact_llm(client, model_name, args.model_type, batch)
+                # else:
+                #     fact_labels = ["FACT"] * len(batch)  # no filtering
+                #
+                # def _passes(label: str) -> bool:
+                #     if args.fact_filter == "off":
+                #         return True
+                #     if args.fact_filter_policy == "strict":
+                #         return label == "FACT"
+                #     # lenient: FACT or UNSURE
+                #     return label in ("FACT", "UNSURE")
+
+                # === Candidate generation in-batch (spaCy tokenization for both modes)
+                candidate_results = process_sentences_batch(
+                    batch,
+                    args.spacy_model,
+                    args.use_chunks,
+                    candidates_from=args.candidates_from,
+                    ner_runtime=ner_runtime,
+                    ner_max_length=args.ner_max_length,
+                    ner_runtime_batch_size=args.ner_batch_size,
+                    np_fallback=args.np_fallback,
+                    bioc_index=bioc_index,
+                    gazetteer_matcher=gaz_matcher,
+                    use_bioc=args.use_bioc,
+                    type_map=type_map,
+                    source_weights=source_weights
+                )
+
+                # === FACT-GATE at clause level ===
+                if args.fact_filter != "off":
+                    nlp = get_spacy_model(args.spacy_model)  # already used elsewhere
+                    for idx, cr in enumerate(candidate_results):
+                        sent = cr["sentence"]
+                        cands = cr.get("candidates")
+                        if not cands:
+                            cr["notes"] = (cr.get("notes", "") + "|fact_gate:no_cands").strip("|")
+                            continue
+
+                        # derive sentence/clause labels
+                        if args.fact_filter_scope == "sentence":
+                            def _passes_label(lbl: str) -> bool:
+                                return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
+                                            lbl in ("FACT", "UNSURE"))
+
+                            lbl = classify_clauses_llm(llm, args.model_type,
+                                                             [{"text": sent, "start": 0, "end": len(sent)}])[0]
+                            if not _passes_label(lbl):
+                                cr["candidates"] = None
+                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
+                                continue
+                            else:
+                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
+                                continue  # sentence-level all pass
+
+                        # clause scope
+                        clauses = split_into_clauses_spacy(sent, nlp)
+                        labels = classify_clauses_llm(llm, args.model_type, clauses)
+
+                        def _passes(lbl: str) -> bool:
+                            return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
+                                        lbl in ("FACT", "UNSURE"))
+
+                        # build filtered candidate list
+                        filtered = []
+                        for c in cands:
+                            # take span midpoint to assign to a clause
+                            mid = int((int(c["start_char"]) + int(c["end_char"])) / 2)
+                            # find clause containing midpoint
+                            cl_idx = next((i for i, cl in enumerate(clauses) if cl["start"] <= mid < cl["end"]), None)
+                            lbl = labels[cl_idx] if cl_idx is not None else "UNSURE"
+                            if _passes(lbl):
+                                filtered.append(c)
+                        if filtered:
+                            cr["candidates"] = filtered
+                            # keep audit: per-clause labels
+                            cr["notes"] = (cr.get("notes", "") + f"|fact_gate_clauses:{labels}").strip("|")
+                        else:
+                            cr["candidates"] = None
+                            cr["notes"] = (cr.get("notes", "") + f"|fact_gate_all_filtered:{labels}").strip("|")
+
+                # # wipe ALL candidates (NER/NP/gaz/gold) for sentences that do not pass the fact gate
+                # for j, cr in enumerate(candidate_results):
+                #     label = fact_labels[j]
+                #     if not _passes(label):
+                #         # Remove all candidates; also stash a note for transparency
+                #         cr["candidates"] = None
+                #         cr["notes"] = f"filtered_out_by_fact_gate:{label}"
+                #     else:
+                #         cr["notes"] = f"fact_gate:{label}"
+
+                assert len(candidate_results) == len(batch), \
+                    f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
+
+                # llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
+                #                                       candidate_results, lock_over_iou=0.5)
+
+                if args.ablation != "off":
+                    llm_results = []
+                    for cr in candidate_results:
+                        llm_results.append(
+                            _ablation_accept(cr.get("candidates"), args.ablation, iou_thr=args.iou_thr)
+                        )
+                else:
+
+                    cond = args.llm_condition
+                    if cond == "C0":
+                        dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
+                        llm_results = call_llm_batch_two_path(llm, args.model_type, args.few_shot,
+                                                              candidate_results,
+                                                              lock_over_iou=args.iou_thr, #todo: T = 0.4
+                                                              decoding=dec, gaz_lock=args.gaz_locked)
+                    elif cond == "C1":
+                        llm_results = run_C1_vanilla(llm, args.model_type, args.few_shot,
+                                                     candidate_results, T=args.passes,
+                                                     lock_over_iou=args.iou_thr,
+                                                     gaz_lock=args.gaz_locked)
+                    elif cond == "C2":
+                        llm_results = run_C2_diverse(llm, args.model_type, args.few_shot,
+                                                     candidate_results, T=args.passes,
+                                                     lock_over_iou=args.iou_thr,
+                                                     gaz_lock=args.gaz_locked)
+                    elif cond == "C3":
+                        llm_results = run_C3_critique_revise(llm, args.model_type, args.few_shot,
+                                                             candidate_results, T=args.passes,
+                                                             lock_over_iou=args.iou_thr,
+                                                             gaz_lock=args.gaz_locked)
+                    elif cond == "C4":
+                        llm_results = run_C4_self_consistency(llm, args.model_type, args.few_shot,
+                                                              candidate_results, K=args.samples_k,
+                                                              lock_over_iou=args.iou_thr,
+                                                              gaz_lock=args.gaz_locked)
+                    else:
+                        raise ValueError(f"Unknown --llm_condition {cond}")
+
+
+                if len(llm_results) != len(candidate_results):
+                    raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
+
+                for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
+                    sentence_data = {
+                        "text": spacy_result["sentence"],
+                        "llm": llm_result,
+                    }
+                    # if "notes" in spacy_result:
+                    #     sentence_data["notes"] = spacy_result["notes"]
+                    if "fact_clause_labels" in spacy_result:
+                        sentence_data["fact_clause_labels"] = spacy_result["fact_clause_labels"]
+                    if spacy_result["candidates"] is not None:
+                        sentence_data["candidates"] = spacy_result["candidates"]
+                    out_sents.append(sentence_data)
+
+                print(f"Processed batch {bidx}/{total_batches}")
+
+            # Write results
+            rec = {
+                "doc_id": doc_id,
+                "sentences": out_sents,
+                "config": {
+                    "model_type": args.model_type,
+                    "model_name": llm.model_name,
+                    "use_chunks": args.use_chunks
+                }
+            }
+
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            docs_written += 1
+            print(f"Completed document {doc_id} with {len(out_sents)} sentences")
+            # metrics.end_doc()
+
+    mode_str = "with chunks" if args.use_chunks else "without chunks"
+    print(f"Done. Processed {docs_written} documents using {args.model_type} {mode_str} and wrote to {args.out_jsonl}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,75 +1,93 @@
 {
   "HAS PROPERTY": [
     {
-      "sentence": "Capra ibex frequently occupies fragmented cliff systems where thermal refuges are scarce.",
-      "e1": {"text": "Capra ibex", "type": "TAXON"},
-      "e2": {"text": "fragmented cliff systems", "type": "HABITAT"}
+      "sentence": "Rupicapra rupicapra exhibits high juvenile mortality during winters with persistent deep snow.",
+      "e1": { "text": "Rupicapra rupicapra", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "high juvenile mortality", "type": "BIOTIC PROPERTY" }
     },
     {
-      "sentence": "Populations of Bombina variegata show pronounced fluctuations in ephemeral puddles formed after heavy rains.",
-      "e1": {"text": "Populations of Bombina variegata", "type": "POPULATION"},
-      "e2": {"text": "ephemeral puddles", "type": "HABITAT"}
+      "sentence": "Alpine marmot colonies are often concentrated in south-facing cirques above the treeline.",
+      "e1": { "text": "Alpine marmot colonies", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "south-facing cirques", "type": "SPATIAL ENTITY" }
     },
     {
-      "sentence": "Marmota marmota has its highest densities in basins where cold-air pooling shapes vegetation mosaics.",
-      "e1": {"text": "Marmota marmota", "type": "TAXON"},
-      "e2": {"text": "basins where cold-air pooling shapes vegetation mosaics", "type": "HABITAT"}
+      "sentence": "Talus slopes in the study area show high surface instability after intense freeze–thaw cycles.",
+      "e1": { "text": "Talus slopes", "type": "ABIOTIC ENTITY" },
+      "e2": { "text": "high surface instability", "type": "ABIOTIC PROPERTY" }
     },
     {
-      "sentence": "Calcareous fens tend to occur close to groundwater seepage zones on gentle midslope terraces.",
-      "e1": {"text": "Calcareous fens", "type": "HABITAT"},
-      "e2": {"text": "groundwater seepage zones on gentle midslope terraces", "type": "LOCATION"}
+      "sentence": "Altitudinal migration of red deer shows pronounced late autumn peaks in years with early snowfall.",
+      "e1": { "text": "Altitudinal migration of red deer", "type": "BIOTIC PROCESS" },
+      "e2": { "text": "late autumn peaks", "type": "TEMPORAL PROPERTY" }
     },
     {
-      "sentence": "Montane spruce stands are marked by persistent soil acidity arising from slow litter decomposition.",
-      "e1": {"text": "Montane spruce stands", "type": "HABITAT"},
-      "e2": {"text": "persistent soil acidity", "type": "ENV_FEATURE"}
+      "sentence": "Snowmelt runoff is characterized by a short pulse in early June followed by a prolonged low-flow period.",
+      "e1": { "text": "Snowmelt runoff", "type": "ABIOTIC PROCESS" },
+      "e2": { "text": "a short pulse in early June", "type": "TEMPORAL PROPERTY" }
+    }
+  ],
+
+  "IS PART OF": [
+    {
+      "sentence": "Individual willow warblers frequently join mixed-species bird flocks in subalpine scrub.",
+      "e1": { "text": "Individual willow warblers", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "mixed-species bird flocks", "type": "BIOTIC COLLECTIVE ENTITY" }
+    },
+    {
+      "sentence": "Adult female chamois form the core of large nursery groups on south-facing slopes.",
+      "e1": { "text": "Adult female chamois", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "large nursery groups", "type": "BIOTIC COLLECTIVE ENTITY" }
+    },
+    {
+      "sentence": "Solitary beech trees occur along the margins of extensive old-growth forest stands.",
+      "e1": { "text": "Solitary beech trees", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "extensive old-growth forest stands", "type": "BIOTIC COLLECTIVE ENTITY" }
     }
   ],
 
   "IS AFFECTED BY": [
     {
-      "sentence": "Breeding success of Apus melba declines sharply in years with intense storm activity.",
-      "e1": {"text": "Breeding success of Apus melba", "type": "TAXON"},
-      "e2": {"text": "intense storm activity", "type": "THREAT"}
+      "sentence": "The brown bear population in the region is strongly influenced by intensive forestry operations in valley bottoms.",
+      "e1": { "text": "The brown bear population in the region", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "intensive forestry operations in valley bottoms", "type": "ANTHROPOGENIC PROCESS" }
     },
     {
-      "sentence": "The distribution of alpine turf assemblages shifts upslope in response to prolonged trampling by hikers.",
-      "e1": {"text": "alpine turf assemblages", "type": "ENV_FEATURE"},
-      "e2": {"text": "prolonged trampling by hikers", "type": "THREAT"}
+      "sentence": "Breeding success of cliff-nesting raptors declines in response to increasing climbing tourism.",
+      "e1": { "text": "Breeding success of cliff-nesting raptors", "type": "BIOTIC ENTITY" },
+      "e2": { "text": "increasing climbing tourism", "type": "ANTHROPOGENIC PROCESS" }
     },
     {
-      "sentence": "Tachybaptus ruficollis colonies experience reduced occupancy near lakes subjected to shoreline urbanization.",
-      "e1": {"text": "Tachybaptus ruficollis colonies", "type": "TAXON"},
-      "e2": {"text": "shoreline urbanization", "type": "THREAT"}
+      "sentence": "Spring migration of amphibians is disrupted where new road construction cuts across traditional movement corridors.",
+      "e1": { "text": "Spring migration of amphibians", "type": "BIOTIC PROCESS" },
+      "e2": { "text": "new road construction", "type": "ANTHROPOGENIC PROCESS" }
     },
     {
-      "sentence": "Temperature inversions in valley floors are increasingly unstable due to regional warming trends.",
-      "e1": {"text": "Temperature inversions in valley floors", "type": "ENV_FEATURE"},
-      "e2": {"text": "regional warming trends", "type": "THREAT"}
+      "sentence": "Daily foraging movements of chamois are compressed near ski resorts with heavy night-time illumination.",
+      "e1": { "text": "Daily foraging movements of chamois", "type": "BIOTIC PROCESS" },
+      "e2": { "text": "heavy night-time illumination", "type": "ANTHROPOGENIC PROCESS" }
     }
   ],
 
   "IS DETERMINING": [
     {
-      "sentence": "Chronic overgrazing exerts strong control over the sparse ground-cover patterns seen in degraded steppe margins.",
-      "e1": {"text": "Chronic overgrazing", "type": "THREAT"},
-      "e2": {"text": "sparse ground-cover patterns", "type": "ENV_FEATURE"}
+      "sentence": "Artificial reservoir management strongly determines the large daily water-level fluctuations observed along the shore.",
+      "e1": { "text": "Artificial reservoir management", "type": "ANTHROPOGENIC PROCESS" },
+      "e2": { "text": "large daily water-level fluctuations", "type": "ABIOTIC PROPERTY" }
     },
     {
-      "sentence": "Intensive road maintenance appears to shape the persistent dust deposition on adjacent meadow vegetation.",
-      "e1": {"text": "Intensive road maintenance", "type": "THREAT"},
-      "e2": {"text": "persistent dust deposition", "type": "ENV_FEATURE"}
+      "sentence": "Snow grooming for ski pistes largely controls the mechanical compaction of the snowpack on south-facing slopes.",
+      "e1": { "text": "Snow grooming for ski pistes", "type": "ANTHROPOGENIC PROCESS" },
+      "e2": { "text": "mechanical compaction of the snowpack", "type": "ABIOTIC PROCESS" }
     },
     {
-      "sentence": "Recurrent ski piste grooming governs the compacted snow morphology across south-oriented slopes.",
-      "e1": {"text": "Recurrent ski piste grooming", "type": "THREAT"},
-      "e2": {"text": "compacted snow morphology", "type": "ENV_FEATURE"}
+      "sentence": "Urban heating from dense building blocks contributes to elevated nighttime air temperatures in valley towns.",
+      "e1": { "text": "Urban heating from dense building blocks", "type": "ANTHROPOGENIC PROCESS" },
+      "e2": { "text": "elevated nighttime air temperatures", "type": "ABIOTIC PROPERTY" }
     },
     {
-      "sentence": "Heavy machinery traffic largely dictates the patchy soil disturbance observed on construction plateaus.",
-      "e1": {"text": "Heavy machinery traffic", "type": "THREAT"},
-      "e2": {"text": "patchy soil disturbance", "type": "ENV_FEATURE"}
+      "sentence": "Extensive drainage ditching initiates rapid drying of peat soils across the plateau.",
+      "e1": { "text": "Extensive drainage ditching", "type": "ANTHROPOGENIC PROCESS" },
+      "e2": { "text": "rapid drying of peat soils", "type": "ABIOTIC PROCESS" }
     }
   ]
 }

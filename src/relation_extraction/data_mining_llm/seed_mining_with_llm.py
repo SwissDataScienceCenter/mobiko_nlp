@@ -19,6 +19,10 @@ except ImportError:
 
 
 
+
+os.environ["OPEN_WEB_UI_API_KEY"] = ""
+
+
 # Model configurations
 MODEL_CONFIGS = {
     "qwen3-4B": {
@@ -382,11 +386,7 @@ def build_relation_candidate_pairs(
         for t1, t2 in pairs_list:
             type_pair_to_relations.setdefault((t1, t2), []).append(rel)
 
-    m = 0
     for record in tqdm(list(load_jsonl(corpus_path)), desc="Scanning corpus"):
-        if m > 100:
-            break
-        m += 1
         paper_id = record.get("paper_id", "")
         sent_id = record.get("sent_id", -1)
         text = record["text"]
@@ -419,8 +419,7 @@ def build_relation_candidate_pairs(
                     e1_tag="E1",
                     e2_tag="E2",
                 )
-                pairs.append(
-                    CandidatePair(
+                candidate = CandidatePair(
                         paper_id=paper_id,
                         sent_id=sent_id,
                         relation_candidates=possible_rels,
@@ -429,7 +428,8 @@ def build_relation_candidate_pairs(
                         e2=e2,
                         marked=marked,
                     )
-                )
+                if candidate not in pairs:
+                    pairs.append(candidate)
     return pairs
 
 
@@ -469,7 +469,6 @@ def mine_candidates(
     }
 
     mined: List[dict] = []
-    candidates = candidates[:100]
 
     # process candidates in batches
     for i in tqdm(range(0, len(candidates), batch_size), desc="Mining candidates"):

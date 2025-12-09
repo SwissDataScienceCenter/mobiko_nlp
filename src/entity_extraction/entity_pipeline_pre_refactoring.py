@@ -25,7 +25,7 @@ import random, numpy as np, torch
 import time, math, csv
 from dataclasses import dataclass, asdict
 
-from prompts import *
+from src.entity_extraction.llm.prompts import *
 import glob
 
 
@@ -366,9 +366,43 @@ def _choose_gaz_type(fused_cand: dict, fallback_argmax: bool = True) -> Optional
 def _overlaps_any(span: tuple[int,int], spans: list[tuple[int,int]], iou_thr: float = 0.5) -> bool:
     s, e = span
     for (s2, e2) in spans:
-        if _iou_tuple((s, e), (s2, e2)) >= iou_thr:
+        if iou_tuple((s, e), (s2, e2)) >= iou_thr:
             return True
     return False
+
+
+def _dedupe_overlaps_longest(
+    spans: List[Dict[str, Any]],
+    iou_thr: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """
+    Greedy de-overlap: prefer longer spans.
+    - Sort spans by length (desc).
+    - Keep a span if its IoU with any already kept span is < iou_thr.
+    - Finally, sort by start_char for deterministic ordering.
+    """
+    if not spans:
+        return []
+
+    # longest first
+    ordered = sorted(
+        spans,
+        key=lambda s: int(s["end_char"]) - int(s["start_char"]),
+        reverse=True,
+    )
+
+    kept: List[Dict[str, Any]] = []
+    for s in ordered:
+        if not kept:
+            kept.append(s)
+            continue
+        if not any(_span_iou_char(s, k) >= iou_thr for k in kept):
+            kept.append(s)
+
+    # nice deterministic order in output
+    kept.sort(key=lambda s: int(s["start_char"]))
+    return kept
+
 
 
 def _is_ner(cand: dict) -> bool:
@@ -428,7 +462,7 @@ def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
             if _is_gazetteer(c):
                 continue
             s, e = int(c["start_char"]), int(c["end_char"])
-            if any(_iou_tuple((s, e), gs) >= iou_thr for gs in gaz_spans): # take both
+            if any(iou_tuple((s, e), gs) >= iou_thr for gs in gaz_spans): # take both
                 # conflict with gazetteer → gaz wins; skip this NER span
                 continue
             if _is_ner(c):
@@ -437,8 +471,6 @@ def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
 
     # Fallback (shouldn't happen)
     return {"accepted": [], "rejected": [], "missing": [], "notes": f"ablation:{mode}|unhandled"}
-
-
 
 
 def get_openai_client(model_type: str):
@@ -736,6 +768,7 @@ def call_llm_batch_two_path(
 
     # Merge locked + llm_out, gaz wins on overlaps
     merged_outs: List[Dict] = []
+
     for info, llm_res in zip(per_req_locked, llm_outs):
         locked_acc = info["locked"]
         locked_spans = info["locked_spans"]
@@ -946,40 +979,6 @@ def run_C2_diverse(
         merged.append({"accepted": merged_acc, "rejected": [], "missing": [], "notes": f"C2-T{T}"})
     return merged
 
-
-# def run_C3_critique_revise(
-#     client, model_name, model_type, few_shot, candidate_results, T: int = 3
-# ) -> List[Dict]:
-#     """
-#     Critique-and-revise: P1 as usual, then iterative 'missing-only' revisions,
-#     finally consolidate.
-#     """
-#     # P1 (fixed profile)
-#     dec = _decoding_profile(1, "C3")
-#     p = call_llm_batch_two_path(client, model_name, model_type, few_shot,
-#                                 candidate_results, lock_over_iou=0.5, decoding=dec)
-#
-#     # P2..T-1: iterative revise -> union
-#     current = []
-#     for i, o in enumerate(p):
-#         current.append({"sentence": candidate_results[i]["sentence"], "accepted": o.get("accepted", [])})
-#
-#     for t in range(2, max(2, T)):
-#         rev_reqs = []
-#         for i, cur in enumerate(current):
-#             prev_json = {"accepted": cur["accepted"], "rejected": [], "missing": []}
-#             rev_reqs.append({"sentence": cur["sentence"], "prev_json": prev_json, "prev_notes": cur.get("notes", "")})
-#         rev = call_llm_batch_revision(client, model_name, model_type, rev_reqs, temperature=0.9)
-#         # union with IoU
-#         for i, r in enumerate(rev):
-#             acc = current[i]["accepted"]
-#             add = r.get("missing", [])
-#             current[i]["accepted"] = merge_spans(acc, add, iou_thr=0.5)
-#
-#     # Final consolidate
-#     cons_requests = [{"sentence": cur["sentence"], "proposals": cur["accepted"]} for cur in current]
-#     final = call_llm_batch_consolidate(client, model_name, model_type, cons_requests)
-#     return final
 
 def run_C3_critique_revise(client, model_name, model_type, few_shot, candidate_results, T: int = 3,
                            lock_over_iou: float = 0.5, gaz_lock: bool = True) -> List[Dict]:
@@ -1381,7 +1380,7 @@ def _normalize_text_min(s: str) -> str:
     return " ".join(s.split())
 
 
-def _iou_tuple(a: tuple[int,int], b: tuple[int,int]) -> float:
+def iou_tuple(a: tuple[int,int], b: tuple[int,int]) -> float:
     (s1,e1),(s2,e2) = a,b
     inter = max(0, min(e1,e2) - max(s1,s2))
     if inter <= 0:
@@ -1449,7 +1448,7 @@ def fuse_candidates(
             if cl[0]["text_norm"] != it["text_norm"]:
                 continue
             # IoU with cluster leader OR exact match with any member
-            if _iou_tuple((it["start_char"], it["end_char"]),
+            if iou_tuple((it["start_char"], it["end_char"]),
                     (cl[0]["start_char"], cl[0]["end_char"])) >= iou_thr or \
                any(m["start_char"]==it["start_char"] and m["end_char"]==it["end_char"] for m in cl):
                 cl.append(it); placed = True; break
@@ -1974,7 +1973,7 @@ def main():
 
                 print(f"Processed batch {bidx}/{total_batches}")
 
-                # Write results
+            # Write results
             rec = {
                 "doc_id": doc_id,
                 "sentences": out_sents,
