@@ -356,13 +356,6 @@ def call_llm_batch_two_path(
             "notes": llm_res.get("notes", ""),
         })
 
-        merged_outs.append({
-            "accepted": merged_accepted,
-            "rejected": merged_rejected,
-            "missing": merged_missing,
-            "notes": llm_res.get("notes", "")
-        })
-
     return merged_outs
 
 
