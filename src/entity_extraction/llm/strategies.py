@@ -8,9 +8,9 @@ from collections import Counter
 
 from .client import remove_thinking_blocks
 from src.entity_extraction.llm.prompts import (
-    DEFAULT_SYSTEM_PROMPT_NEW_2,
-    NO_CHUNK_CANDIDATE_SYSTEM_PROMPT_2,
-    SYSTEM_PROMPT_FEW_SHOT_2,
+    DEFAULT_SYSTEM_PROMPT_NEW,
+    NO_CHUNK_CANDIDATE_SYSTEM_PROMPT,
+    SYSTEM_PROMPT_FEW_SHOT,
 )
 from span_utils import (
     fix_span_indices,
@@ -166,7 +166,7 @@ def call_llm_batch(
 
 
         if candidates is None:
-            system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT_2
+            system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
             user_payload = {"sentence": sentence}
         else:
             # # Determine whether candidates include NER-proposed types
@@ -186,11 +186,11 @@ def call_llm_batch(
             #     user_payload = {"sentence": sentence, "candidates": cand_objs}
             # else:
             if few_shot:
-                system_prompt = SYSTEM_PROMPT_FEW_SHOT_2 # try new schema
+                system_prompt = SYSTEM_PROMPT_FEW_SHOT # try new schema
                 # system_prompt = SYSTEM_PROMPT_FEW_SHOT_NEW
             else:
                 # Legacy chunks path: no types proposed
-                system_prompt = DEFAULT_SYSTEM_PROMPT_NEW_2
+                system_prompt = DEFAULT_SYSTEM_PROMPT_NEW
             cand_objs = [
                 {"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]}
                 for c in candidates
@@ -502,7 +502,6 @@ def run_C1_vanilla(client, model_type, few_shot, candidate_results, T: int = 3,
     for o1, o2, req in zip(p1, p2, candidate_results):
         merged = merge_spans(o1.get("accepted", []), o2.get("missing", []), iou_thr=0.5)
         merged_after_p2.append({"sentence": req["sentence"], "accepted": merged})
-        print(merged_after_p2)
 
     # Consolidate (optional final pass if T>=3)
     if T >= 3:
