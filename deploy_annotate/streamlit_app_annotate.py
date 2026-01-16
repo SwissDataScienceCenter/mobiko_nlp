@@ -1,7 +1,7 @@
 import json
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any
-import os, datetime, tempfile
+import os, datetime, tempfile, re
 import io
 import streamlit.components.v1 as components
 import streamlit as st
@@ -156,12 +156,30 @@ def _atomic_write(text: str, dst_path: str):
             except Exception: pass
 
 
-def _prune_snapshots():
-    """Keep only the newest MAX_SNAPSHOTS aug_*.jsonl files."""
-    files = [f for f in os.listdir(SAVE_DIR) if f.startswith("aug_") and f.endswith(".jsonl")]
+def _safe_dirname(name: str) -> str:
+    base = os.path.basename(name)
+    stem = os.path.splitext(base)[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    return safe or "upload"
+
+
+def _current_paths():
+    save_dir = st.session_state.get("upload_dir")
+    if not save_dir:
+        return None, None
+    run_path = os.path.join(save_dir, f"aug_{st.session_state.run_id}.jsonl")
+    latest_path = os.path.join(save_dir, "aug_latest.jsonl")
+    return run_path, latest_path
+
+
+def _prune_snapshots(save_dir: str):
+    """Keep only the newest MAX_SNAPSHOTS aug_*.jsonl files in save_dir."""
+    if not save_dir or not os.path.isdir(save_dir):
+        return
+    files = [f for f in os.listdir(save_dir) if f.startswith("aug_") and f.endswith(".jsonl")]
     files = sorted(files, reverse=True)
     for f in files[MAX_SNAPSHOTS:]:
-        try: os.remove(os.path.join(SAVE_DIR, f))
+        try: os.remove(os.path.join(save_dir, f))
         except Exception:
             pass
 
@@ -202,12 +220,16 @@ def _maybe_autosave():
 
     payload = export_augmented_jsonl()
 
+    run_path, latest_path = _current_paths()
+    if not run_path or not latest_path:
+        return
+
     # 1) Write to this session's RUN_PATH
-    _atomic_write(payload, RUN_PATH)
+    _atomic_write(payload, run_path)
     # 2) Update the rolling latest pointer
-    _atomic_write(payload, LATEST_PATH)
+    _atomic_write(payload, latest_path)
     # 3) Prune old snapshots
-    _prune_snapshots()
+    _prune_snapshots(os.path.dirname(run_path))
 
 
 # -------------------- Span math --------------------
@@ -581,9 +603,6 @@ if "run_id" not in st.session_state:
     st.session_state.run_id = f"{ts}-{uuid.uuid4().hex[:6]}"
 
 
-RUN_PATH    = os.path.join(SAVE_DIR, f"aug_{st.session_state.run_id}.jsonl")
-LATEST_PATH = os.path.join(SAVE_DIR, "aug_latest.jsonl")
-
 MAX_SNAPSHOTS = 50
 
 st.set_page_config(page_title="BioNER Annotation", layout="wide")
@@ -607,6 +626,13 @@ ws = 0.06
 light_bg = True
 merge_same_label = True
 merge_thr = 0.8
+
+if pred_up is not None:
+    if st.session_state.get("upload_name") != pred_up.name:
+        st.session_state.upload_name = pred_up.name
+        upload_dir = os.path.join(SAVE_DIR, _safe_dirname(pred_up.name))
+        st.session_state.upload_dir = upload_dir
+        os.makedirs(upload_dir, exist_ok=True)
 
 
 # --- Loader: gold optional, model required ---
@@ -939,8 +965,12 @@ with colG:
 st.divider()
 st.subheader("Export augmented gold")
 
-st.caption(f"Autosave: session file → {RUN_PATH}")
-st.caption(f"Latest snapshot → {LATEST_PATH}")
+run_path, latest_path = _current_paths()
+if run_path and latest_path:
+    st.caption(f"Autosave: session file → {run_path}")
+    st.caption(f"Latest snapshot → {latest_path}")
+else:
+    st.caption("Autosave: waiting for an uploaded JSONL file.")
 
 aug_jsonl = export_augmented_jsonl()
 
