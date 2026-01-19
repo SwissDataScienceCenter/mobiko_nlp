@@ -93,17 +93,21 @@ Abiotic property (A measurable physical or chemical attribute)
                 soil moisture content
                 soil pH
 
-Antropogenic material entity (A human-made physical object, infrastructure or modification)
+Antropogenic entity (A human-made object)
         Built infrastructure
                 building
                 dam
                 fence
                 hydropower infrastructure
-                irrigation channel
-                mine
-                powerline
-                road
-                terraced field
+        Social construct
+                land management system
+                protected area designation (infrastructure)
+                conservation policy
+                customary law
+                land tenure regime
+                management plan
+                
+
                 
 Antropogenic process (An activity or action performed by humans that affects socioecological systems)
         Intellectual /governance process
@@ -473,14 +477,6 @@ Antropogenic property (A measurable social, economic or governance attribute)
         ownership
         infrastructure density
 
-Antropoggenic social institution (Non-material human constructs such as laws, policies, norms, governance structures and knowledge systems)
-        conservation policy
-        customary law
-        land tenure regime
-        management plan
-        protected area designation (legal)
-        traditional knowledge
-
 Biotic collective entity (An assemblage of organisms functioning as a unit (community, guild, ecosystem).
         epiphyte assemblage
         fauna
@@ -650,13 +646,11 @@ ABIOTIC PROCESS (DEFINITION: A physical or chemical change in the environment (e
 
 ABIOTIC PROPERTY (DEFINITION: A measurable physical or chemical attribute)
 
-ANTHROPOGENIC MATERIAL ENTITY (DEFINITION: A human-made physical object, infrastructure or modification, e.g., road, dam, house, mine)
+ANTHROPOGENIC ENTITY (DEFINITION: A human-made object, material or social construct, e.g., road, dam, policy)
 
 ANTHROPOGENIC PROCESS (DEFINITION: An activity or action performed by humans that affects socioecological systems, e.g., grazing, mining, policy implementation)
 
 ANTHROPOGENIC PROPERTY (DEFINITION: A measurable social, economic or governance attribute, e.g., population density, land tenure type)
-
-ANTHROPOGENIC SOCIAL INSTITUTION (DEFINITION: Non-material human constructs such as laws, policies, norms, governance structures and knowledge systems)
 
 BIOTIC COLLECTIVE ENTITY (DEFINITION: An assemblage of organisms functioning as a unit, e.g., community, guild, ecosystem)
 

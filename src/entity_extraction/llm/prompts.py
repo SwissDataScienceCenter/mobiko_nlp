@@ -1,8 +1,5 @@
 from src.entity_extraction.legacy.schema import SCHEMA_BIODIV
-from schema2 import SCHEMA_BIODIV_SHORT
-
-
-
+from schema import SCHEMA_BIODIV_SHORT
 
 
 
