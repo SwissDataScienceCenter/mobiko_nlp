@@ -108,19 +108,64 @@ def find_span_positions(text: str, span_text: str):
     Find all positions of span_text in text using regex.
     Returns list of (start, end) tuples for all matches.
     """
-    # Escape special regex characters in the span text
-    escaped_span = re.escape(span_text.strip())
+    raw = span_text.strip()
+    if not raw:
+        return []
 
-    # Find all matches (case-insensitive, word boundaries optional)
-    matches = []
-    for match in re.finditer(escaped_span, text, re.IGNORECASE):
-        start, end = match.span()
-        matches.append((start, end))
+    def _wrap_word(token: str) -> str:
+        if token and token[0].isalnum() and token[-1].isalnum():
+            return r"\b" + token + r"\b"
+        return token
 
-    return matches
+    # 1) Exact (case-insensitive) match
+    escaped_span = re.escape(raw)
+    matches = [(m.start(), m.end()) for m in re.finditer(escaped_span, text, re.IGNORECASE)]
+    if matches:
+        return matches
+
+    # 2) Flexible whitespace between tokens
+    tokens = raw.split()
+    if tokens:
+        parts = [_wrap_word(re.escape(t)) for t in tokens]
+        pattern = r"\s+".join(parts)
+        matches = [(m.start(), m.end()) for m in re.finditer(pattern, text, re.IGNORECASE)]
+        if matches:
+            return matches
+
+    return []
 
 
-def fix_span_indices(spans: list, sentence_text: str) -> List[Dict]:
+def _tokenize_words(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9]+", (text or "").lower())
+
+
+def _snap_to_candidate(span_text: str, candidates: List[Dict[str, Any]] | None) -> Dict[str, Any] | None:
+    if not candidates:
+        return None
+    span_tokens = _tokenize_words(span_text)
+    if len(span_tokens) < 2:
+        return None
+
+    best = None
+    best_score = (-1.0, -1.0, float("inf"))
+    for cand in candidates:
+        cand_text = cand.get("text", "")
+        cand_tokens = _tokenize_words(cand_text)
+        if not cand_tokens:
+            continue
+        overlap = len(set(span_tokens) & set(cand_tokens))
+        overlap_ratio = overlap / len(span_tokens)
+        if overlap_ratio < 0.6:
+            continue
+        jaccard = overlap / (len(set(span_tokens)) + len(set(cand_tokens)) - overlap)
+        score = (overlap_ratio, jaccard, len(cand_tokens))
+        if score > best_score:
+            best_score = score
+            best = cand
+    return best
+
+
+def fix_span_indices(spans: list, sentence_text: str, candidates: List[Dict[str, Any]] | None = None) -> List[Dict]:
     """
     Fix span indices using regex matching.
     Returns updated spans with correct start_char and end_char.
@@ -146,13 +191,21 @@ def fix_span_indices(spans: list, sentence_text: str) -> List[Dict]:
             fixed_span["text"] = sentence_text[start:end]  # Use actual text from sentence
             fixed_spans.append(fixed_span)
         else:
-            # Span text not found in sentence - log warning but keep original
-            print(f"WARNING: Could not find span '{span_text}' in sentence: {sentence_text}")
-            fixed_span = dict(span)
-            fixed_span["start_char"] = 0
-            fixed_span["end_char"] = 0
-            fixed_span["text"] = span_text
-            fixed_spans.append(fixed_span)
+            snapped = _snap_to_candidate(span_text, candidates)
+            if snapped:
+                fixed_span = dict(span)
+                fixed_span["start_char"] = int(snapped["start_char"])
+                fixed_span["end_char"] = int(snapped["end_char"])
+                fixed_span["text"] = sentence_text[fixed_span["start_char"]:fixed_span["end_char"]]
+                fixed_spans.append(fixed_span)
+            else:
+                # Span text not found in sentence - log warning but keep original
+                print(f"WARNING: Could not find span '{span_text}' in sentence: {sentence_text}")
+                fixed_span = dict(span)
+                fixed_span["start_char"] = 0
+                fixed_span["end_char"] = 0
+                fixed_span["text"] = span_text
+                fixed_spans.append(fixed_span)
 
     return fixed_spans
 

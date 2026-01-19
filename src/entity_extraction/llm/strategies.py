@@ -226,7 +226,7 @@ def call_llm_batch(
             for category in ["accepted", "missing", "rejected"]:
                 if category in llm_result:
                     llm_result[category] = fix_span_indices(
-                        llm_result[category], sentence)
+                        llm_result[category], sentence, candidates)
 
             results.append(llm_result)
 
