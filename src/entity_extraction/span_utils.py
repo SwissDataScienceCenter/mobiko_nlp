@@ -128,6 +128,10 @@ def fix_span_indices(spans: list, sentence_text: str) -> List[Dict]:
 
     fixed_spans = []
     for span in spans:
+        if isinstance(span, str):
+            span = {"text": span}
+        if not isinstance(span, dict):
+            continue
         span_text = span.get("text", "").strip()
         if not span_text:
             continue

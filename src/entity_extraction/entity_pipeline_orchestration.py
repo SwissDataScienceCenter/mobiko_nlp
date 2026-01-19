@@ -59,6 +59,24 @@ def read_txt_files(indir: str):
             continue
         with open(path, "r", encoding="utf-8") as f:
             yield os.path.splitext(name)[0], f.read()
+
+
+def load_checkpoint(path: str, total_sents: int) -> List[Any]:
+    out: List[Any] = [None] * total_sents
+    if not os.path.exists(path):
+        return out
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            idx = rec.get("idx")
+            sent = rec.get("sentence")
+            if isinstance(idx, int) and 0 <= idx < total_sents and sent is not None:
+                if out[idx] is None:
+                    out[idx] = sent
+    return out
             
             
             
@@ -73,6 +91,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--sample_every", type=int, default=1, help="Process every Nth sentence (e.g., 5 to sample)")
     ap.add_argument("--batch_size", type=int, default=15, help="Batch size for processing")
     ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
+    ap.add_argument("--checkpoint_dir", type=str, default=None,
+                    help="Directory for per-doc checkpoints (JSONL per doc).")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from existing checkpoints and skip processed sentences.")
 
     # ==== Candidate source switch ====
     ap.add_argument("--candidates_from", choices=["chunks", "ner", "bioc"], default="ner",
@@ -196,6 +218,8 @@ def main():
             sys.exit(1)
 
     Path(os.path.dirname(args.out_jsonl) or ".").mkdir(parents=True, exist_ok=True)
+    if args.checkpoint_dir:
+        Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     # Load BioC candidates if requested
     bioc_index = None
@@ -232,96 +256,113 @@ def main():
             lines = text.strip().split('\n')
             sentences = [line.strip() for line in lines if line.strip()]
 
-            out_sents = []
-            print(f"Processing {len(sentences)} sentences from lines")
+            out_sents: List[Any] = [None] * len(sentences)
+            ckpt_path = None
+            ckpt_fh = None
+            if args.checkpoint_dir:
+                ckpt_path = os.path.join(args.checkpoint_dir, f"{doc_id}.jsonl")
+                if args.resume and os.path.exists(ckpt_path):
+                    out_sents = load_checkpoint(ckpt_path, len(sentences))
+                elif os.path.exists(ckpt_path):
+                    os.remove(ckpt_path)
+                ckpt_fh = open(ckpt_path, "a", encoding="utf-8")
+
+            processed = sum(1 for s in out_sents if s is not None)
+            print(f"Processing {len(sentences)} sentences from lines (cached: {processed})")
 
             total_batches = (len(sentences) + args.batch_size - 1) // args.batch_size
 
-            for bidx, i in enumerate(range(0, len(sentences), args.batch_size), start=1):
-                batch = sentences[i:i + args.batch_size]
+            try:
+                for bidx, i in enumerate(range(0, len(sentences), args.batch_size), start=1):
+                    batch_indices = list(range(i, min(i + args.batch_size, len(sentences))))
+                    pending_indices = [j for j in batch_indices if out_sents[j] is None]
+                    if not pending_indices:
+                        print(f"Skipping batch {bidx}/{total_batches} (all cached)")
+                        continue
+                    batch = [sentences[j] for j in pending_indices]
 
-                # # ---- FACT FILTER: classify sentences in this batch
-                # if args.fact_filter == "llm":
-                #     fact_labels = classify_sentences_fact_llm(client, model_name, args.model_type, batch)
-                # else:
-                #     fact_labels = ["FACT"] * len(batch)  # no filtering
-                #
-                # def _passes(label: str) -> bool:
-                #     if args.fact_filter == "off":
-                #         return True
-                #     if args.fact_filter_policy == "strict":
-                #         return label == "FACT"
-                #     # lenient: FACT or UNSURE
-                #     return label in ("FACT", "UNSURE")
+                    # # ---- FACT FILTER: classify sentences in this batch
+                    # if args.fact_filter == "llm":
+                    #     fact_labels = classify_sentences_fact_llm(client, model_name, args.model_type, batch)
+                    # else:
+                    #     fact_labels = ["FACT"] * len(batch)  # no filtering
+                    #
+                    # def _passes(label: str) -> bool:
+                    #     if args.fact_filter == "off":
+                    #         return True
+                    #     if args.fact_filter_policy == "strict":
+                    #         return label == "FACT"
+                    #     # lenient: FACT or UNSURE
+                    #     return label in ("FACT", "UNSURE")
 
-                # === Candidate generation in-batch (spaCy tokenization for both modes)
-                candidate_results = process_sentences_batch(
-                    batch,
-                    args.spacy_model,
-                    args.use_chunks,
-                    candidates_from=args.candidates_from,
-                    ner_runtime=ner_runtime,
-                    ner_max_length=args.ner_max_length,
-                    ner_runtime_batch_size=args.ner_batch_size,
-                    np_fallback=args.np_fallback,
-                    bioc_index=bioc_index,
-                    gazetteer_matcher=gaz_matcher,
-                    use_bioc=args.use_bioc,
-                    type_map=type_map,
-                    source_weights=source_weights
-                )
+                    # === Candidate generation in-batch (spaCy tokenization for both modes)
+                    candidate_results = process_sentences_batch(
+                        batch,
+                        args.spacy_model,
+                        args.use_chunks,
+                        candidates_from=args.candidates_from,
+                        ner_runtime=ner_runtime,
+                        ner_max_length=args.ner_max_length,
+                        ner_runtime_batch_size=args.ner_batch_size,
+                        np_fallback=args.np_fallback,
+                        bioc_index=bioc_index,
+                        gazetteer_matcher=gaz_matcher,
+                        use_bioc=args.use_bioc,
+                        type_map=type_map,
+                        source_weights=source_weights
+                    )
 
-                # === FACT-GATE at clause level ===
-                if args.fact_filter != "off":
-                    nlp = get_spacy_model(args.spacy_model)  # already used elsewhere
-                    for idx, cr in enumerate(candidate_results):
-                        sent = cr["sentence"]
-                        cands = cr.get("candidates")
-                        if not cands:
-                            cr["notes"] = (cr.get("notes", "") + "|fact_gate:no_cands").strip("|")
-                            continue
+                    # === FACT-GATE at clause level ===
+                    if args.fact_filter != "off":
+                        nlp = get_spacy_model(args.spacy_model)  # already used elsewhere
+                        for idx, cr in enumerate(candidate_results):
+                            sent = cr["sentence"]
+                            cands = cr.get("candidates")
+                            if not cands:
+                                cr["notes"] = (cr.get("notes", "") + "|fact_gate:no_cands").strip("|")
+                                continue
 
-                        # derive sentence/clause labels
-                        if args.fact_filter_scope == "sentence":
-                            def _passes_label(lbl: str) -> bool:
+                            # derive sentence/clause labels
+                            if args.fact_filter_scope == "sentence":
+                                def _passes_label(lbl: str) -> bool:
+                                    return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
+                                                lbl in ("FACT", "UNSURE"))
+
+                                lbl = classify_clauses_llm(llm, args.model_type,
+                                                                 [{"text": sent, "start": 0, "end": len(sent)}])[0]
+                                if not _passes_label(lbl):
+                                    cr["candidates"] = None
+                                    cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
+                                    continue
+                                else:
+                                    cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
+                                    continue  # sentence-level all pass
+
+                            # clause scope
+                            clauses = split_into_clauses_spacy(sent, nlp)
+                            labels = classify_clauses_llm(llm, args.model_type, clauses)
+
+                            def _passes(lbl: str) -> bool:
                                 return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
                                             lbl in ("FACT", "UNSURE"))
 
-                            lbl = classify_clauses_llm(llm, args.model_type,
-                                                             [{"text": sent, "start": 0, "end": len(sent)}])[0]
-                            if not _passes_label(lbl):
-                                cr["candidates"] = None
-                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
-                                continue
+                            # build filtered candidate list
+                            filtered = []
+                            for c in cands:
+                                # take span midpoint to assign to a clause
+                                mid = int((int(c["start_char"]) + int(c["end_char"])) / 2)
+                                # find clause containing midpoint
+                                cl_idx = next((i for i, cl in enumerate(clauses) if cl["start"] <= mid < cl["end"]), None)
+                                lbl = labels[cl_idx] if cl_idx is not None else "UNSURE"
+                                if _passes(lbl):
+                                    filtered.append(c)
+                            if filtered:
+                                cr["candidates"] = filtered
+                                # keep audit: per-clause labels
+                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_clauses:{labels}").strip("|")
                             else:
-                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
-                                continue  # sentence-level all pass
-
-                        # clause scope
-                        clauses = split_into_clauses_spacy(sent, nlp)
-                        labels = classify_clauses_llm(llm, args.model_type, clauses)
-
-                        def _passes(lbl: str) -> bool:
-                            return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
-                                        lbl in ("FACT", "UNSURE"))
-
-                        # build filtered candidate list
-                        filtered = []
-                        for c in cands:
-                            # take span midpoint to assign to a clause
-                            mid = int((int(c["start_char"]) + int(c["end_char"])) / 2)
-                            # find clause containing midpoint
-                            cl_idx = next((i for i, cl in enumerate(clauses) if cl["start"] <= mid < cl["end"]), None)
-                            lbl = labels[cl_idx] if cl_idx is not None else "UNSURE"
-                            if _passes(lbl):
-                                filtered.append(c)
-                        if filtered:
-                            cr["candidates"] = filtered
-                            # keep audit: per-clause labels
-                            cr["notes"] = (cr.get("notes", "") + f"|fact_gate_clauses:{labels}").strip("|")
-                        else:
-                            cr["candidates"] = None
-                            cr["notes"] = (cr.get("notes", "") + f"|fact_gate_all_filtered:{labels}").strip("|")
+                                cr["candidates"] = None
+                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_all_filtered:{labels}").strip("|")
 
                 # # wipe ALL candidates (NER/NP/gaz/gold) for sentences that do not pass the fact gate
                 # for j, cr in enumerate(candidate_results):
@@ -333,70 +374,90 @@ def main():
                 #     else:
                 #         cr["notes"] = f"fact_gate:{label}"
 
-                assert len(candidate_results) == len(batch), \
-                    f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
+                    assert len(candidate_results) == len(batch), \
+                        f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
 
                 # llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
                 #                                       candidate_results, lock_over_iou=0.5)
 
-                if args.ablation != "off":
-                    llm_results = []
-                    for cr in candidate_results:
-                        llm_results.append(
-                            _ablation_accept(cr.get("candidates"), args.ablation, iou_thr=args.iou_thr)
-                        )
-                else:
-
-                    cond = args.llm_condition
-                    if cond == "C0":
-                        dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
-                        llm_results = call_llm_batch_two_path(llm, args.model_type, args.few_shot,
-                                                              candidate_results,
-                                                              lock_over_iou=args.iou_thr, #todo: T = 0.4
-                                                              decoding=dec, gaz_lock=args.gaz_locked)
-                    elif cond == "C1":
-                        llm_results = run_C1_vanilla(llm, args.model_type, args.few_shot,
-                                                     candidate_results, T=args.passes,
-                                                     lock_over_iou=args.iou_thr,
-                                                     gaz_lock=args.gaz_locked)
-                    elif cond == "C2":
-                        llm_results = run_C2_diverse(llm, args.model_type, args.few_shot,
-                                                     candidate_results, T=args.passes,
-                                                     lock_over_iou=args.iou_thr,
-                                                     gaz_lock=args.gaz_locked)
-                    elif cond == "C3":
-                        llm_results = run_C3_critique_revise(llm, args.model_type, args.few_shot,
-                                                             candidate_results, T=args.passes,
-                                                             lock_over_iou=args.iou_thr,
-                                                             gaz_lock=args.gaz_locked)
-                    elif cond == "C4":
-                        llm_results = run_C4_self_consistency(llm, args.model_type, args.few_shot,
-                                                              candidate_results, K=args.samples_k,
-                                                              lock_over_iou=args.iou_thr,
-                                                              gaz_lock=args.gaz_locked)
+                    if args.ablation != "off":
+                        llm_results = []
+                        for cr in candidate_results:
+                            llm_results.append(
+                                _ablation_accept(cr.get("candidates"), args.ablation, iou_thr=args.iou_thr)
+                            )
                     else:
-                        raise ValueError(f"Unknown --llm_condition {cond}")
+
+                        cond = args.llm_condition
+                        if cond == "C0":
+                            dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
+                            llm_results = call_llm_batch_two_path(llm, args.model_type, args.few_shot,
+                                                                  candidate_results,
+                                                                  lock_over_iou=args.iou_thr, #todo: T = 0.4
+                                                                  decoding=dec, gaz_lock=args.gaz_locked)
+                        elif cond == "C1":
+                            llm_results = run_C1_vanilla(llm, args.model_type, args.few_shot,
+                                                         candidate_results, T=args.passes,
+                                                         lock_over_iou=args.iou_thr,
+                                                         gaz_lock=args.gaz_locked)
+                        elif cond == "C2":
+                            llm_results = run_C2_diverse(llm, args.model_type, args.few_shot,
+                                                         candidate_results, T=args.passes,
+                                                         lock_over_iou=args.iou_thr,
+                                                         gaz_lock=args.gaz_locked)
+                        elif cond == "C3":
+                            llm_results = run_C3_critique_revise(llm, args.model_type, args.few_shot,
+                                                                 candidate_results, T=args.passes,
+                                                                 lock_over_iou=args.iou_thr,
+                                                                 gaz_lock=args.gaz_locked)
+                        elif cond == "C4":
+                            llm_results = run_C4_self_consistency(llm, args.model_type, args.few_shot,
+                                                                  candidate_results, K=args.samples_k,
+                                                                  lock_over_iou=args.iou_thr,
+                                                                  gaz_lock=args.gaz_locked)
+                        else:
+                            raise ValueError(f"Unknown --llm_condition {cond}")
 
 
-                if len(llm_results) != len(candidate_results):
-                    raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
+                    if len(llm_results) != len(candidate_results):
+                        raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
 
-                for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
-                    sentence_data = {
-                        "text": spacy_result["sentence"],
-                        "llm": llm_result,
-                    }
-                    # if "notes" in spacy_result:
-                    #     sentence_data["notes"] = spacy_result["notes"]
-                    if "fact_clause_labels" in spacy_result:
-                        sentence_data["fact_clause_labels"] = spacy_result["fact_clause_labels"]
-                    if spacy_result["candidates"] is not None:
-                        sentence_data["candidates"] = spacy_result["candidates"]
-                    out_sents.append(sentence_data)
+                    for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
+                        sentence_data = {
+                            "text": spacy_result["sentence"],
+                            "llm": llm_result,
+                        }
+                        # if "notes" in spacy_result:
+                        #     sentence_data["notes"] = spacy_result["notes"]
+                        if "fact_clause_labels" in spacy_result:
+                            sentence_data["fact_clause_labels"] = spacy_result["fact_clause_labels"]
+                        if spacy_result["candidates"] is not None:
+                            sentence_data["candidates"] = spacy_result["candidates"]
+                        global_idx = pending_indices[idx_in_batch]
+                        out_sents[global_idx] = sentence_data
+                        if ckpt_fh:
+                            ckpt_fh.write(json.dumps(
+                                {"idx": global_idx, "sentence": sentence_data},
+                                ensure_ascii=False
+                            ) + "\n")
+                    if ckpt_fh:
+                        ckpt_fh.flush()
 
-                print(f"Processed batch {bidx}/{total_batches}")
+                    print(
+                        f"Processed batch {bidx}/{total_batches} "
+                        f"({len(pending_indices)}/{len(batch_indices)} new)"
+                    )
+            finally:
+                if ckpt_fh:
+                    ckpt_fh.close()
 
             # Write results
+            missing = [i for i, s in enumerate(out_sents) if s is None]
+            if missing:
+                raise RuntimeError(
+                    f"Missing {len(missing)} sentences for doc {doc_id}; "
+                    f"rerun with --resume to fill from checkpoints."
+                )
             rec = {
                 "doc_id": doc_id,
                 "sentences": out_sents,
