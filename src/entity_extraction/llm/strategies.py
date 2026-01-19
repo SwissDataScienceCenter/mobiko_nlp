@@ -219,8 +219,8 @@ def call_llm_batch(
 
             )
             print('LLM response received.')
-
-            llm_result = json.loads(content)
+            # print(content)
+            llm_result = safe_json_from_llm(content, kind="extract")
 
             # Fix indices for all span categories
             for category in ["accepted", "missing", "rejected"]:
