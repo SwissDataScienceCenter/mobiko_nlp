@@ -505,6 +505,19 @@ def main():
                     if len(llm_results) != len(candidate_results):
                         raise RuntimeError(f"LLM results mismatch: {len(llm_results)} vs {len(candidate_results)}")
 
+                    for llm_result in llm_results:
+                        if not isinstance(llm_result, dict):
+                            continue
+                        if isinstance(llm_result.get("final_spans"), list):
+                            continue
+                        accepted = llm_result.get("accepted") or []
+                        missing = llm_result.get("missing") or []
+                        # Normalize outputs to always include final_spans.
+                        llm_result["final_spans"] = dedupe_overlaps_longest(
+                            accepted + missing,
+                            iou_thr=args.iou_thr,
+                        ) if (accepted or missing) else []
+
                     for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
                         sentence_data = {
                             "text": spacy_result["sentence"],
