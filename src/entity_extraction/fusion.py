@@ -32,7 +32,7 @@ def _noisy_or(ps: List[float]) -> float:
 def _map_type(raw_type: Optional[str], tmap: Dict[str, str]) -> Optional[str]:
     if not raw_type:
         return None
-    return tmap.get(raw_type, raw_type)
+    return tmap.get(raw_type.lower(), raw_type)
 
 
 def fuse_candidates(

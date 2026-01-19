@@ -77,6 +77,68 @@ def load_checkpoint(path: str, total_sents: int) -> List[Any]:
                 if out[idx] is None:
                     out[idx] = sent
     return out
+
+
+def _extract_types_from_llm(llm_result: Dict[str, Any]) -> List[str]:
+    spans = None
+    if isinstance(llm_result, dict):
+        if isinstance(llm_result.get("final_spans"), list):
+            spans = llm_result.get("final_spans")
+        elif isinstance(llm_result.get("final_accepted"), list) or isinstance(llm_result.get("final_missing"), list):
+            spans = (llm_result.get("final_accepted") or []) + (llm_result.get("final_missing") or [])
+        elif isinstance(llm_result.get("accepted"), list) or isinstance(llm_result.get("missing"), list):
+            spans = (llm_result.get("accepted") or []) + (llm_result.get("missing") or [])
+    if not spans:
+        return []
+    types = []
+    for s in spans:
+        if isinstance(s, dict):
+            t = s.get("type")
+            if t:
+                types.append(t)
+    return types
+
+
+def stats_from_out_sents(out_sents: List[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for s in out_sents:
+        if not s or not isinstance(s, dict):
+            continue
+        llm_result = s.get("llm")
+        for t in _extract_types_from_llm(llm_result):
+            counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def write_stats(path: str, doc_id: str, counts: Dict[str, int], processed: int, total: int) -> None:
+    payload = {
+        "doc_id": doc_id,
+        "processed_sentences": processed,
+        "total_sentences": total,
+        "type_counts": counts,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def load_global_stats(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"docs": {}}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_global_stats(path: str, docs: Dict[str, Any]) -> None:
+    totals: Dict[str, int] = {}
+    for doc_stats in docs.values():
+        for t, c in (doc_stats.get("type_counts") or {}).items():
+            totals[t] = totals.get(t, 0) + int(c)
+    payload = {
+        "docs": docs,
+        "type_counts": totals,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
             
             
             
@@ -174,17 +236,17 @@ def main():
     set_base_seed(args.base_seed)
 
     type_map = {
-          "Biomes": "ABIOTIC ENTITY",
-          "Biota": "BIOTIC ENTITY",
-          "Mountains": "BIOTIC ENTITY",
-          "MountainRange": "BIOTIC ENTITY",
+          "biomes": "ABIOTIC ENTITY",
+          "biota": "BIOTIC ENTITY",
+          "mountains": "BIOTIC ENTITY",
+          "mountainrange": "BIOTIC ENTITY",
           "geography": "SPATIAL ENTITY",
-          "ENV_FEATURE": "ABIOTIC PROPERTY",
-          "POPULATION": "BIOTIC COLLECTIVE ENTITY",
-          "TAXON": "BIOTIC ENTITY",
-          "LOCATION": "SPACIAL ENTITY",
-          "HABITAT": "BIOTIC PROPERTY",
-          "THREAT": "ANTHROPOGENIC PROCESS"
+          "env_feature": "ABIOTIC PROPERTY",
+          "population": "BIOTIC COLLECTIVE ENTITY",
+          "taxon": "BIOTIC ENTITY",
+          "location": "SPACIAL ENTITY",
+          "habitat": "BIOTIC PROPERTY",
+          "threat": "ANTHROPOGENIC PROCESS"
         }
 
     if args.type_map_json:
@@ -244,6 +306,12 @@ def main():
         ner_runtime = load_ner(args.ner_model_dir)
 
     docs_written = 0
+    global_stats_path = None
+    global_docs: Dict[str, Any] = {}
+    if args.checkpoint_dir:
+        global_stats_path = os.path.join(args.checkpoint_dir, "_global.stats.json")
+        if args.resume and os.path.exists(global_stats_path):
+            global_docs = load_global_stats(global_stats_path).get("docs", {})
 
     with open(args.out_jsonl, "w", encoding="utf-8") as fout:
         for doc_id, text in read_txt_files(args.in_dir):
@@ -259,16 +327,31 @@ def main():
             out_sents: List[Any] = [None] * len(sentences)
             ckpt_path = None
             ckpt_fh = None
+            stats_path = None
+            type_counts: Dict[str, int] = {}
             if args.checkpoint_dir:
                 ckpt_path = os.path.join(args.checkpoint_dir, f"{doc_id}.jsonl")
+                stats_path = os.path.join(args.checkpoint_dir, f"{doc_id}.stats.json")
                 if args.resume and os.path.exists(ckpt_path):
                     out_sents = load_checkpoint(ckpt_path, len(sentences))
                 elif os.path.exists(ckpt_path):
                     os.remove(ckpt_path)
                 ckpt_fh = open(ckpt_path, "a", encoding="utf-8")
 
+            if args.resume and out_sents:
+                type_counts = stats_from_out_sents(out_sents)
+
             processed = sum(1 for s in out_sents if s is not None)
             print(f"Processing {len(sentences)} sentences from lines (cached: {processed})")
+            if stats_path:
+                write_stats(stats_path, doc_id, type_counts, processed, len(sentences))
+            if global_stats_path:
+                global_docs[doc_id] = {
+                    "processed_sentences": processed,
+                    "total_sentences": len(sentences),
+                    "type_counts": type_counts,
+                }
+                write_global_stats(global_stats_path, global_docs)
 
             total_batches = (len(sentences) + args.batch_size - 1) // args.batch_size
 
@@ -440,8 +523,20 @@ def main():
                                 {"idx": global_idx, "sentence": sentence_data},
                                 ensure_ascii=False
                             ) + "\n")
+                        for t in _extract_types_from_llm(sentence_data.get("llm", {})):
+                            type_counts[t] = type_counts.get(t, 0) + 1
                     if ckpt_fh:
                         ckpt_fh.flush()
+                    if stats_path:
+                        processed = sum(1 for s in out_sents if s is not None)
+                        write_stats(stats_path, doc_id, type_counts, processed, len(sentences))
+                    if global_stats_path:
+                        global_docs[doc_id] = {
+                            "processed_sentences": processed,
+                            "total_sentences": len(sentences),
+                            "type_counts": type_counts,
+                        }
+                        write_global_stats(global_stats_path, global_docs)
 
                     print(
                         f"Processed batch {bidx}/{total_batches} "
@@ -458,6 +553,15 @@ def main():
                     f"Missing {len(missing)} sentences for doc {doc_id}; "
                     f"rerun with --resume to fill from checkpoints."
                 )
+            if stats_path:
+                write_stats(stats_path, doc_id, type_counts, len(out_sents), len(sentences))
+            if global_stats_path:
+                global_docs[doc_id] = {
+                    "processed_sentences": len(out_sents),
+                    "total_sentences": len(sentences),
+                    "type_counts": type_counts,
+                }
+                write_global_stats(global_stats_path, global_docs)
             rec = {
                 "doc_id": doc_id,
                 "sentences": out_sents,
