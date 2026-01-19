@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 import spacy  # just for validation of model existence
+from nltk.tokenize import sent_tokenize
 
 from llm.client import LLMClientFactory
 from llm.strategies import (
@@ -59,6 +60,17 @@ def read_txt_files(indir: str):
             continue
         with open(path, "r", encoding="utf-8") as f:
             yield os.path.splitext(name)[0], f.read()
+
+
+def split_sentences(text: str) -> List[str]:
+    try:
+        sentences = sent_tokenize(text)
+    except LookupError as exc:
+        raise RuntimeError(
+            "NLTK punkt tokenizer not found. Install it with: "
+            "python -m nltk.downloader punkt"
+        ) from exc
+    return [s.strip() for s in sentences if s.strip()]
 
 
 def load_checkpoint(path: str, total_sents: int) -> List[Any]:
@@ -320,9 +332,8 @@ def main():
             if docs_written > 1:  # Debug limit
                 break
 
-            # Split text into lines (one sentence per line)
-            lines = text.strip().split('\n')
-            sentences = [line.strip() for line in lines if line.strip()]
+            # Split text into sentences using NLTK
+            sentences = split_sentences(text)
 
             out_sents: List[Any] = [None] * len(sentences)
             ckpt_path = None
