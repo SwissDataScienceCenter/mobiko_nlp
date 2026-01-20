@@ -1,5 +1,5 @@
-from src.entity_extraction.legacy.schema import SCHEMA_BIODIV
-from schema import SCHEMA_BIODIV_SHORT
+from src.entity_extraction.llm.schema import SCHEMA_BIODIV
+from src.entity_extraction.llm.schema import SCHEMA_BIODIV_SHORT
 
 
 
