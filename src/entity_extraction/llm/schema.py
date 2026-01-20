@@ -93,7 +93,7 @@ Abiotic property (A measurable physical or chemical attribute)
                 soil moisture content
                 soil pH
 
-Antropogenic entity (A human-made object)
+Anthropogenic entity (A human-made object)
         Built infrastructure
                 building
                 dam
@@ -109,7 +109,7 @@ Antropogenic entity (A human-made object)
                 
 
                 
-Antropogenic process (An activity or action performed by humans that affects socioecological systems)
+Anthropogenic process (An activity or action performed by humans that affects socioecological systems)
         Intellectual /governance process
                 community forest management
                 conservation planning
@@ -133,7 +133,7 @@ Antropogenic process (An activity or action performed by humans that affects soc
                 terracing
                 tourism
                 
-Antropogenic property (A measurable social, economic or governance attribute)
+Anthropogenic property (A measurable social, economic or governance attribute)
         Demographic property
                 human population density
                 population (human)
@@ -430,18 +430,7 @@ Abiotic property (A measurable physical or chemical attribute)
         soil moisture content
         soil pH
 
-Antropogenic material entity (A human-made physical object, infrastructure or modification)
-        building
-        dam
-        fence
-        hydropower infrastructure
-        irrigation channel
-        mine
-        powerline
-        road
-        terraced field
-
-Antropogenic process (An activity or action performed by humans that affects socioecological systems)
+Anthropogenic process (An activity or action performed by humans that affects socioecological systems)
         community forest management
         conservation planning
         forest ecology
@@ -463,7 +452,7 @@ Antropogenic process (An activity or action performed by humans that affects soc
         terracing
         tourism
 
-Antropogenic property (A measurable social, economic or governance attribute)
+Anthropogenic property (A measurable social, economic or governance attribute)
         human population density
         population (human)
         agricultural intensity
@@ -476,6 +465,18 @@ Antropogenic property (A measurable social, economic or governance attribute)
         land tenure type
         ownership
         infrastructure density
+
+Anthropogenic entity (A human-made object)
+        building
+        dam
+        fence
+        hydropower infrastructure
+        land management system
+        protected area designation (infrastructure)
+        conservation policy
+        customary law
+        land tenure regime
+        management plan
 
 Biotic collective entity (An assemblage of organisms functioning as a unit (community, guild, ecosystem).
         epiphyte assemblage
