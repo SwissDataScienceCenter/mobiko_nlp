@@ -22,7 +22,7 @@ from llm.strategies import (
     run_C4_self_consistency,
 )
 from candidates import process_sentences_batch
-from candidates.bioc import load_bioc_index_from_dir, dedupe_bioc_index
+from candidates.bioc import load_bioc_index_from_dir, load_bioc_sentence_index_from_dir, dedupe_bioc_index
 from candidates.ner import load_ner
 from candidates.chunk import get_spacy_model
 from candidates.gazetteer import load_gazetteer_matcher
@@ -60,6 +60,25 @@ def read_txt_files(indir: str):
             continue
         with open(path, "r", encoding="utf-8") as f:
             yield os.path.splitext(name)[0], f.read()
+
+
+def read_bioc_passages(indir: str):
+    for name in os.listdir(indir):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(indir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        articles = doc.get("sibils_article_set") or doc.get("articles") or []
+        for a_idx, article in enumerate(articles):
+            for p_idx, passage in enumerate(article.get("passages", []) or []):
+                text = passage.get("text") or ""
+                if not text:
+                    continue
+                doc_id = f"{os.path.splitext(name)[0]}__a{a_idx}_p{p_idx}"
+                yield doc_id, text
 
 
 def split_sentences(text: str) -> List[str]:
@@ -221,7 +240,9 @@ def _assign_tiers_to_llm(llm_result: Dict[str, Any], candidates: List[Dict[str, 
             
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in_dir", required=True, help="Folder with .txt documents")
+    ap.add_argument("--in_dir", required=False, default=None, help="Folder with .txt documents")
+    ap.add_argument("--in_bioc_dir", required=False, default=None,
+                    help="Folder with BioC JSON files. Passage text is used as input.")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
     ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq", "qwen3-32B-vllm"],
                     default="gpt4o", help="LLM model to use")
@@ -244,6 +265,8 @@ def parse_args() -> argparse.Namespace:
                     help="Directory with BioC JSON files. We will extract sentence->spans as candidates.")
     ap.add_argument("--use_bioc", action="store_true",
                     help="When using NER candidates, also add BioC spans if available.")
+    ap.add_argument("--bioc_index_mode", choices=["sentence", "passage"], default="sentence",
+                    help="How to index BioC for candidate lookup (sentence is recommended).")
 
     ap.add_argument("--schema_csv", type=str, default=None,
                     help="Optional schema CSV passed to the converter.")
@@ -362,13 +385,26 @@ def main():
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     print(f"Checkpointing enabled at: {args.checkpoint_dir}")
 
+    if args.in_bioc_dir and args.in_dir:
+        print("Provide only one of --in_dir or --in_bioc_dir", file=sys.stderr)
+        sys.exit(1)
+    if not args.in_bioc_dir and not args.in_dir:
+        print("Provide --in_dir or --in_bioc_dir", file=sys.stderr)
+        sys.exit(1)
+
+    if args.bioc_candidates_dir is None and args.in_bioc_dir:
+        args.bioc_candidates_dir = args.in_bioc_dir
+
     # Load BioC candidates if requested
     bioc_index = None
-    if args.candidates_from == "bioc":
+    if args.candidates_from == "bioc" or args.use_bioc:
         if not args.bioc_candidates_dir:
             print("Provide --bioc_candidates_dir for candidates_from=bioc", file=sys.stderr)
             sys.exit(1)
-        bioc_index = load_bioc_index_from_dir(args.bioc_candidates_dir)
+        if args.bioc_index_mode == "passage":
+            bioc_index = load_bioc_index_from_dir(args.bioc_candidates_dir)
+        else:
+            bioc_index = load_bioc_sentence_index_from_dir(args.bioc_candidates_dir)
         print(f"Loaded BioC candidates for {len(bioc_index)} sentences from {args.bioc_candidates_dir}")
 
         before = len(bioc_index)
@@ -393,7 +429,12 @@ def main():
             global_docs = load_global_stats(global_stats_path).get("docs", {})
 
     with open(args.out_jsonl, "w", encoding="utf-8") as fout:
-        for doc_id, text in read_txt_files(args.in_dir):
+        if args.in_bioc_dir:
+            doc_iter = read_bioc_passages(args.in_bioc_dir)
+        else:
+            doc_iter = read_txt_files(args.in_dir)
+
+        for doc_id, text in doc_iter:
             # metrics.start_doc()
 
             # no debug limit
