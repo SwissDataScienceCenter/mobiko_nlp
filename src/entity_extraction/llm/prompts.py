@@ -54,12 +54,18 @@ DEFAULT_SYSTEM_PROMPT_NEW = f"""You are a careful information extractor with exp
 
 Task: Given ONE sentence and a list of candidate noun phrases, produce a HIGH-RECALL extraction.
 
-Rules:
+Hard constraints (must obey):
 - Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
 - Allowed types are EXACTLY as in the SCHEMA: {SCHEMA_BIODIV_SHORT}
-- Prefer HIGH RECALL. If plausible but uncertain, include and set "uncertain": true in a note.
+- Return spans as exact substrings copied from the sentence.
 - Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
-- If no entities are accepted but any are plausible, you MUST populate "missing".
+- For every item in accepted and missing: sentence[start_char:end_char] MUST exactly equal "text".
+- Do NOT output entities whose exact substring cannot be found in the sentence.
+- "missing" is ONLY for entities explicitly present in the sentence but absent from the candidate list.
+- If an entity is implied by the sentence but not explicitly mentioned as a substring, put it in rejected with reason "implied_not_explicit".
+- If a candidate is close but not exact (e.g., plural/singular, derivation), choose the closest explicit substring that exists in the sentence (with correct offsets), and optionally note the normalization in "note".
+- If you cannot find an exact substring for a proposed entity, you must reject it.
+- If accepted is empty but the sentence contains explicit entity mentions, populate missing with those explicit mentions.
 
 Return STRICT JSON only, this is the output schema:
 {{
@@ -92,12 +98,20 @@ Return STRICT JSON only, matching this schema:
   "notes": "optional short string"
 }}
 
-Guidelines:
-- Prefer HIGH RECALL. If uncertain about type or span, still include the entity with a note.
-- Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate, but respect the text. Do not invent spans which are not present in the text.
-- Do not invent new types beyond the schema. 
+Hard constraints (must obey):
+- Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
+- Allowed types are EXACTLY as in the SCHEMA: {SCHEMA_BIODIV_SHORT}
 - Types of candidates are suggestions only, correct if needed using the schema.
-- Missing list is for entities clearly present but absent from candidates.
+- Return spans as exact substrings copied from the sentence.
+- Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
+- For every item in accepted and missing: sentence[start_char:end_char] MUST exactly equal "text".
+- Do NOT output entities whose exact substring cannot be found in the sentence.
+- "missing" is ONLY for entities explicitly present in the sentence but absent from the candidate list.
+- If an entity is implied by the sentence but not explicitly mentioned as a substring, put it in rejected with reason "implied_not_explicit".
+- If a candidate is close but not exact (e.g., plural/singular, derivation), choose the closest explicit substring that exists in the sentence (with correct offsets), and optionally note the normalization in "note".
+- If you cannot find an exact substring for a proposed entity, you must reject it.
+- If accepted is empty but the sentence contains explicit entity mentions, populate missing with those explicit mentions.
+
 
 EXAMPLES:
 

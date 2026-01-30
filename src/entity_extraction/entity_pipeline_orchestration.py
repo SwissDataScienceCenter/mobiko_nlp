@@ -231,7 +231,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=15, help="Batch size for processing")
     ap.add_argument("--max_workers", type=int, default=4, help="Max worker threads")
     ap.add_argument("--checkpoint_dir", type=str, default=None,
-                    help="Directory for per-doc checkpoints (JSONL per doc).")
+                    help="Directory for per-doc checkpoints (JSONL per doc). Defaults to <out_jsonl>.ckpt")
     ap.add_argument("--resume", action="store_true",
                     help="Resume from existing checkpoints and skip processed sentences.")
 
@@ -357,8 +357,10 @@ def main():
             sys.exit(1)
 
     Path(os.path.dirname(args.out_jsonl) or ".").mkdir(parents=True, exist_ok=True)
-    if args.checkpoint_dir:
-        Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = f"{args.out_jsonl}.ckpt"
+    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    print(f"Checkpointing enabled at: {args.checkpoint_dir}")
 
     # Load BioC candidates if requested
     bioc_index = None
@@ -394,8 +396,7 @@ def main():
         for doc_id, text in read_txt_files(args.in_dir):
             # metrics.start_doc()
 
-            if docs_written > 1:  # Debug limit
-                break
+            # no debug limit
 
             # Split text into sentences using NLTK
             sentences = split_sentences(text)
