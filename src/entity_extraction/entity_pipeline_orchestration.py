@@ -30,7 +30,7 @@ from fusion import DEFAULT_SOURCE_WEIGHTS
 from fact_filter import split_into_clauses_spacy, classify_clauses_llm
 from llm.strategies import _ablation_accept
 # from .metrics import MetricsLogger
-from span_utils import dedupe_overlaps_longest
+from span_utils import dedupe_overlaps_longest, iou_tuple
 try:
     from . import __all__  # silence unused warning (package import)
 except Exception:
@@ -151,6 +151,71 @@ def write_global_stats(path: str, docs: Dict[str, Any]) -> None:
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _candidate_sources(cand: Dict[str, Any]) -> List[str]:
+    sources: List[str] = []
+    raw_sources = cand.get("sources")
+    if isinstance(raw_sources, list):
+        for s in raw_sources:
+            if isinstance(s, dict) and s.get("name"):
+                sources.append(s["name"])
+    if cand.get("source"):
+        sources.append(cand["source"])
+    return sources
+
+
+def _tier_from_sources(sources: List[str]) -> int | None:
+    if any(s in ("bioc", "gazetteer") for s in sources):
+        return 1
+    if any(s in ("ner", "chunks") for s in sources):
+        return 2
+    return None
+
+
+def _tier_for_span(span: Dict[str, Any], candidates: List[Dict[str, Any]] | None, iou_thr: float) -> int | None:
+    if not candidates:
+        return None
+    try:
+        s = int(span.get("start_char"))
+        e = int(span.get("end_char"))
+    except Exception:
+        return None
+    if e <= s:
+        return None
+    found_tier2 = False
+    for cand in candidates:
+        try:
+            cs = int(cand.get("start_char"))
+            ce = int(cand.get("end_char"))
+        except Exception:
+            continue
+        if ce <= cs:
+            continue
+        if iou_tuple((s, e), (cs, ce)) >= iou_thr or (s == cs and e == ce):
+            tier = _tier_from_sources(_candidate_sources(cand))
+            if tier == 1:
+                return 1
+            if tier == 2:
+                found_tier2 = True
+    return 2 if found_tier2 else None
+
+
+def _assign_tiers_to_llm(llm_result: Dict[str, Any], candidates: List[Dict[str, Any]] | None, iou_thr: float) -> None:
+    if not llm_result or not isinstance(llm_result, dict):
+        return
+    accepted = llm_result.get("accepted") or []
+    missing = llm_result.get("missing") or []
+    if isinstance(accepted, list):
+        for a in accepted:
+            if not isinstance(a, dict):
+                continue
+            a["tier"] = _tier_for_span(a, candidates, iou_thr) or 2
+    if isinstance(missing, list):
+        for m in missing:
+            if not isinstance(m, dict):
+                continue
+            m["tier"] = 3
             
             
             
@@ -530,6 +595,7 @@ def main():
                         ) if (accepted or missing) else []
 
                     for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
+                        _assign_tiers_to_llm(llm_result, spacy_result.get("candidates"), args.iou_thr)
                         sentence_data = {
                             "text": spacy_result["sentence"],
                             "llm": llm_result,
