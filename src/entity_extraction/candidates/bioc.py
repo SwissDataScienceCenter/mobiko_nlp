@@ -44,13 +44,13 @@ def load_bioc_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str, Any]]]:
                         meta = {k: infons.get(k) for k in _BIOC_META_KEYS}
                         spans.append(
                             {
-                                "start": start,
-                                "end": end,
+                                "start_char": start,
+                                "end_char": end,
                                 "text": text[start:end],
                                 **meta,
                             }
                         )
-                spans.sort(key=lambda s: (s["start"], -(s["end"] - s["start"])))
+                spans.sort(key=lambda s: (s["start_char"], -(s["end_char"] - s["start_char"])))
                 index[text] = spans
     return index
 
@@ -98,6 +98,46 @@ def load_bioc_sentence_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str,
             doc = json.load(f)
         articles = doc.get("sibils_article_set") or doc.get("articles") or []
         for article in articles:
+            if article.get("sentences"):
+                sent_by_key: Dict[Tuple[str, int], str] = {}
+                for s in article.get("sentences", []):
+                    fld = s.get("field") or ""
+                    num = int(s.get("sentence_number", 0))
+                    txt = s.get("sentence") or ""
+                    if not txt:
+                        continue
+                    sent_by_key[(fld, num)] = txt
+
+                ann_by_key: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+                for a in article.get("annotations", []):
+                    fld = a.get("field") or ""
+                    num = int(a.get("sentence_number", 0))
+                    ann_by_key.setdefault((fld, num), []).append(a)
+
+                for key, text in sent_by_key.items():
+                    anns = ann_by_key.get(key, [])
+                    if not anns:
+                        continue
+                    spans = []
+                    for a in anns:
+                        start = int(a.get("start_index", 0))
+                        end = int(a.get("end_index", 0))
+                        if end <= start or start < 0 or end > len(text):
+                            continue
+                        spans.append(
+                            {
+                                "text": text[start:end],
+                                "start_char": start,
+                                "end_char": end,
+                                "type": a.get("type"),
+                                "source": "bioc",
+                                "meta": {k: a.get(k) for k in _BIOC_META_KEYS},
+                            }
+                        )
+                    if spans:
+                        index.setdefault(text, []).extend(spans)
+                continue
+
             for passage in article.get("passages", []) or []:
                 text = passage.get("text") or ""
                 if not text:
@@ -116,9 +156,10 @@ def load_bioc_sentence_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str,
                             continue
                         spans.append(
                             {
-                                "start": start,
-                                "end": end,
+                                "start_char": start,
+                                "end_char": end,
                                 "text": text[start:end],
+                                "type": infons.get("type"),
                                 **{k: infons.get(k) for k in _BIOC_META_KEYS},
                             }
                         )
@@ -127,13 +168,13 @@ def load_bioc_sentence_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str,
                 for sent_text, s_start, s_end in sent_offsets:
                     sent_spans = []
                     for sp in spans:
-                        if sp["start"] < s_start or sp["end"] > s_end:
+                        if sp["start_char"] < s_start or sp["end_char"] > s_end:
                             continue
                         sent_spans.append(
                             {
                                 "text": sp["text"],
-                                "start": sp["start"] - s_start,
-                                "end": sp["end"] - s_start,
+                                "start_char": sp["start_char"] - s_start,
+                                "end_char": sp["end_char"] - s_start,
                                 "type": sp.get("type"),
                                 "source": "bioc",
                                 "meta": {k: sp.get(k) for k in _BIOC_META_KEYS},
@@ -148,7 +189,7 @@ def dedupe_bioc_index(bioc_index: Dict[str, List[Dict[str, Any]]]) -> Dict[str, 
     tmp: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
 
     def _span_key(sp):
-        return (int(sp["start"]), int(sp["end"]), sp.get("text", ""), sp.get("type"))
+        return (int(sp["start_char"]), int(sp["end_char"]), sp.get("text", ""), sp.get("type"))
 
     for sent_text, spans in bioc_index.items():
         c = canon(sent_text)
@@ -167,7 +208,7 @@ def dedupe_bioc_index(bioc_index: Dict[str, List[Dict[str, Any]]]) -> Dict[str, 
                 continue
             seen.add(k)
             uniq.append(sp)
-        uniq.sort(key=lambda s: (int(s["start"]), -(int(s["end"]) - int(s["start"]))))
+        uniq.sort(key=lambda s: (int(s["start_char"]), -(int(s["end_char"]) - int(s["start_char"]))))
         deduped[orig_text] = uniq
     return deduped
 
@@ -175,7 +216,7 @@ def dedupe_bioc_index(bioc_index: Dict[str, List[Dict[str, Any]]]) -> Dict[str, 
 def normalize_bioc_spans(spans: List[Dict[str, Any]], sent_text: str) -> List[Dict[str, Any]]:
     norm_spans = []
     for s in spans:
-        if "text" in s and "start" in s and "end" in s:
+        if "text" in s and "start_char" in s and "end_char" in s:
             if isinstance(s.get("meta"), dict):
                 meta = {k: s["meta"].get(k) for k in _BIOC_META_KEYS}
             else:
@@ -184,8 +225,8 @@ def normalize_bioc_spans(spans: List[Dict[str, Any]], sent_text: str) -> List[Di
             norm_spans.append(
                 {
                     "text": s["text"].strip(),
-                    "start_char": int(s["start"]),
-                    "end_char": int(s["end"]),
+                    "start_char": int(s["start_char"]),
+                    "end_char": int(s["end_char"]),
                     "type": s.get("type"),
                     "source": "bioc",
                     "meta": meta,

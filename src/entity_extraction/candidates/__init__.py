@@ -117,8 +117,8 @@ def process_sentences_batch(
                     spans = spans + gz
                 # Also add BioC spans if available
                 if use_bioc and bioc_index:
-                    spans = bioc_index.get(sent_text, [])
-                    norm_spans = normalize_bioc_spans(spans, sent_text)
+                    bioc_spans = bioc_index.get(sent_text, [])
+                    norm_spans = normalize_bioc_spans(bioc_spans, sent_text)
                     if norm_spans:
                         spans = spans + norm_spans
 

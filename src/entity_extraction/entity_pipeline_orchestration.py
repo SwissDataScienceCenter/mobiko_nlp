@@ -62,6 +62,11 @@ def read_txt_files(indir: str):
             yield os.path.splitext(name)[0], f.read()
 
 
+def _iter_with_split_flag(doc_iter):
+    for doc_id, text in doc_iter:
+        yield doc_id, text, False
+
+
 def read_bioc_passages(indir: str):
     for name in os.listdir(indir):
         if not name.endswith(".json"):
@@ -72,13 +77,28 @@ def read_bioc_passages(indir: str):
         with open(path, "r", encoding="utf-8") as f:
             doc = json.load(f)
         articles = doc.get("sibils_article_set") or doc.get("articles") or []
+        if not articles:
+            articles = [doc]
         for a_idx, article in enumerate(articles):
-            for p_idx, passage in enumerate(article.get("passages", []) or []):
-                text = passage.get("text") or ""
-                if not text:
+            passages = article.get("passages", []) or []
+            if passages:
+                passage_texts = []
+                for passage in passages:
+                    text = passage.get("text") or ""
+                    if text:
+                        passage_texts.append(text)
+                if passage_texts:
+                    doc_id = f"{os.path.splitext(name)[0]}__a{a_idx}_passages"
+                    yield doc_id, passage_texts, True
                     continue
-                doc_id = f"{os.path.splitext(name)[0]}__a{a_idx}_p{p_idx}"
-                yield doc_id, text
+            sentences = []
+            for s in article.get("sentences", []) or []:
+                text = s.get("sentence") or ""
+                if text:
+                    sentences.append(text)
+            if sentences:
+                doc_id = f"{os.path.splitext(name)[0]}__a{a_idx}_sentences"
+                yield doc_id, sentences, True
 
 
 def split_sentences(text: str) -> List[str]:
@@ -432,15 +452,19 @@ def main():
         if args.in_bioc_dir:
             doc_iter = read_bioc_passages(args.in_bioc_dir)
         else:
-            doc_iter = read_txt_files(args.in_dir)
+            doc_iter = _iter_with_split_flag(read_txt_files(args.in_dir))
 
-        for doc_id, text in doc_iter:
+
+        for doc_id, text, is_pre_split in doc_iter:
             # metrics.start_doc()
 
             # no debug limit
 
-            # Split text into sentences using NLTK
-            sentences = split_sentences(text)
+            # Split text into sentences using NLTK unless already pre-split
+            if is_pre_split:
+                sentences = text
+            else:
+                sentences = split_sentences(text)
 
             out_sents: List[Any] = [None] * len(sentences)
             ckpt_path = None
