@@ -7,7 +7,7 @@ import regex as re
 from collections import Counter
 
 from .client import remove_thinking_blocks
-from src.entity_extraction.llm.prompts import (
+from src.entity_extraction.llm.prompts_two_output import (
     DEFAULT_SYSTEM_PROMPT_NEW,
     NO_CHUNK_CANDIDATE_SYSTEM_PROMPT,
     SYSTEM_PROMPT_FEW_SHOT,
@@ -129,7 +129,7 @@ def _is_ner(cand: dict) -> bool:
 
 def _as_accepted(c: dict, forced_type: Optional[str] = None) -> dict:
     return {
-        "text": c["text"],
+        "text": c.get("text") if c.get("text") else c.get("mention_text"),
         "type": forced_type if forced_type else c.get("type"),
         "start_char": int(c["start_char"]),
         "end_char": int(c["end_char"]),
@@ -286,7 +286,7 @@ def call_llm_batch_two_path(
                 # If no type could be chosen, skip locking
                 continue
             lock_accepteds.append({
-                "text": c["text"],
+                "text": c.get("text") if c.get("text") else c.get("mention_text"),
                 "type": t,
                 "start_char": int(c["start_char"]),
                 "end_char": int(c["end_char"]),

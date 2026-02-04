@@ -177,7 +177,7 @@ def fix_span_indices(spans: list, sentence_text: str, candidates: List[Dict[str,
             span = {"text": span}
         if not isinstance(span, dict):
             continue
-        span_text = span.get("text", "").strip()
+        span_text = span.get("text", "").strip() if "text" in span else span.get("mention_text", "").strip()
         if not span_text:
             continue
 
@@ -189,6 +189,8 @@ def fix_span_indices(spans: list, sentence_text: str, candidates: List[Dict[str,
             fixed_span["start_char"] = start
             fixed_span["end_char"] = end
             fixed_span["text"] = sentence_text[start:end]  # Use actual text from sentence
+            if "mention_text" in fixed_span:
+                del fixed_span["mention_text"]
             fixed_spans.append(fixed_span)
         else:
             snapped = _snap_to_candidate(span_text, candidates)
@@ -197,6 +199,8 @@ def fix_span_indices(spans: list, sentence_text: str, candidates: List[Dict[str,
                 fixed_span["start_char"] = int(snapped["start_char"])
                 fixed_span["end_char"] = int(snapped["end_char"])
                 fixed_span["text"] = sentence_text[fixed_span["start_char"]:fixed_span["end_char"]]
+                if "mention_text" in fixed_span:
+                    del fixed_span["mention_text"]
                 fixed_spans.append(fixed_span)
             else:
                 # Span text not found in sentence - log warning but keep original
@@ -205,6 +209,8 @@ def fix_span_indices(spans: list, sentence_text: str, candidates: List[Dict[str,
                 fixed_span["start_char"] = 0
                 fixed_span["end_char"] = 0
                 fixed_span["text"] = span_text
+                if "mention_text" in fixed_span:
+                    del fixed_span["mention_text"]
                 fixed_spans.append(fixed_span)
 
     return fixed_spans

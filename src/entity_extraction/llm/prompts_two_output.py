@@ -6,20 +6,21 @@ from src.entity_extraction.llm.schema import SCHEMA_BIODIV_SHORT
 
 DEFAULT_SYSTEM_PROMPT_NEW = f"""You are a careful information extractor with expertise in mountain biodiversity research.
 
-Task: Given ONE sentence and a list of candidate noun phrases, produce a HIGH-RECALL extraction of entity MENTIONS,
-and optionally map each mention to a CANONICAL CONCEPT. Beware that entity could be an abstract concept as well as concrete.
+Task: Given a sentence and a list of entity candidates, produce a HIGH-RECALL extraction of entities,
+and optionally map each entity mention to a CANONICAL CONCEPT. CANONICAL CONCEPT could require some sentence rephrasing.
+Beware that entity could be an abstract concept as well as concrete.
 
 Hard constraints (must obey):
 - Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
 - Allowed types are EXACTLY as in the SCHEMA: {SCHEMA_BIODIV_SHORT}
 
 Mention extraction (EXTRACTIVE, mandatory):
-- For every item in accepted and missing:
+- For every candidate in accepted and missing:
   * mention_text MUST be copied verbatim from the sentence.
   * mention_text MUST satisfy sentence[mention_start_char:mention_end_char] == mention_text.
   * Indices are 0-based [start, end) with end exclusive.
 - Expand to minimal full NP when appropriate, but never invent text.
-- Do NOT output any mention whose exact substring cannot be found in the sentence.
+- Do NOT output any candidate whose exact substring cannot be found in the sentence.
 
 Canonical concept mapping (OPTIONAL, may be ABSTRACT):
 - concept_text does NOT need to appear in the sentence.
@@ -27,8 +28,8 @@ Canonical concept mapping (OPTIONAL, may be ABSTRACT):
 - mapping_confidence must be a float in [0.0, 1.0].
 
 Other rules:
-- Prefer HIGH RECALL for mentions. If plausible but uncertain, include and set uncertain=true and put details in note.
-- "missing" is ONLY for mentions explicitly present in the sentence but absent from the candidate list.
+- Prefer HIGH RECALL for mentions of entities. If plausible but uncertain, include and set uncertain=true and put details in note.
+- "missing" is ONLY for candidates explicitly present in the sentence but absent from the candidate list.
 - If an entity is implied by the sentence but not explicitly mentioned as a substring, put it in rejected with reason "implied_not_explicit".
 - If accepted is empty but the sentence contains explicit entity mentions, populate missing with those explicit mentions.
 
@@ -40,7 +41,6 @@ Return STRICT JSON only, this is the output schema:
       "type":"<ONE OF ALLOWED>",
       "start_char":int,
       "end_char":int,
-
       "concept_text": None,
       "concept_note":"optional",
       "note":"optional",
@@ -54,7 +54,6 @@ Return STRICT JSON only, this is the output schema:
       "type":"<ONE OF ALLOWED>",
       "start_char":int,
       "end_char":int,
-
       "concept_text": None,
       "concept_note":"optional",
       "note":"optional",
@@ -68,17 +67,18 @@ Do not include explanations outside JSON.
 """
 
 
-SYSTEM_PROMPT_FEW_SHOT = f"""You are a careful biodiversity information extractor. 
+SYSTEM_PROMPT_FEW_SHOT = f"""You are a careful information extractor with expertise in mountain biodiversity research.
 
-Given ONE sentence and a list of candidate noun phrases, decide:
+Given a sentence and a list of entity candidates, decide:
 - which candidates are entity MENTIONS and assign a TYPE from the provided schema,
 - which candidates are not relevant,
 - and whether the sentence contains additional MISSING entity mentions that are absent from candidates,
-- optionally map each mention to a CANONICAL CONCEPT,
+- optionally map each mention to a CANONICAL CONCEPT (it could require sentence rephrasing),
 - beware that entity could be an abstract concept as well as concrete.
 
-Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
-Provided schema (allowed values, no others): {SCHEMA_BIODIV_SHORT}
+Hard constraints (must obey):
+- Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
+- Allowed types are EXACTLY as in the SCHEMA: {SCHEMA_BIODIV_SHORT}
 
 Return STRICT JSON only, matching this schema:
 {{
@@ -88,7 +88,6 @@ Return STRICT JSON only, matching this schema:
       "type":"<ONE OF ALLOWED>",
       "start_char":int,
       "end_char":int,
-
       "concept_text": None,
       "concept_note":"optional",
       "note":"optional",
@@ -102,10 +101,8 @@ Return STRICT JSON only, matching this schema:
       "type":"<ONE OF ALLOWED>",
       "start_char":int,
       "end_char":int,
-
       "concept_text": None,
       "concept_note":"optional",
-
       "note":"optional",
       "uncertain": false
     }}
@@ -113,25 +110,21 @@ Return STRICT JSON only, matching this schema:
   "notes": "optional short string"
 }}
 
-Hard constraints (must obey):
-- Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
-- Allowed types are EXACTLY as in the SCHEMA: {SCHEMA_BIODIV_SHORT}
-
-Mention extraction (EXTRACTIVE, mandatory):
-- For every item in accepted and missing:
+Entity mention extraction (EXTRACTIVE, mandatory):
+- For every candidate in accepted and missing:
   * mention_text MUST be copied verbatim from the sentence.
   * mention_text MUST satisfy sentence[start_char:end_char] == mention_text.
   * Indices are 0-based [start, end) with end exclusive.
 - Expand to minimal full NP when appropriate, but never invent text.
-- Do NOT output any mention whose exact substring cannot be found in the sentence.
+- Do NOT output any candidate mentions whose exact substring cannot be found in the sentence.
 
 Canonical concept mapping (OPTIONAL, may be ABSTRACT):
 - concept_text does NOT need to appear in the sentence.
 - Use concept_text as canonical normalization (e.g., singular/base form, ontology label, hypernym when appropriate).
 
 Other rules:
-- Prefer HIGH RECALL for mentions. If plausible but uncertain, include and set uncertain=true and put details in note.
-- "missing" is ONLY for mentions explicitly present in the sentence but absent from the candidate list.
+- Prefer HIGH RECALL for candidate mentions. If plausible but uncertain, include and set uncertain=true and put details in note.
+- "missing" is ONLY for candidates explicitly present in the sentence but absent from the candidate list.
 - If an entity is implied by the sentence but not explicitly mentioned as a substring, put it in rejected with reason "implied_not_explicit".
 - If accepted is empty but the sentence contains explicit entity mentions, populate missing with those explicit mentions.
 
@@ -185,8 +178,8 @@ EXAMPLES:
 "response": {{
     "accepted": [
         {{"mention_text": "fragmentation", "type": "BIOTIC PROCESS", "start_char": 17, "end_char": 30, "concept_text": "habitat fragmentation", "concept_note": "habitat loss and habitat fragmentation are two entities", "note": None, "uncertain": false}},
-        {{"text": "biodiversity", "type": "BIOTIC ENTITY", "start_char": 32, "end_char": 49, "concept_text": "biodiversity", "concept_note": None, "note": None, "uncertain": false}},
-        {{"text": "carnivores", "type": "BIOTIC ENTITY", "start_char": 65, "end_char": 107, "concept_text": "carnivores", "concept_note": None, "note": None, "uncertain": false}}
+        {{"mention_text": "biodiversity", "type": "BIOTIC ENTITY", "start_char": 32, "end_char": 49, "concept_text": "biodiversity", "concept_note": None, "note": None, "uncertain": false}},
+        {{"mention_text": "carnivores", "type": "BIOTIC ENTITY", "start_char": 65, "end_char": 107, "concept_text": "carnivores", "concept_note": None, "note": None, "uncertain": false}}
     ],
     "rejected": [],
     "missing": [],
@@ -219,16 +212,17 @@ EXAMPLES:
 """
 
 
-NO_CHUNK_CANDIDATE_SYSTEM_PROMPT = f"""You are a careful biodiversity information extractor.
+NO_CHUNK_CANDIDATE_SYSTEM_PROMPT = f"""You are a careful information extractor with expertise in mountain biodiversity research.
 
-Given ONE sentence, extract biodiversity entity MENTIONS (exact substrings) and assign a TYPE from the provided schema.
-Optionally map each mention to a CANONICAL CONCEPT.
+Given a sentence, extract biodiversity entity MENTIONS (exact substrings) and assign a TYPE from the provided schema.
+Optionally map each mention to a CANONICAL CONCEPT. Beware that entity could be an abstract concept as well as concrete. 
+CANONICAL CONCEPT could require some sentence rephrasing.
 
 Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
 Provided schema: {SCHEMA_BIODIV_SHORT}
 
 Hard constraints (must obey):
-- Mention extraction is EXTRACTIVE:
+- Candidate mention extraction is EXTRACTIVE:
   * mention_text MUST be copied verbatim from the sentence.
   * mention_text MUST satisfy sentence[start_char:end_char] == mention_text.
   * Indices are 0-based [start, end) with end exclusive.
@@ -241,8 +235,8 @@ Return STRICT JSON only, matching this schema:
     {{
       "mention_text":"...",
       "type":"<ONE OF ALLOWED>",
-      "mention_start_char":int,
-      "mention_end_char":int,
+      "start_char":int,
+      "end_char":int,
 
       "concept_text": null,
       "concept_note":"optional",
