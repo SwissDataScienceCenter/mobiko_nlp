@@ -72,7 +72,7 @@ SYSTEM_PROMPT_FEW_SHOT = f"""You are a careful information extractor with expert
 Given a sentence and a list of entity candidates, decide:
 - which candidates are entity MENTIONS and assign a TYPE from the provided schema,
 - which candidates are not relevant,
-- and whether the sentence contains additional MISSING entity mentions that are absent from candidates,
+- and whether the sentence contains additional MISSING entity mentions that are absent from the candidates,
 - optionally map each mention to a CANONICAL CONCEPT (it could require sentence rephrasing),
 - beware that entity could be an abstract concept as well as concrete.
 
@@ -136,17 +136,16 @@ EXAMPLES:
 "candidates": [
     {{"text": "Amazon rainforest", "start_char": 4, "end_char": 21}},
     {{"text": "temperature", "start_char": 33, "end_char": 53}},
-    {{"text": "decade", "start_char": 83, "end_char": 89}}
 ],
 "response": {{
     "accepted": [
         {{"mention_text": "Amazon rainforest", "type": "SPATIAL ENTITY", "start_char": 4, "end_char": 21, "concept_text": "Amazon rainforest", "note": None, "uncertain": false}},
         {{"mention_text": "increase in temperature", "type": "ABIOTIC PROCESS", "start_char": 33, "end_char": 53, "concept_text": "temperature increase", "concept_note": None, "note": None, "uncertain": false}}
     ],
-    "rejected": [
-        {{"text": "decade", "reason": "Not a biodiversity entity"}}
-    ],
-    "missing": [],
+    "rejected": [],
+    "missing": [
+        {{"text": "past decade", "concept_text": "past decade", "reason": "Increase in temperature happens in a temporal entity.", "type": "TEMPORAL ENTITY", "start_char": 78, "end_char": 89}}
+    ]
     "notes": "temperature mapped to increase in temperature"
 }}}}
 
@@ -164,7 +163,9 @@ EXAMPLES:
         {{"mention_text": "species", "type": "BIOTIC ENTITY", "start_char": 57, "end_char": 64, "concept_text": "species", "concept_note": None, "note": None, "uncertain": false}}
     ],
     "rejected": [],
-    "missing": [],
+    "missing": [
+        {{"mention_text": "numerous", "type": "BIOTIC PROPERTY", "start_char": 48, "end_char": 64, "concept_text": "numerous", "concept_note": None, "reason": "Missing property of species", "uncertain": false}}
+        ],
     "notes": "ABIOTIC PROPERTY vs ABIOTIC PROCESS: chose PROCESS for Deforestation"
 }}}}
 
@@ -182,8 +183,14 @@ EXAMPLES:
         {{"mention_text": "carnivores", "type": "BIOTIC ENTITY", "start_char": 65, "end_char": 107, "concept_text": "carnivores", "concept_note": None, "note": None, "uncertain": false}}
     ],
     "rejected": [],
-    "missing": [],
-    "notes": "Rate is PROPERTY, management is PROCESS"
+    "missing": [        
+        {{"mention_text": "Habitat loss", "type": "ABIOTIC PROCESS", "start_char": 0, "end_char": 12, "concept_text": "habitat loss", "concept_note": "habitat loss and habitat fragmentation are two entities", "note": None, "uncertain": false}},
+        {{"mention_text": "dispersion", "type": "BIOTIC PROPERTY", "start_char": 88, "end_char": 98, "concept_text": "dispersion", "concept_note": None, "reason": "Missing property related to carnivores", "uncertain": false}},
+        {{"mention_text": "population viability", "type": "BIOTIC PROPERTY", "start_char": 103, "end_char": 123, "concept_text": "population viability", "concept_note": None, "reason": "Missing property related to carnivores", "uncertain": false}},
+        {{"mention_text": "reduced available habitat", "type": "ABIOTIC ENTITY", "start_char": 143, "end_char": 168, "concept_text": "reduced available habitat", "concept_note": None, "reason": "Missing entity related to carnivores", "uncertain": false}},
+        {{"mention_text": "anthropogenic elements", "type": "ANTHROPOGENIC ENTITY", "start_char": 173, "end_char": 195, "concept_text": "anthropogenic elements", "concept_note": None, "reason": "Missing entity related to human impact on carnivores", "uncertain": false}},
+    ],
+    "notes": ""
 }}}}
 
 {{{{
