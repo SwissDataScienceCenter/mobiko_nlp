@@ -4,6 +4,7 @@ from typing import Dict, List, Any, Tuple
 import json
 import glob
 import os
+import re
 from nltk.tokenize import sent_tokenize
 from span_utils import canon, fix_span_indices, find_span_positions
 
@@ -19,6 +20,17 @@ _BIOC_META_KEYS = [
     "nature",
     "concept_form",
 ]
+
+_BIOC_EXCLUDED_SENTENCE_FIELDS = {
+    "title",
+    "keywords",
+    "affiliations",
+    "section_title",
+    "table_caption",
+    "table_value",
+    "fig_caption",
+    "references"
+}
 
 
 def load_bioc_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -91,6 +103,71 @@ def _sentence_offsets(text: str) -> List[Tuple[str, int, int]]:
     return out
 
 
+def _norm_section_title(title: str) -> str:
+    t = (title or "").casefold()
+    t = t.replace("&", " and ")
+    t = re.sub(r"[-–—_/]+", " ", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    return " ".join(t.split())
+
+
+def _is_included_section_title(title: str) -> bool:
+    norm = _norm_section_title(title)
+    if not norm:
+        return False
+
+    # Exclude methods/methodology sections even if mixed with other words.
+    if "methodolog" in norm or "materials and method" in norm or re.search(r"\bmethods?\b", norm):
+        return False
+
+    return any(k in norm for k in ("introduction", "results", "discussion", "conclusion"))
+
+
+def _iter_section_content_ids(node: Any) -> List[str]:
+    if not isinstance(node, dict):
+        return []
+    out: List[str] = []
+    node_id = node.get("id")
+    if isinstance(node_id, str) and node_id:
+        out.append(node_id)
+    for child in node.get("contents", []) or []:
+        if not isinstance(child, dict):
+            continue
+        child_id = child.get("id")
+        if isinstance(child_id, str) and child_id:
+            out.append(child_id)
+        if child.get("contents"):
+            out.extend(_iter_section_content_ids(child))
+    return out
+
+
+def _collect_allowed_content_ids_from_document(article: Dict[str, Any]) -> Tuple[set[str], set[str], bool]:
+    doc = article.get("document", {}) or {}
+    body_sections = doc.get("body_sections", [])
+    if not isinstance(body_sections, list) or not body_sections:
+        return set(), set(), False
+
+    allowed_content_ids: set[str] = set()
+    allowed_section_ids: set[str] = set()
+
+    for sec in body_sections:
+        if not isinstance(sec, dict):
+            continue
+        sec_tag = str(sec.get("tag") or "").strip().lower()
+        sec_title = str(sec.get("title") or "")
+        include = sec_tag == "abstract" or _is_included_section_title(sec_title)
+        if not include:
+            continue
+
+        sec_id = sec.get("id")
+        if isinstance(sec_id, str) and sec_id:
+            allowed_section_ids.add(sec_id)
+        for cid in _iter_section_content_ids(sec):
+            allowed_content_ids.add(cid)
+
+    return allowed_content_ids, allowed_section_ids, True
+
+
 def load_bioc_sentence_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str, Any]]]:
     index: Dict[str, List[Dict[str, Any]]] = {}
     for path in glob.glob(os.path.join(bioc_dir, "*.json")):
@@ -99,8 +176,37 @@ def load_bioc_sentence_index_from_dir(bioc_dir: str) -> Dict[str, List[Dict[str,
         articles = doc.get("sibils_article_set") or doc.get("articles") or []
         for article in articles:
             if article.get("sentences"):
+                allowed_content_ids, allowed_section_ids, has_body_section_metadata = (
+                    _collect_allowed_content_ids_from_document(article)
+                )
+
+                def _is_allowed_sentence_record(s: Dict[str, Any]) -> bool:
+                    fld = str(s.get("field") or "").strip().lower()
+                    if fld in _BIOC_EXCLUDED_SENTENCE_FIELDS:
+                        return False
+                    if fld == "abstract":
+                        return True
+                    if fld != "text":
+                        return False
+
+                    # Fallback for formats without document/body_sections metadata.
+                    if not has_body_section_metadata:
+                        return True
+
+                    content_id = str(s.get("content_id") or "").strip()
+                    if not content_id:
+                        return False
+                    if content_id in allowed_content_ids:
+                        return True
+                    return any(
+                        content_id == sec_id or content_id.startswith(sec_id + ".")
+                        for sec_id in allowed_section_ids
+                    )
+
                 sent_by_key: Dict[Tuple[str, int], str] = {}
                 for s in article.get("sentences", []):
+                    if not _is_allowed_sentence_record(s):
+                        continue
                     fld = s.get("field") or ""
                     num = int(s.get("sentence_number", 0))
                     txt = s.get("sentence") or ""

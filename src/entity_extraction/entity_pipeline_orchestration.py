@@ -22,7 +22,13 @@ from llm.strategies import (
     run_C4_self_consistency,
 )
 from candidates import process_sentences_batch
-from candidates.bioc import load_bioc_index_from_dir, load_bioc_sentence_index_from_dir, dedupe_bioc_index
+from candidates.bioc import (
+    load_bioc_index_from_dir,
+    load_bioc_sentence_index_from_dir,
+    dedupe_bioc_index,
+    _collect_allowed_content_ids_from_document,
+    _BIOC_EXCLUDED_SENTENCE_FIELDS,
+)
 from candidates.ner import load_ner
 from candidates.chunk import get_spacy_model
 from candidates.gazetteer import load_gazetteer_matcher
@@ -80,10 +86,34 @@ def read_bioc_passages(indir: str):
         if not articles:
             articles = [doc]
         for a_idx, article in enumerate(articles):
+            allowed_content_ids, allowed_section_ids, has_body_section_metadata = (
+                _collect_allowed_content_ids_from_document(article)
+            )
+
+            def _is_allowed_field_content(field: str, content_id: str) -> bool:
+                fld = str(field or "").strip().lower()
+                if fld in _BIOC_EXCLUDED_SENTENCE_FIELDS:
+                    return False
+                if fld == "abstract":
+                    return True
+                if fld != "text":
+                    return False
+                if not has_body_section_metadata:
+                    return True
+                cid = str(content_id or "").strip()
+                if not cid:
+                    return False
+                if cid in allowed_content_ids:
+                    return True
+                return any(cid == sec_id or cid.startswith(sec_id + ".") for sec_id in allowed_section_ids)
+
             passages = article.get("passages", []) or []
             if passages:
                 passage_texts = []
                 for passage in passages:
+                    infons = passage.get("infons", {}) or {}
+                    if not _is_allowed_field_content(infons.get("field"), infons.get("content_id")):
+                        continue
                     text = passage.get("text") or ""
                     if text:
                         passage_texts.append(text)
@@ -93,6 +123,8 @@ def read_bioc_passages(indir: str):
                     continue
             sentences = []
             for s in article.get("sentences", []) or []:
+                if not _is_allowed_field_content(s.get("field"), s.get("content_id")):
+                    continue
                 text = s.get("sentence") or ""
                 if text:
                     sentences.append(text)
