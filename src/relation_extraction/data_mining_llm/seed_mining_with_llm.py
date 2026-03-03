@@ -108,6 +108,34 @@ class CandidatePair:
 
 # ---------- Utility functions ----------
 
+def normalize_entity_type_to_tag(entity_type: str) -> str:
+    """
+    Convert entity type text into a safe tag name.
+    Example: "BIOTIC ENTITY" -> "BIOTIC_ENTITY".
+    """
+    tag = re.sub(r"[^A-Za-z0-9]+", "_", entity_type.strip().upper()).strip("_")
+    if not tag:
+        tag = "ENTITY"
+    if tag[0].isdigit():
+        tag = f"TYPE_{tag}"
+    return tag
+
+
+def resolve_marker_tag(entity_type: str, fallback_tag: str, marker_style: str) -> str:
+    if marker_style == "generic":
+        return fallback_tag
+    return normalize_entity_type_to_tag(entity_type)
+
+
+def collect_schema_entity_types(schema: Dict[str, List[List[str]]]) -> List[str]:
+    types = set()
+    for pairs_list in schema.values():
+        for t1, t2 in pairs_list:
+            types.add(t1)
+            types.add(t2)
+    return sorted(types)
+
+
 def load_json(path: Path):
     with path.open("r", encoding="utf8") as f:
         print(f"Loading JSON from {path}...")
@@ -248,23 +276,87 @@ class SentenceEmbedder(nn.Module):
     Returns [h_<E1>; h_<E2>] for each input text.
     """
 
-    def __init__(self, model_name: str, device: Optional[str] = None):
+    def __init__(
+        self,
+        model_name: str,
+        tokenizer_name: Optional[str] = None,
+        device: Optional[str] = None,
+        marker_style: str = "generic",
+        marker_entity_types: Optional[List[str]] = None,
+    ):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.marker_style = marker_style
+        self.tokenizer = self._load_tokenizer(model_name, tokenizer_name=tokenizer_name)
         self.encoder = AutoModel.from_pretrained(model_name)
-        marker_tokens = ["<E1>", "</E1>", "<E2>", "</E2>"]
+        if marker_style == "generic":
+            self.marker_open_tokens = ["<E1>", "<E2>"]
+            marker_tokens = ["<E1>", "</E1>", "<E2>", "</E2>"]
+        else:
+            marker_entity_types = marker_entity_types or []
+            marker_tags = sorted({normalize_entity_type_to_tag(t) for t in marker_entity_types})
+            self.marker_open_tokens = [f"<{t}>" for t in marker_tags]
+            marker_tokens = self.marker_open_tokens + [f"</{t}>" for t in marker_tags]
         vocab = self.tokenizer.get_vocab()
         missing = [tok for tok in marker_tokens if tok not in vocab]
         if missing:
             self.tokenizer.add_special_tokens({"additional_special_tokens": missing})
             self.encoder.resize_token_embeddings(len(self.tokenizer))
-        self.e1_token_id = self.tokenizer.convert_tokens_to_ids("<E1>")
-        self.e2_token_id = self.tokenizer.convert_tokens_to_ids("<E2>")
+        if marker_style == "generic":
+            self.e1_token_id = self.tokenizer.convert_tokens_to_ids("<E1>")
+            self.e2_token_id = self.tokenizer.convert_tokens_to_ids("<E2>")
+            self.marker_open_token_ids = set()
+        else:
+            self.e1_token_id = None
+            self.e2_token_id = None
+            self.marker_open_token_ids = {
+                self.tokenizer.convert_tokens_to_ids(tok)
+                for tok in self.marker_open_tokens
+            }
+            self.marker_open_token_ids.discard(self.tokenizer.unk_token_id)
         self.encoder.eval()
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.encoder.to(self.device)
+
+    @staticmethod
+    def _load_tokenizer(model_name: str, tokenizer_name: Optional[str] = None):
+        """
+        Load tokenizer robustly across model families:
+        try fast tokenizer first, then fallback to slow tokenizer.
+        """
+        candidates: List[str] = []
+        if tokenizer_name:
+            candidates.append(tokenizer_name)
+        candidates.append(model_name)
+        # SPECTER2 commonly uses SciBERT tokenizer assets.
+        if "specter2" in model_name.lower():
+            candidates.append("allenai/scibert_scivocab_uncased")
+
+        tried_errors = []
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return AutoTokenizer.from_pretrained(candidate, use_fast=True)
+            except Exception as fast_err:
+                try:
+                    return AutoTokenizer.from_pretrained(candidate, use_fast=False)
+                except Exception as slow_err:
+                    tried_errors.append(
+                        f"{candidate} -> fast_err={fast_err} | slow_err={slow_err}"
+                    )
+
+        errors_joined = "\n".join(tried_errors)
+        raise RuntimeError(
+            "Failed to load tokenizer.\n"
+            f"model_name='{model_name}', tokenizer_name='{tokenizer_name}'.\n"
+            "Tried explicit tokenizer (if provided), model name, and known fallbacks.\n"
+            "Install dependencies: `pip install sentencepiece tiktoken`.\n"
+            f"Attempts:\n{errors_joined}"
+        )
 
     @torch.no_grad()
     def encode(self, texts: List[str], batch_size: int = 16) -> torch.Tensor:
@@ -284,14 +376,22 @@ class SentenceEmbedder(nn.Module):
             attn_mask = encoded["attention_mask"].unsqueeze(-1)
             mean_pooled = (hidden * attn_mask).sum(dim=1) / attn_mask.sum(dim=1).clamp(min=1)
 
-            # Entity-marker pooling: concatenate hidden states at <E1> and <E2>.
+            # Entity-marker pooling: concatenate hidden states at marker starts.
             # Fallback to mean pooled state when markers are absent.
             embs = []
             for row_idx in range(hidden.size(0)):
-                e1_positions = (input_ids[row_idx] == self.e1_token_id).nonzero(as_tuple=False)
-                e2_positions = (input_ids[row_idx] == self.e2_token_id).nonzero(as_tuple=False)
-                e1_state = hidden[row_idx, e1_positions[0].item()] if e1_positions.numel() > 0 else mean_pooled[row_idx]
-                e2_state = hidden[row_idx, e2_positions[0].item()] if e2_positions.numel() > 0 else mean_pooled[row_idx]
+                if self.marker_style == "generic":
+                    e1_positions = (input_ids[row_idx] == self.e1_token_id).nonzero(as_tuple=False)
+                    e2_positions = (input_ids[row_idx] == self.e2_token_id).nonzero(as_tuple=False)
+                    e1_state = hidden[row_idx, e1_positions[0].item()] if e1_positions.numel() > 0 else mean_pooled[row_idx]
+                    e2_state = hidden[row_idx, e2_positions[0].item()] if e2_positions.numel() > 0 else mean_pooled[row_idx]
+                else:
+                    marker_positions = [
+                        pos for pos, tok_id in enumerate(input_ids[row_idx].tolist())
+                        if tok_id in self.marker_open_token_ids
+                    ]
+                    e1_state = hidden[row_idx, marker_positions[0]] if len(marker_positions) > 0 else mean_pooled[row_idx]
+                    e2_state = hidden[row_idx, marker_positions[1]] if len(marker_positions) > 1 else mean_pooled[row_idx]
                 embs.append(torch.cat([e1_state, e2_state], dim=-1))
             embs = torch.stack(embs, dim=0)
             all_embs.append(embs.cpu())
@@ -432,8 +532,11 @@ class OpenAILLMValidator(LLMValidator):
 
 # ---------- Loading seeds ----------
 
-def load_seeds(seeds_path: Path,
-               schema: Dict[str, List[List[str]]]) -> List[SeedExample]:
+def load_seeds(
+    seeds_path: Path,
+    schema: Dict[str, List[List[str]]],
+    marker_style: str = "generic",
+) -> List[SeedExample]:
     data = load_seeds_data(seeds_path)
     seeds: List[SeedExample] = []
 
@@ -454,8 +557,8 @@ def load_seeds(seeds_path: Path,
                 sent,
                 span1,
                 span2,
-                e1_tag="E1",
-                e2_tag="E2"
+                e1_tag=resolve_marker_tag(e1["type"], "E1", marker_style),
+                e2_tag=resolve_marker_tag(e2["type"], "E2", marker_style),
             )
             seeds.append(
                 SeedExample(
@@ -476,6 +579,7 @@ def load_seeds(seeds_path: Path,
 def build_relation_candidate_pairs(
     corpus_path: Path,
     schema: Dict[str, List[List[str]]],
+    marker_style: str = "generic",
 ) -> List[CandidatePair]:
     """
     For each sentence, generate all entity pairs whose types match at least
@@ -520,8 +624,8 @@ def build_relation_candidate_pairs(
                     text,
                     (e1.start, e1.end),
                     (e2.start, e2.end),
-                    e1_tag="E1",
-                    e2_tag="E2",
+                    e1_tag=resolve_marker_tag(e1.type, "E1", marker_style),
+                    e2_tag=resolve_marker_tag(e2.type, "E2", marker_style),
                 )
                 candidate = CandidatePair(
                         paper_id=paper_id,
@@ -865,6 +969,30 @@ def llm_filter_candidates(
     return filtered
 
 
+def llm_filter_and_stream_yes(
+    candidates: List[dict],
+    validator: LLMValidator,
+    output_path: Path,
+    max_calls: Optional[int] = None,
+) -> int:
+    """
+    Validate candidates with LLM and stream YES-labeled examples to disk immediately.
+    Returns number of written YES records.
+    """
+    to_process = candidates if max_calls is None else candidates[:max_calls]
+    written = 0
+    with output_path.open("w", encoding="utf8") as f:
+        for ex in tqdm(to_process, desc="LLM validating"):
+            verdict = validator.validate(ex)
+            ex_llm = dict(ex)
+            ex_llm.update(verdict)
+            if ex_llm.get("llm_label") == "YES":
+                f.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
+                f.flush()
+                written += 1
+    return written
+
+
 # ---------- Main CLI ----------
 
 def main():
@@ -879,6 +1007,8 @@ def main():
                         help="Path to seeds file (.json or .py) with seed examples per relation.")
     parser.add_argument("--model-name", type=str, default="allenai/scibert_scivocab_uncased",
                         help="HF model name for embeddings.")
+    parser.add_argument("--tokenizer-name", type=str, default=None,
+                        help="Optional tokenizer model id/path when model repo lacks tokenizer assets.")
     parser.add_argument("--similarity-threshold", type=float, default=0.75,
                         help="Cosine similarity threshold to accept a candidate.")
     parser.add_argument("--batch-size", type=int, default=32,
@@ -902,6 +1032,12 @@ def main():
                         help="Weight for relational context similarity (default: 0.4).")
     parser.add_argument("--w-sentence", type=float, default=0.3,
                         help="Weight for full sentence similarity (default: 0.3).")
+    parser.add_argument(
+        "--marker-style",
+        choices=["generic", "type-specific"],
+        default="generic",
+        help="Marker format: generic (<E1>/<E2>) or type-specific (<BIOTIC_ENTITY>/...).",
+    )
 
     args = parser.parse_args()
 
@@ -913,13 +1049,23 @@ def main():
                      f"sentence={args.w_sentence})")
 
     schema = load_schema(args.schema_json)
-    seeds = load_seeds(args.seeds_json, schema)
+    seeds = load_seeds(args.seeds_json, schema, marker_style=args.marker_style)
     print(f"Loaded {len(seeds)} seed examples.")
 
-    candidates = build_relation_candidate_pairs(args.corpus_jsonl, schema)
+    candidates = build_relation_candidate_pairs(
+        args.corpus_jsonl,
+        schema,
+        marker_style=args.marker_style,
+    )
     print(f"Built {len(candidates)} candidate pairs from corpus.")
     print(candidates[0])
-    embedder = SentenceEmbedder(args.model_name)
+    schema_entity_types = collect_schema_entity_types(schema)
+    embedder = SentenceEmbedder(
+        args.model_name,
+        tokenizer_name=args.tokenizer_name,
+        marker_style=args.marker_style,
+        marker_entity_types=schema_entity_types,
+    )
 
     print(f"Using multiview weights: structural={args.w_structural}, "
           f"relational={args.w_relational}, sentence={args.w_sentence}")
@@ -943,12 +1089,14 @@ def main():
             raise RuntimeError("openai package missing or misconfigured. Install it or plug your own LLM client.")
         print(f"Running LLM validation with model={args.llm_model} ...")
         validator = OpenAILLMValidator(model_name=args.llm_model)
-        mined = llm_filter_candidates(
+        written = llm_filter_and_stream_yes(
             candidates=mined,
             validator=validator,
+            output_path=args.output_jsonl,
             max_calls=args.llm_max_calls,
         )
-        mined = [ex for ex in mined if ex.get("llm_label") == "YES"]
+        print(f"Wrote {written} records to {args.output_jsonl}")
+        return
 
     with args.output_jsonl.open("w", encoding="utf8") as f:
         for rec in mined:
