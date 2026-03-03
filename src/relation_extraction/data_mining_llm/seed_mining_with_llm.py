@@ -969,20 +969,56 @@ def llm_filter_candidates(
     return filtered
 
 
+def _save_checkpoint(path: Path, payload: dict) -> None:
+    tmp_path = Path(str(path) + ".tmp")
+    with tmp_path.open("w", encoding="utf8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+
+def _load_checkpoint(path: Path) -> dict:
+    with path.open("r", encoding="utf8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Checkpoint at {path} is not a JSON object.")
+    return payload
+
+
 def llm_filter_and_stream_yes(
     candidates: List[dict],
     validator: LLMValidator,
     output_path: Path,
     max_calls: Optional[int] = None,
+    checkpoint_path: Optional[Path] = None,
+    resume: bool = False,
+    checkpoint_every: int = 1,
 ) -> int:
     """
     Validate candidates with LLM and stream YES-labeled examples to disk immediately.
     Returns number of written YES records.
     """
     to_process = candidates if max_calls is None else candidates[:max_calls]
+    total = len(to_process)
+
+    start_idx = 0
     written = 0
-    with output_path.open("w", encoding="utf8") as f:
-        for ex in tqdm(to_process, desc="LLM validating"):
+    file_mode = "w"
+    if resume and checkpoint_path is not None and checkpoint_path.exists():
+        state = _load_checkpoint(checkpoint_path)
+        start_idx = int(state.get("next_index", 0))
+        written = int(state.get("written_yes", 0))
+        start_idx = max(0, min(start_idx, total))
+        file_mode = "a"
+        print(f"Resuming LLM validation from index {start_idx}/{total} "
+              f"(already wrote {written} YES examples).")
+
+    if start_idx >= total:
+        print("Checkpoint indicates all selected candidates are already processed.")
+        return written
+
+    with output_path.open(file_mode, encoding="utf8") as f:
+        for idx in tqdm(range(start_idx, total), desc="LLM validating"):
+            ex = to_process[idx]
             verdict = validator.validate(ex)
             ex_llm = dict(ex)
             ex_llm.update(verdict)
@@ -990,6 +1026,17 @@ def llm_filter_and_stream_yes(
                 f.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
                 f.flush()
                 written += 1
+            if checkpoint_path is not None:
+                processed = idx + 1
+                if checkpoint_every <= 1 or (processed % checkpoint_every == 0) or processed == total:
+                    _save_checkpoint(
+                        checkpoint_path,
+                        {
+                            "next_index": processed,
+                            "written_yes": written,
+                            "total": total,
+                        },
+                    )
     return written
 
 
@@ -1024,6 +1071,12 @@ def main():
                         help="Optional base URL for self-hosted OpenAI-compatible endpoint.")
     parser.add_argument("--llm-max-calls", type=int, default=None,
                         help="Optional cap on number of LLM calls (for debugging / cost control).")
+    parser.add_argument("--checkpoint-path", type=Path, default=None,
+                        help="Path to JSON checkpoint file for resumable LLM validation.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume LLM validation from checkpoint if available.")
+    parser.add_argument("--checkpoint-every", type=int, default=1,
+                        help="Save checkpoint every N processed candidates (default: 1).")
 
     # Multi-view similarity weights
     parser.add_argument("--w-structural", type=float, default=0.3,
@@ -1087,13 +1140,20 @@ def main():
     if args.use_llm:
         if OpenAI is None and args.llm_base_url is None:
             raise RuntimeError("openai package missing or misconfigured. Install it or plug your own LLM client.")
+        if args.checkpoint_every < 1:
+            parser.error(f"--checkpoint-every must be >= 1, got {args.checkpoint_every}")
+        checkpoint_path = args.checkpoint_path or Path(str(args.output_jsonl) + ".ckpt.json")
         print(f"Running LLM validation with model={args.llm_model} ...")
+        print(f"Checkpoint file: {checkpoint_path} (resume={args.resume}, every={args.checkpoint_every})")
         validator = OpenAILLMValidator(model_name=args.llm_model)
         written = llm_filter_and_stream_yes(
             candidates=mined,
             validator=validator,
             output_path=args.output_jsonl,
             max_calls=args.llm_max_calls,
+            checkpoint_path=checkpoint_path,
+            resume=args.resume,
+            checkpoint_every=args.checkpoint_every,
         )
         print(f"Wrote {written} records to {args.output_jsonl}")
         return
