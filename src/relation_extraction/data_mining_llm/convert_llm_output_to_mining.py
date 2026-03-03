@@ -31,6 +31,9 @@ def convert_file(input_path: str, output_path: str) -> None:
                         ent_type = ent["type"]
                         start = ent["start_char"]
                         end = ent["end_char"]
+                        tier = ent["tier"]
+                        uncertain = ent["uncertain"]
+                        concept_text = ent["concept_text"]
 
                         entities_out.append(
                             {
@@ -39,9 +42,13 @@ def convert_file(input_path: str, output_path: str) -> None:
                                 "type": ent_type,
                                 "start": start,
                                 "end": end,
+                                "tier": tier,
+                                "uncertain": uncertain,
+                                "concept_text": concept_text,
                             }
                         )
                     except Exception as e:
+                        print(ent)
                         print(
                             f"[WARNING] Skipping entity in paper {paper_id}, "
                             f"sentence {sent_id} due to error: {e}",
