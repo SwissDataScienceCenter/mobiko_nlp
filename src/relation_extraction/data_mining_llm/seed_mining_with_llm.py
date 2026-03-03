@@ -1,4 +1,5 @@
 import argparse
+import ast
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,7 +110,90 @@ class CandidatePair:
 
 def load_json(path: Path):
     with path.open("r", encoding="utf8") as f:
+        print(f"Loading JSON from {path}...")
         return json.load(f)
+
+
+def load_schema(path: Path) -> Dict[str, List[List[str]]]:
+    """
+    Load relation schema from JSON or Python dict literal.
+    Supported Python forms:
+    - bare dict literal file
+    - assignment to `schema` or `SCHEMA`
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return load_json(path)
+
+    if suffix != ".py":
+        raise ValueError(f"Unsupported schema format: {path}. Use .json or .py")
+
+    text = path.read_text(encoding="utf8")
+    print(f"Loading Python schema from {path}...")
+    tree = ast.parse(text, filename=str(path), mode="exec")
+
+    schema_obj = None
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {"schema", "SCHEMA"}:
+                    schema_obj = ast.literal_eval(node.value)
+                    break
+        if schema_obj is not None:
+            break
+
+    if schema_obj is None and len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+        schema_obj = ast.literal_eval(tree.body[0].value)
+
+    if not isinstance(schema_obj, dict):
+        raise ValueError(
+            f"Could not read schema dict from {path}. "
+            "Expected dict literal or assignment to `schema`/`SCHEMA`."
+        )
+
+    return schema_obj
+
+
+def load_seeds_data(path: Path) -> Dict[str, List[dict]]:
+    """
+    Load seeds from JSON or Python dict literal.
+    Supported Python forms:
+    - bare dict literal file
+    - assignment to `seeds` or `SEEDS`
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return load_json(path)
+
+    if suffix != ".py":
+        raise ValueError(f"Unsupported seeds format: {path}. Use .json or .py")
+
+    text = path.read_text(encoding="utf8")
+    print(f"Loading Python seeds from {path}...")
+    tree = ast.parse(text, filename=str(path), mode="exec")
+
+    seeds_obj = None
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {"seeds", "SEEDS"}:
+                    seeds_obj = ast.literal_eval(node.value)
+                    break
+        if seeds_obj is not None:
+            break
+
+    if seeds_obj is None and len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+        seeds_obj = ast.literal_eval(tree.body[0].value)
+
+    if not isinstance(seeds_obj, dict):
+        raise ValueError(
+            f"Could not read seeds dict from {path}. "
+            "Expected dict literal or assignment to `seeds`/`SEEDS`."
+        )
+
+    return seeds_obj
 
 
 def load_jsonl(path: Path) -> Iterable[dict]:
@@ -160,13 +244,22 @@ def find_first_span(sentence: str, phrase: str) -> Optional[Tuple[int, int]]:
 
 class SentenceEmbedder(nn.Module):
     """
-    Simple wrapper around a HF encoder with mean pooling.
+    Wrapper around a HF encoder using entity-marker pooling.
+    Returns [h_<E1>; h_<E2>] for each input text.
     """
 
     def __init__(self, model_name: str, device: Optional[str] = None):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
+        marker_tokens = ["<E1>", "</E1>", "<E2>", "</E2>"]
+        vocab = self.tokenizer.get_vocab()
+        missing = [tok for tok in marker_tokens if tok not in vocab]
+        if missing:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": missing})
+            self.encoder.resize_token_embeddings(len(self.tokenizer))
+        self.e1_token_id = self.tokenizer.convert_tokens_to_ids("<E1>")
+        self.e2_token_id = self.tokenizer.convert_tokens_to_ids("<E2>")
         self.encoder.eval()
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -186,10 +279,21 @@ class SentenceEmbedder(nn.Module):
                 return_tensors="pt"
             ).to(self.device)
             outputs = self.encoder(**encoded)
+            hidden = outputs.last_hidden_state
+            input_ids = encoded["input_ids"]
             attn_mask = encoded["attention_mask"].unsqueeze(-1)
-            sum_embs = (outputs.last_hidden_state * attn_mask).sum(dim=1)
-            lengths = attn_mask.sum(dim=1).clamp(min=1)
-            embs = sum_embs / lengths
+            mean_pooled = (hidden * attn_mask).sum(dim=1) / attn_mask.sum(dim=1).clamp(min=1)
+
+            # Entity-marker pooling: concatenate hidden states at <E1> and <E2>.
+            # Fallback to mean pooled state when markers are absent.
+            embs = []
+            for row_idx in range(hidden.size(0)):
+                e1_positions = (input_ids[row_idx] == self.e1_token_id).nonzero(as_tuple=False)
+                e2_positions = (input_ids[row_idx] == self.e2_token_id).nonzero(as_tuple=False)
+                e1_state = hidden[row_idx, e1_positions[0].item()] if e1_positions.numel() > 0 else mean_pooled[row_idx]
+                e2_state = hidden[row_idx, e2_positions[0].item()] if e2_positions.numel() > 0 else mean_pooled[row_idx]
+                embs.append(torch.cat([e1_state, e2_state], dim=-1))
+            embs = torch.stack(embs, dim=0)
             all_embs.append(embs.cpu())
         return torch.cat(all_embs, dim=0)
 
@@ -294,7 +398,7 @@ class OpenAILLMValidator(LLMValidator):
             content = remove_thinking_blocks(content)
             print('content:', content)
         except Exception as e:
-            # Fail closed: label as NO if LLM call fails
+            #Fail closed: label as NO if LLM call fails
             return {
                 "llm_label": "NO",
                 "llm_reason": f"LLM call failed: {e}",
@@ -330,12 +434,12 @@ class OpenAILLMValidator(LLMValidator):
 
 def load_seeds(seeds_path: Path,
                schema: Dict[str, List[List[str]]]) -> List[SeedExample]:
-    data = load_json(seeds_path)
+    data = load_seeds_data(seeds_path)
     seeds: List[SeedExample] = []
 
     for rel, examples in data.items():
         if rel not in schema:
-            print(f"Warning: relation {rel} in seeds.json not in schema.json, skipping.")
+            print(f"Warning: relation {rel} in seeds file not in schema, skipping.")
             continue
         for ex in examples:
             sent = ex["sentence"]
@@ -441,6 +545,53 @@ def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a_norm @ b_norm.T
 
 
+def build_triplet_text(e1_text: str, e1_type: str, relation: str,
+                       e2_text: str, e2_type: str) -> str:
+    """Build a structural triplet string for embedding.
+
+    Example: "alpine plant species [BIOTIC ENTITY] HAS_PROPERTY perennial [TEMPORAL PROPERTY]"
+    """
+    return f"{e1_text} [{e1_type}] {relation} {e2_text} [{e2_type}]"
+
+
+def extract_relational_context(sentence: str,
+                               e1_text: str, e1_type: str,
+                               e2_text: str, e2_type: str,
+                               e1_start: Optional[int] = None,
+                               e1_end: Optional[int] = None,
+                               e2_start: Optional[int] = None,
+                               e2_end: Optional[int] = None) -> str:
+    """Extract text between two entities, replacing entity text with type markers.
+
+    Returns e.g. "[BIOTIC ENTITY] are found in [SPATIAL ENTITY]"
+    Falls back to "[e1_type] <full sentence> [e2_type]" if spans can't be located.
+    """
+    # Determine spans: use offsets if provided, otherwise string search
+    if e1_start is not None and e1_end is not None:
+        span1 = (e1_start, e1_end)
+    else:
+        span1 = find_first_span(sentence, e1_text)
+
+    if e2_start is not None and e2_end is not None:
+        span2 = (e2_start, e2_end)
+    else:
+        span2 = find_first_span(sentence, e2_text)
+
+    if span1 is None or span2 is None:
+        return f"[{e1_type}] {sentence} [{e2_type}]"
+
+    # Order by position in sentence
+    if span1[0] <= span2[0]:
+        first_type, second_type = e1_type, e2_type
+        between = sentence[span1[1]:span2[0]]
+    else:
+        first_type, second_type = e2_type, e1_type
+        between = sentence[span2[1]:span1[0]]
+
+    between = between.strip()
+    return f"[{first_type}] {between} [{second_type}]"
+
+
 def mine_candidates(
     embedder: SentenceEmbedder,
     seeds: List[SeedExample],
@@ -521,6 +672,169 @@ def mine_candidates(
     return mined
 
 
+def mine_candidates_multiview(
+    embedder: SentenceEmbedder,
+    seeds: List[SeedExample],
+    candidates: List[CandidatePair],
+    similarity_threshold: float,
+    batch_size: int = 32,
+    w_structural: float = 0.3,
+    w_relational: float = 0.4,
+    w_sentence: float = 0.3,
+) -> List[dict]:
+    """
+    Multi-view hybrid similarity mining.
+
+    Combines 3 complementary signals:
+      1. Structural triplet: embeds "{e1} [TYPE] RELATION {e2} [TYPE]"
+      2. Relational context: embeds text between entities with type markers
+      3. Full sentence: embeds the whole marked sentence (same as original)
+
+    Final score = w_structural*sim1 + w_relational*sim2 + w_sentence*sim3
+    """
+    # --- group seeds by relation ---
+    seeds_by_relation: Dict[str, List[SeedExample]] = {}
+    for s in seeds:
+        seeds_by_relation.setdefault(s.relation, []).append(s)
+
+    # --- pre-embed seeds (3 views, per relation) ---
+    seed_sentence_embs: Dict[str, torch.Tensor] = {}
+    seed_structural_embs: Dict[str, torch.Tensor] = {}
+    seed_relational_embs: Dict[str, torch.Tensor] = {}
+
+    for rel, rel_seeds in seeds_by_relation.items():
+        # Sentence view
+        seed_sentence_embs[rel] = embedder.encode(
+            [s.marked for s in rel_seeds]
+        )
+        # Structural triplet view
+        seed_structural_embs[rel] = embedder.encode(
+            [build_triplet_text(s.e1_text, s.e1_type, rel, s.e2_text, s.e2_type)
+             for s in rel_seeds]
+        )
+        # Relational context view
+        seed_relational_embs[rel] = embedder.encode(
+            [extract_relational_context(s.sentence, s.e1_text, s.e1_type,
+                                        s.e2_text, s.e2_type)
+             for s in rel_seeds]
+        )
+
+    mined: List[dict] = []
+
+    # --- process candidates in batches ---
+    for i in tqdm(range(0, len(candidates), batch_size), desc="Mining candidates (multiview)"):
+        batch = candidates[i:i + batch_size]
+
+        # -- Sentence view embeddings --
+        cand_sentence_embs = embedder.encode(
+            [c.marked for c in batch], batch_size=batch_size
+        )
+
+        # -- Relational context view embeddings --
+        cand_context_texts = [
+            extract_relational_context(
+                c.sentence, c.e1.text, c.e1.type, c.e2.text, c.e2.type,
+                c.e1.start, c.e1.end, c.e2.start, c.e2.end,
+            )
+            for c in batch
+        ]
+        cand_context_embs = embedder.encode(cand_context_texts, batch_size=batch_size)
+
+        # -- Structural triplet view embeddings --
+        # Build two triplets per (candidate, relation_candidate): forward and reverse
+        triplet_texts: List[str] = []
+        # (batch_idx, rel) -> (fwd_idx, rev_idx) in triplet_texts
+        triplet_map: Dict[Tuple[int, str], Tuple[int, int]] = {}
+        for idx, cand in enumerate(batch):
+            for rel in cand.relation_candidates:
+                fwd_idx = len(triplet_texts)
+                triplet_texts.append(
+                    build_triplet_text(cand.e1.text, cand.e1.type, rel,
+                                       cand.e2.text, cand.e2.type)
+                )
+                rev_idx = len(triplet_texts)
+                triplet_texts.append(
+                    build_triplet_text(cand.e2.text, cand.e2.type, rel,
+                                       cand.e1.text, cand.e1.type)
+                )
+                triplet_map[(idx, rel)] = (fwd_idx, rev_idx)
+        cand_triplet_embs = embedder.encode(triplet_texts, batch_size=batch_size) if triplet_texts else None
+
+        # -- Score each candidate --
+        for idx, cand in enumerate(batch):
+            best_rel = None
+            best_score = -1.0
+            best_sub_scores = (0.0, 0.0, 0.0)
+
+            for rel in cand.relation_candidates:
+                if rel not in seed_sentence_embs:
+                    continue
+
+                # Structural similarity (max of forward and reverse triplet)
+                if cand_triplet_embs is not None and (idx, rel) in triplet_map:
+                    fwd_i, rev_i = triplet_map[(idx, rel)]
+                    fwd_emb = cand_triplet_embs[fwd_i].unsqueeze(0)
+                    rev_emb = cand_triplet_embs[rev_i].unsqueeze(0)
+                    sim_fwd = cosine_sim(fwd_emb, seed_structural_embs[rel]).max().item()
+                    sim_rev = cosine_sim(rev_emb, seed_structural_embs[rel]).max().item()
+                    sim_structural = max(sim_fwd, sim_rev)
+                else:
+                    sim_structural = 0.0
+
+                # Relational context similarity
+                ctx_emb = cand_context_embs[idx].unsqueeze(0)
+                sim_relational = cosine_sim(ctx_emb, seed_relational_embs[rel]).max().item()
+
+                # Sentence similarity
+                sent_emb = cand_sentence_embs[idx].unsqueeze(0)
+                sim_sentence = cosine_sim(sent_emb, seed_sentence_embs[rel]).max().item()
+
+                # Combined score
+                final_score = (w_structural * sim_structural
+                               + w_relational * sim_relational
+                               + w_sentence * sim_sentence)
+
+                if final_score > best_score:
+                    best_score = final_score
+                    best_rel = rel
+                    best_sub_scores = (sim_structural, sim_relational, sim_sentence)
+
+            if best_rel is None or best_score < similarity_threshold:
+                continue
+
+            if sim_relational < 0.8:
+                print(f"Low relational similarity for candidate {cand.paper_id}:{cand.sent_id} rel={best_rel} score={best_score:.4f} (struct={best_sub_scores[0]:.4f}, rel={best_sub_scores[1]:.4f}, sent={best_sub_scores[2]:.4f})")
+                continue
+
+            mined.append(
+                {
+                    "paper_id": cand.paper_id,
+                    "sent_id": cand.sent_id,
+                    "relation": best_rel,
+                    "similarity": best_score,
+                    "sim_structural": best_sub_scores[0],
+                    "sim_relational": best_sub_scores[1],
+                    "sim_sentence": best_sub_scores[2],
+                    "sentence": cand.sentence,
+                    "e1": {
+                        "text": cand.e1.text,
+                        "type": cand.e1.type,
+                        "start": cand.e1.start,
+                        "end": cand.e1.end,
+                    },
+                    "e2": {
+                        "text": cand.e2.text,
+                        "type": cand.e2.type,
+                        "start": cand.e2.start,
+                        "end": cand.e2.end,
+                    },
+                    "marked": cand.marked,
+                }
+            )
+
+    return mined
+
+
 # ---------- LLM filtering step ----------
 
 def llm_filter_candidates(
@@ -560,9 +874,9 @@ def main():
     parser.add_argument("--corpus-jsonl", type=Path, required=True,
                         help="Path to corpus sentences JSONL with entities.")
     parser.add_argument("--schema-json", type=Path, required=True,
-                        help="Path to schema.json describing allowed type pairs per relation.")
+                        help="Path to schema file (.json or .py) describing allowed type pairs per relation.")
     parser.add_argument("--seeds-json", type=Path, required=True,
-                        help="Path to seeds.json with seed examples per relation.")
+                        help="Path to seeds file (.json or .py) with seed examples per relation.")
     parser.add_argument("--model-name", type=str, default="allenai/scibert_scivocab_uncased",
                         help="HF model name for embeddings.")
     parser.add_argument("--similarity-threshold", type=float, default=0.75,
@@ -581,9 +895,24 @@ def main():
     parser.add_argument("--llm-max-calls", type=int, default=None,
                         help="Optional cap on number of LLM calls (for debugging / cost control).")
 
+    # Multi-view similarity weights
+    parser.add_argument("--w-structural", type=float, default=0.3,
+                        help="Weight for structural triplet similarity (default: 0.3).")
+    parser.add_argument("--w-relational", type=float, default=0.4,
+                        help="Weight for relational context similarity (default: 0.4).")
+    parser.add_argument("--w-sentence", type=float, default=0.3,
+                        help="Weight for full sentence similarity (default: 0.3).")
+
     args = parser.parse_args()
 
-    schema = load_json(args.schema_json)
+    # Validate weights sum to 1.0
+    weight_sum = args.w_structural + args.w_relational + args.w_sentence
+    if abs(weight_sum - 1.0) > 1e-6:
+        parser.error(f"Weights must sum to 1.0, got {weight_sum:.4f} "
+                     f"(structural={args.w_structural}, relational={args.w_relational}, "
+                     f"sentence={args.w_sentence})")
+
+    schema = load_schema(args.schema_json)
     seeds = load_seeds(args.seeds_json, schema)
     print(f"Loaded {len(seeds)} seed examples.")
 
@@ -592,15 +921,21 @@ def main():
     print(candidates[0])
     embedder = SentenceEmbedder(args.model_name)
 
-    mined = mine_candidates(
+    print(f"Using multiview weights: structural={args.w_structural}, "
+          f"relational={args.w_relational}, sentence={args.w_sentence}")
+    mined = mine_candidates_multiview(
         embedder=embedder,
         seeds=seeds,
         candidates=candidates,
         similarity_threshold=args.similarity_threshold,
         batch_size=args.batch_size,
+        w_structural=args.w_structural,
+        w_relational=args.w_relational,
+        w_sentence=args.w_sentence,
     )
     print(f"Mined {len(mined)} candidates above similarity {args.similarity_threshold}.")
-    print(mined[0])
+    if mined:
+        print(mined[0])
 
     # Optional LLM validation
     if args.use_llm:
