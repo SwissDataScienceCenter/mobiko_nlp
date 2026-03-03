@@ -269,7 +269,7 @@
       {
           "sentence": "Seasonal precipitation patterns are part of regional climate regimes.",
           "e1": {
-              "text": "seasonal precipitation patterns",
+              "text": "Seasonal precipitation patterns",
               "type": "COLLECTIVE ABIOTIC ENTITY"
           },
           "e2": {
@@ -370,7 +370,7 @@
       {
           "sentence": "Woolly mammoths persisted as a distinct species during the Late Pleistocene.",
           "e1": {
-              "text": "woolly mammoths",
+              "text": "Woolly mammoths",
               "type": "BIOTIC ENTITY"
           },
           "e2": {
@@ -559,7 +559,7 @@
       {
           "sentence": "Selective logging is reducing species richness in montane forests.",
           "e1": {
-              "text": "selective logging",
+              "text": "Selective logging",
               "type": "ANTHROPOGENIC PROCESS"
           },
           "e2": {
@@ -581,7 +581,7 @@
       {
           "sentence": "Wildlife migration strongly influences tourism revenue in mountain regions.",
           "e1": {
-              "text": "wildlife migration",
+              "text": "Wildlife migration",
               "type": "BIOTIC PROCESS"
           },
           "e2": {
@@ -592,7 +592,7 @@
       {
           "sentence": "Vegetation growth alters soil moisture levels in alpine ecosystems.",
           "e1": {
-              "text": "vegetation growth",
+              "text": "Vegetation growth",
               "type": "BIOTIC PROCESS"
           },
           "e2": {
@@ -607,14 +607,14 @@
         "type": "BIOTIC PROCESS"
       },
       "e2": {
-        "text": "species richness",
+        "text": "richness",
         "type": "BIOTIC PROPERTY"
       }
     },
     {
       "sentence": "Environmental change is causing economic challenges for mountain communities reliant on agriculture and tourism.",
       "e1": {
-        "text": "environmental change",
+        "text": "Environmental change",
         "type": "ABIOTIC PROCESS"
       },
       "e2": {
@@ -702,7 +702,7 @@
       {
           "sentence": "Infrastructure expansion is reshaping rural settlements in mountain valleys.",
           "e1": {
-              "text": "infrastructure expansion",
+              "text": "Infrastructure expansion",
               "type": "ANTHROPOGENIC PROCESS"
           },
           "e2": {
@@ -713,7 +713,7 @@
       {
           "sentence": "River damming has transformed downstream river systems.",
           "e1": {
-              "text": "river damming",
+              "text": "River damming",
               "type": "ANTHROPOGENIC PROCESS"
           },
           "e2": {
@@ -746,7 +746,7 @@
     {
       "sentence": "Nutrient enrichment from glacial meltwater has been shown to enhance downstream ecosystems.",
       "e1": {
-        "text": "nutrient enrichment",
+        "text": "Nutrient enrichment",
         "type": "BIOTIC PROCESS"
       },
       "e2": {
@@ -768,7 +768,7 @@
       {
           "sentence": "Burrowing by small mammals subtly reshapes sediment layers over time.",
           "e1": {
-              "text": "burrowing by small mammals",
+              "text": "Burrowing by small mammals",
               "type": "BIOTIC PROCESS"
           },
           "e2": {
@@ -779,7 +779,7 @@
       {
           "sentence": "Predation pressure reshapes small mammal populations in alpine valleys.",
           "e1": {
-              "text": "predation pressure",
+              "text": "Predation pressure",
               "type": "BIOTIC PROCESS"
           },
           "e2": {
