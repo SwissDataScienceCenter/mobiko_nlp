@@ -82,6 +82,9 @@ class Entity:
     type: str
     start: int
     end: int
+    tier: Optional[str] = None
+    uncertainty: Optional[float] = None
+    concept_text: Optional[str] = None
 
 
 @dataclass
@@ -107,6 +110,21 @@ class CandidatePair:
 
 
 # ---------- Utility functions ----------
+
+def entity_to_output_dict(entity: Entity) -> Dict[str, object]:
+    out = {
+        "text": entity.text,
+        "type": entity.type,
+        "start": entity.start,
+        "end": entity.end,
+    }
+    if entity.tier is not None:
+        out["tier"] = entity.tier
+    if entity.uncertainty is not None:
+        out["uncertainty"] = entity.uncertainty
+    if entity.concept_text is not None:
+        out["concept_text"] = entity.concept_text
+    return out
 
 def normalize_entity_type_to_tag(entity_type: str) -> str:
     """
@@ -606,6 +624,9 @@ def build_relation_candidate_pairs(
                 type=e["type"],
                 start=e["start"],
                 end=e["end"],
+                tier=e.get("tier"),
+                uncertainty=e.get("uncertainty"),
+                concept_text=e.get("concept_text"),
             )
             for e in ents_raw
         ]
@@ -758,16 +779,10 @@ def mine_candidates(
                     "similarity": best_score,
                     "sentence": cand.sentence,
                     "e1": {
-                        "text": cand.e1.text,
-                        "type": cand.e1.type,
-                        "start": cand.e1.start,
-                        "end": cand.e1.end,
+                        **entity_to_output_dict(cand.e1),
                     },
                     "e2": {
-                        "text": cand.e2.text,
-                        "type": cand.e2.type,
-                        "start": cand.e2.start,
-                        "end": cand.e2.end,
+                        **entity_to_output_dict(cand.e2),
                     },
                     "marked": cand.marked,
                 }
@@ -921,16 +936,10 @@ def mine_candidates_multiview(
                     "sim_sentence": best_sub_scores[2],
                     "sentence": cand.sentence,
                     "e1": {
-                        "text": cand.e1.text,
-                        "type": cand.e1.type,
-                        "start": cand.e1.start,
-                        "end": cand.e1.end,
+                        **entity_to_output_dict(cand.e1),
                     },
                     "e2": {
-                        "text": cand.e2.text,
-                        "type": cand.e2.type,
-                        "start": cand.e2.start,
-                        "end": cand.e2.end,
+                        **entity_to_output_dict(cand.e2),
                     },
                     "marked": cand.marked,
                 }
