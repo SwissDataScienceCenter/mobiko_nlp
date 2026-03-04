@@ -61,7 +61,7 @@ Hard constraints (must obey):
 - Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
 - For every item in accepted and missing: sentence[start_char:end_char] MUST exactly equal "text".
 - Do NOT output entities whose exact substring cannot be found in the sentence.
-- "missing" is ONLY for entities explicitly present in the sentence but absent from the candidate list.
+- "missing" should include ONLY for entities explicitly present in the sentence but absent from the candidate list.
 - If an entity is implied by the sentence but not explicitly mentioned as a substring, put it in rejected with reason "implied_not_explicit".
 - If a candidate is close but not exact (e.g., plural/singular, derivation), choose the closest explicit substring that exists in the sentence (with correct offsets), and optionally note the normalization in "note".
 - If you cannot find an exact substring for a proposed entity, you must reject it.
@@ -84,7 +84,7 @@ SYSTEM_PROMPT_FEW_SHOT = f"""You are a careful biodiversity information extracto
 Given ONE sentence and a list of candidate noun phrases, decide:
 - which candidates are entities and assign a TYPE from the provided schema,
 - which candidates are not relevant,
-- and whether the sentence contains additional entities that are missing.
+- and whether the sentence contains additional entities that are missing in the list of candidates.
 
 Provided schema has entities and their definitions in parentheses. Use ONLY the entity names for typing.
 
@@ -106,7 +106,7 @@ Hard constraints (must obey):
 - Spans use 0-based indices [start, end) with end exclusive. Expand to minimal full NP when appropriate.
 - For every item in accepted and missing: sentence[start_char:end_char] MUST exactly equal "text".
 - Do NOT output entities whose exact substring cannot be found in the sentence.
-- "missing" is ONLY for entities explicitly present in the sentence but absent from the candidate list.
+- "missing" should include ONLY for entities explicitly present in the sentence but absent from the candidate list.
 - If an entity is implied by the sentence but not explicitly mentioned as a substring, put it in rejected with reason "implied_not_explicit".
 - If a candidate is close but not exact (e.g., plural/singular, derivation), choose the closest explicit substring that exists in the sentence (with correct offsets), and optionally note the normalization in "note".
 - If you cannot find an exact substring for a proposed entity, you must reject it.
@@ -120,17 +120,16 @@ EXAMPLES:
 "candidates": [
     {{"text": "Amazon rainforest", "start_char": 4, "end_char": 21}},
     {{"text": "temperature", "start_char": 33, "end_char": 53}},
-    {{"text": "decade", "start_char": 83, "end_char": 89}}
 ],
 "response": {{
     "accepted": [
         {{"text": "Amazon rainforest", "type": "SPATIAL ENTITY", "start_char": 4, "end_char": 21}},
         {{"text": "increase in temperature", "type": "ABIOTIC PROCESS", "start_char": 33, "end_char": 53}}
+        
     ],
-    "rejected": [
-        {{"text": "decade", "reason": "Not a biodiversity entity"}}
-    ],
-    "missing": [],
+    "rejected": [],
+    "missing": [{{"text": "past decade", "reason": "Increase in temperature happens in a temporal entity.", "type": "TEMPORAL ENTITY", "start_char": 78, "end_char": 89}}
+],
     "notes": "temperature mapped to increase in temperature"
 }}}}
 

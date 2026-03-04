@@ -5,6 +5,7 @@ import threading
 from openai import OpenAI
 import regex as re
 import os
+from dotenv import load_dotenv
 
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 
