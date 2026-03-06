@@ -408,6 +408,14 @@ class SentenceEmbedder(nn.Module):
                         pos for pos, tok_id in enumerate(input_ids[row_idx].tolist())
                         if tok_id in self.marker_open_token_ids
                     ]
+                    if len(marker_positions) != 2:
+                        print(
+                            f"[WARNING] Expected 2 entity markers in type-specific mode, "
+                            f"found {len(marker_positions)}. "
+                            "This may indicate overlapping or nested entity spans. "
+                            "Falling back to mean pooling for missing markers.",
+                            file=sys.stderr,
+                        )
                     e1_state = hidden[row_idx, marker_positions[0]] if len(marker_positions) > 0 else mean_pooled[row_idx]
                     e2_state = hidden[row_idx, marker_positions[1]] if len(marker_positions) > 1 else mean_pooled[row_idx]
                 embs.append(torch.cat([e1_state, e2_state], dim=-1))
@@ -605,6 +613,7 @@ def build_relation_candidate_pairs(
     all possible relation labels this pair could satisfy.
     """
     pairs: List[CandidatePair] = []
+    seen: set = set()
 
     # precompute mapping from (type1,type2) -> possible relations
     type_pair_to_relations: Dict[Tuple[str, str], List[str]] = {}
@@ -657,7 +666,9 @@ def build_relation_candidate_pairs(
                         e2=e2,
                         marked=marked,
                     )
-                if candidate not in pairs:
+                key = (paper_id, sent_id, e1.start, e1.end, e2.start, e2.end)
+                if key not in seen:
+                    seen.add(key)
                     pairs.append(candidate)
     return pairs
 
@@ -800,6 +811,7 @@ def mine_candidates_multiview(
     w_structural: float = 0.3,
     w_relational: float = 0.4,
     w_sentence: float = 0.3,
+    min_relational_sim: float = 0.0,
 ) -> List[dict]:
     """
     Multi-view hybrid similarity mining.
@@ -921,8 +933,7 @@ def mine_candidates_multiview(
             if best_rel is None or best_score < similarity_threshold:
                 continue
 
-            if sim_relational < 0.8:
-                print(f"Low relational similarity for candidate {cand.paper_id}:{cand.sent_id} rel={best_rel} score={best_score:.4f} (struct={best_sub_scores[0]:.4f}, rel={best_sub_scores[1]:.4f}, sent={best_sub_scores[2]:.4f})")
+            if min_relational_sim > 0.0 and best_sub_scores[1] < min_relational_sim:
                 continue
 
             mined.append(
@@ -1001,52 +1012,68 @@ def llm_filter_and_stream_yes(
     checkpoint_path: Optional[Path] = None,
     resume: bool = False,
     checkpoint_every: int = 1,
-) -> int:
+    negatives_path: Optional[Path] = None,
+) -> Tuple[int, int]:
     """
-    Validate candidates with LLM and stream YES-labeled examples to disk immediately.
-    Returns number of written YES records.
+    Validate candidates with LLM and stream results to disk immediately.
+    YES-labeled examples go to output_path; NO-labeled hard negatives go to
+    negatives_path (if provided).
+    Returns (written_yes, written_no).
     """
     to_process = candidates if max_calls is None else candidates[:max_calls]
     total = len(to_process)
 
     start_idx = 0
-    written = 0
+    written_yes = 0
+    written_no = 0
     file_mode = "w"
     if resume and checkpoint_path is not None and checkpoint_path.exists():
         state = _load_checkpoint(checkpoint_path)
         start_idx = int(state.get("next_index", 0))
-        written = int(state.get("written_yes", 0))
+        written_yes = int(state.get("written_yes", 0))
+        written_no = int(state.get("written_no", 0))
         start_idx = max(0, min(start_idx, total))
         file_mode = "a"
         print(f"Resuming LLM validation from index {start_idx}/{total} "
-              f"(already wrote {written} YES examples).")
+              f"(already wrote {written_yes} YES, {written_no} NO examples).")
 
     if start_idx >= total:
         print("Checkpoint indicates all selected candidates are already processed.")
-        return written
+        return written_yes, written_no
 
-    with output_path.open(file_mode, encoding="utf8") as f:
-        for idx in tqdm(range(start_idx, total), desc="LLM validating"):
-            ex = to_process[idx]
-            verdict = validator.validate(ex)
-            ex_llm = dict(ex)
-            ex_llm.update(verdict)
-            if ex_llm.get("llm_label") == "YES":
-                f.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
-                f.flush()
-                written += 1
-            if checkpoint_path is not None:
-                processed = idx + 1
-                if checkpoint_every <= 1 or (processed % checkpoint_every == 0) or processed == total:
-                    _save_checkpoint(
-                        checkpoint_path,
-                        {
-                            "next_index": processed,
-                            "written_yes": written,
-                            "total": total,
-                        },
-                    )
-    return written
+    neg_ctx = negatives_path.open(file_mode, encoding="utf8") if negatives_path is not None else None
+    try:
+        with output_path.open(file_mode, encoding="utf8") as f:
+            for idx in tqdm(range(start_idx, total), desc="LLM validating"):
+                ex = to_process[idx]
+                verdict = validator.validate(ex)
+                ex_llm = dict(ex)
+                ex_llm.update(verdict)
+                label = ex_llm.get("llm_label")
+                if label == "YES":
+                    f.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
+                    f.flush()
+                    written_yes += 1
+                elif label == "NO" and neg_ctx is not None:
+                    neg_ctx.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
+                    neg_ctx.flush()
+                    written_no += 1
+                if checkpoint_path is not None:
+                    processed = idx + 1
+                    if checkpoint_every <= 1 or (processed % checkpoint_every == 0) or processed == total:
+                        _save_checkpoint(
+                            checkpoint_path,
+                            {
+                                "next_index": processed,
+                                "written_yes": written_yes,
+                                "written_no": written_no,
+                                "total": total,
+                            },
+                        )
+    finally:
+        if neg_ctx is not None:
+            neg_ctx.close()
+    return written_yes, written_no
 
 
 # ---------- Main CLI ----------
@@ -1071,6 +1098,8 @@ def main():
                         help="Batch size for embedding.")
     parser.add_argument("--output-jsonl", type=Path, required=True,
                         help="Where to write mined (and possibly LLM-filtered) candidates as JSONL.")
+    parser.add_argument("--negatives-jsonl", type=Path, default=None,
+                        help="Optional path to write LLM-rejected (NO-label) hard negatives as JSONL.")
 
     # LLM options
     parser.add_argument("--use-llm", action="store_true",
@@ -1094,6 +1123,8 @@ def main():
                         help="Weight for relational context similarity (default: 0.4).")
     parser.add_argument("--w-sentence", type=float, default=0.3,
                         help="Weight for full sentence similarity (default: 0.3).")
+    parser.add_argument("--min-relational-sim", type=float, default=0.8,
+                        help="Minimum relational context similarity to accept a candidate (default: 0.8).")
     parser.add_argument(
         "--marker-style",
         choices=["generic", "type-specific"],
@@ -1140,6 +1171,7 @@ def main():
         w_structural=args.w_structural,
         w_relational=args.w_relational,
         w_sentence=args.w_sentence,
+        min_relational_sim=args.min_relational_sim,
     )
     print(f"Mined {len(mined)} candidates above similarity {args.similarity_threshold}.")
     if mined:
@@ -1155,7 +1187,7 @@ def main():
         print(f"Running LLM validation with model={args.llm_model} ...")
         print(f"Checkpoint file: {checkpoint_path} (resume={args.resume}, every={args.checkpoint_every})")
         validator = OpenAILLMValidator(model_name=args.llm_model)
-        written = llm_filter_and_stream_yes(
+        written_yes, written_no = llm_filter_and_stream_yes(
             candidates=mined,
             validator=validator,
             output_path=args.output_jsonl,
@@ -1163,8 +1195,11 @@ def main():
             checkpoint_path=checkpoint_path,
             resume=args.resume,
             checkpoint_every=args.checkpoint_every,
+            negatives_path=args.negatives_jsonl,
         )
-        print(f"Wrote {written} records to {args.output_jsonl}")
+        print(f"Wrote {written_yes} YES records to {args.output_jsonl}")
+        if args.negatives_jsonl is not None:
+            print(f"Wrote {written_no} NO (hard negative) records to {args.negatives_jsonl}")
         return
 
     with args.output_jsonl.open("w", encoding="utf8") as f:
