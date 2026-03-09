@@ -21,7 +21,7 @@ except ImportError:
 
 
 
-os.environ["OPEN_WEB_UI_API_KEY"] = ""
+os.environ["OPEN_WEB_UI_API_KEY"] = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjcyNDE1ZDA3MmUwMjkzZDg5MmFhODliMTkzNDI2MTE3IiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2F1dGhlbnRpay1zZXJ2ZXItcnVuYWktY29kZXYtbGxtLmluZmVyZW5jZS5jb21wdXRlLmRhdGFzY2llbmNlLmNoL2FwcGxpY2F0aW9uL28vdmxsbS8iLCJzdWIiOiJiOWM3YWQ1ZmQ3NjMzNTRiZDdiMTQwZWNjOGVmN2E2YmFkNWIwMTdmODcwY2ExYjk1MWNiZDcwMGZiNDk5NDE5IiwiYXVkIjoiMDlCcm9CdlJFWEZTWVhCVGt3c2UwUGxPRjV3MXJtcmsiLCJleHAiOjE3NzQ0NjUzNTAsImlhdCI6MTc3MTg3MzM1MCwiYXV0aF90aW1lIjoxNzcxODczMzUwLCJhY3IiOiJnb2F1dGhlbnRpay5pby9wcm92aWRlcnMvb2F1dGgyL2RlZmF1bHQiLCJlbWFpbCI6ImFuaXNpYS5rYXRpbnNrYWlhQGVwZmwuY2giLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwibmFtZSI6IkFuaXNpYSBLYXRpbnNrYWlhIiwiZ2l2ZW5fbmFtZSI6IkFuaXNpYSBLYXRpbnNrYWlhIiwicHJlZmVycmVkX3VzZXJuYW1lIjoia2F0aW5za2FpYSIsIm5pY2tuYW1lIjoia2F0aW5za2FpYSIsImdyb3VwcyI6W10sImF6cCI6IjA5QnJvQnZSRVhGU1lYQlRrd3NlMFBsT0Y1dzFybXJrIiwidWlkIjoidUlyYlRJRkFDS1RXSlZSNVVqWHQ4TmxNSkpCOGF0SlQ2dFAyQ1ZEdCJ9.t7lpOVkIiJau1KmH5fveNkD-Hbtylrdj32_BsYLvGVJJVwA_yEEyabEz98xbVWfQsHa4j8Ns2_rCwtc01-zZ6rcL12cRF2OWDoNvJdhvxQ4oxPMtEZZQlhGR0sc18J-Ueeoubkaww0IhoAfrAuEG-2UshssN6RoUF-ZuY_gnUUKoXrKKXmm_ucR4YrXbGIalFAmmZbPZSa-0VR3Kqxlo__OighmVdutD1gWKWnoJYG7iEIyWfJpDTuh6adAJyqAGb0rqA1CiBhkzK-GZtphZ5xKmRPeWP0bx9c4cHNMBbOlKgvh2csnd3lOhSi0FJzMN3T6AjYM-J07A1bKSaY2lK9uLq8dk8I20uSYgzdS6hQqmcQFBl_vDyOCrGh000GxWHV7511PQ-HyRUvmnoTqwEP9_fkJkpHbYbNEtbinZbctciqqTcbJTj2MOd6T--nkQZeGXbiTNJT-nLmAEF2w2pY1ZRf_n0z8RWT5Y_OINMVJGz8D6oENWJrfxVbF6vuNzAbxIElREWDvxo_Ecaz1RtJMF4t6Km_NBEegThj-oKmTpoXc3uS6RPNwY3BlCzJQX8awEyJBPWDAwkTAgXNu1FQ3gLyDuHjGN-YVmggu_7Fadb9fERw9zwO_HOSKahoTsQI90vdFKWUoUBaNxaJ5B4QEEQggE137cASju6eJnpR0"
 
 
 # Model configurations
@@ -690,17 +690,27 @@ def build_triplet_text(e1_text: str, e1_type: str, relation: str,
     return f"{e1_text} [{e1_type}] {relation} {e2_text} [{e2_type}]"
 
 
+def count_tokens_between_spans(text: str, span1: Tuple[int, int], span2: Tuple[int, int]) -> int:
+    """Count non-whitespace token chunks between two entity spans."""
+    if span1[0] <= span2[0]:
+        between = text[span1[1]:span2[0]]
+    else:
+        between = text[span2[1]:span1[0]]
+    return len(re.findall(r"\S+", between))
+
+
 def extract_relational_context(sentence: str,
                                e1_text: str, e1_type: str,
                                e2_text: str, e2_type: str,
                                e1_start: Optional[int] = None,
                                e1_end: Optional[int] = None,
                                e2_start: Optional[int] = None,
-                               e2_end: Optional[int] = None) -> str:
+                               e2_end: Optional[int] = None,
+                               min_tokens_between: int = 2) -> Optional[str]:
     """Extract text between two entities, replacing entity text with type markers.
 
     Returns e.g. "[BIOTIC ENTITY] are found in [SPATIAL ENTITY]"
-    Falls back to "[e1_type] <full sentence> [e2_type]" if spans can't be located.
+    Returns None if spans can't be located or there are too few tokens between them.
     """
     # Determine spans: use offsets if provided, otherwise string search
     if e1_start is not None and e1_end is not None:
@@ -714,7 +724,10 @@ def extract_relational_context(sentence: str,
         span2 = find_first_span(sentence, e2_text)
 
     if span1 is None or span2 is None:
-        return f"[{e1_type}] {sentence} [{e2_type}]"
+        return None
+
+    if count_tokens_between_spans(sentence, span1, span2) < min_tokens_between:
+        return None
 
     # Order by position in sentence
     if span1[0] <= span2[0]:
@@ -844,11 +857,13 @@ def mine_candidates_multiview(
              for s in rel_seeds]
         )
         # Relational context view
-        seed_relational_embs[rel] = embedder.encode(
-            [extract_relational_context(s.sentence, s.e1_text, s.e1_type,
-                                        s.e2_text, s.e2_type)
-             for s in rel_seeds]
-        )
+        seed_relational_texts = [
+            extract_relational_context(s.sentence, s.e1_text, s.e1_type, s.e2_text, s.e2_type)
+            for s in rel_seeds
+        ]
+        seed_relational_texts = [text for text in seed_relational_texts if text is not None]
+        if seed_relational_texts:
+            seed_relational_embs[rel] = embedder.encode(seed_relational_texts)
 
     mined: List[dict] = []
 
@@ -862,14 +877,21 @@ def mine_candidates_multiview(
         )
 
         # -- Relational context view embeddings --
-        cand_context_texts = [
-            extract_relational_context(
+        cand_context_texts = []
+        cand_context_map: Dict[int, int] = {}
+        for idx, c in enumerate(batch):
+            context_text = extract_relational_context(
                 c.sentence, c.e1.text, c.e1.type, c.e2.text, c.e2.type,
                 c.e1.start, c.e1.end, c.e2.start, c.e2.end,
             )
-            for c in batch
-        ]
-        cand_context_embs = embedder.encode(cand_context_texts, batch_size=batch_size)
+            if context_text is None:
+                continue
+            cand_context_map[idx] = len(cand_context_texts)
+            cand_context_texts.append(context_text)
+        cand_context_embs = (
+            embedder.encode(cand_context_texts, batch_size=batch_size)
+            if cand_context_texts else None
+        )
 
         # -- Structural triplet view embeddings --
         # Build two triplets per (candidate, relation_candidate): forward and reverse
@@ -913,8 +935,15 @@ def mine_candidates_multiview(
                     sim_structural = 0.0
 
                 # Relational context similarity
-                ctx_emb = cand_context_embs[idx].unsqueeze(0)
-                sim_relational = cosine_sim(ctx_emb, seed_relational_embs[rel]).max().item()
+                if (
+                    cand_context_embs is not None
+                    and idx in cand_context_map
+                    and rel in seed_relational_embs
+                ):
+                    ctx_emb = cand_context_embs[cand_context_map[idx]].unsqueeze(0)
+                    sim_relational = cosine_sim(ctx_emb, seed_relational_embs[rel]).max().item()
+                else:
+                    sim_relational = 0.0
 
                 # Sentence similarity
                 sent_emb = cand_sentence_embs[idx].unsqueeze(0)
