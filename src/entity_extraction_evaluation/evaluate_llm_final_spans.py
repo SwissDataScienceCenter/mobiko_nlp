@@ -5,11 +5,36 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 NONE_LABEL = "__NONE__"
 UNKNOWN_LABEL = "__UNKNOWN__"
+COLLAPSED_ENTITY_LABEL_MAP = {
+    "ABIOTIC COLLECTIVE ENTITY": "ABIOTIC ENTITY",
+    "BIOTIC COLLECTIVE ENTITY": "BIOTIC ENTITY",
+}
+DEFAULT_CANDIDATE_TYPE_MAP = {
+    "biomes": "ABIOTIC ENTITY",
+    "biota": "BIOTIC ENTITY",
+    "mountains": "BIOTIC ENTITY",
+    "mountainrange": "BIOTIC ENTITY",
+    "geography": "SPATIAL ENTITY",
+    "env_feature": "ABIOTIC PROPERTY",
+    "population": "BIOTIC COLLECTIVE ENTITY",
+    "taxon": "BIOTIC ENTITY",
+    "location": "SPACIAL ENTITY",
+    "habitat": "BIOTIC PROPERTY",
+    "threat": "ANTHROPOGENIC PROCESS",
+}
+TOP_LEVEL_LABEL_PREFIXES = (
+    "ABIOTIC",
+    "BIOTIC",
+    "ANTHROPOGENIC",
+    "SPATIAL",
+    "TEMPORAL",
+    "CONCEPT",
+)
 
 
 def _safe_div(num: float, den: float) -> float:
@@ -58,7 +83,49 @@ def _get_pred_final_spans(sentence: Dict[str, Any]) -> Tuple[bool, List[Dict[str
     return False, []
 
 
-def normalize_gold_span(span: Dict[str, Any], *, context: str) -> Dict[str, Any]:
+def _get_sentence_candidates(sentence: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Returns (present, candidates). present=False if no candidates key is available.
+    Supports sentence['candidates'] and sentence['llm']['candidates'].
+    """
+    if "candidates" in sentence:
+        v = sentence.get("candidates")
+        return True, (v or [])
+    llm = sentence.get("llm") or {}
+    if isinstance(llm, dict) and "candidates" in llm:
+        v = llm.get("candidates")
+        return True, (v or [])
+    return False, []
+
+
+def canonicalize_label(
+    label: str,
+    *,
+    collapse_entity_variants: bool,
+    collapse_to_top_level: bool,
+) -> str:
+    label = str(label)
+    if collapse_entity_variants:
+        label = COLLAPSED_ENTITY_LABEL_MAP.get(label, label)
+    if collapse_to_top_level:
+        for prefix in TOP_LEVEL_LABEL_PREFIXES:
+            if label == prefix or label.startswith(prefix + " "):
+                return prefix
+    return label
+
+
+def canonicalize_candidate_label(label: str, candidate_type_map: Dict[str, str]) -> str:
+    mapped = candidate_type_map.get(str(label).strip().lower(), str(label))
+    return str(mapped)
+
+
+def normalize_gold_span(
+    span: Dict[str, Any],
+    *,
+    context: str,
+    collapse_entity_variants: bool = False,
+    collapse_to_top_level: bool = False,
+) -> Dict[str, Any]:
     if "start_char" not in span or "end_char" not in span:
         raise ValueError(f"{context}: gold span missing offsets: {span}")
     label = span.get("type")
@@ -67,7 +134,11 @@ def normalize_gold_span(span: Dict[str, Any], *, context: str) -> Dict[str, Any]
     out = {
         "start_char": int(span["start_char"]),
         "end_char": int(span["end_char"]),
-        "type": str(label),
+        "type": canonicalize_label(
+            label,
+            collapse_entity_variants=collapse_entity_variants,
+            collapse_to_top_level=collapse_to_top_level,
+        ),
         "text": span.get("text"),
     }
     if out["end_char"] <= out["start_char"]:
@@ -75,19 +146,103 @@ def normalize_gold_span(span: Dict[str, Any], *, context: str) -> Dict[str, Any]
     return out
 
 
-def normalize_pred_span(span: Dict[str, Any], *, context: str) -> Dict[str, Any]:
+def normalize_pred_span(
+    span: Dict[str, Any],
+    *,
+    context: str,
+    collapse_entity_variants: bool = False,
+    collapse_to_top_level: bool = False,
+) -> Dict[str, Any]:
     if "start_char" not in span or "end_char" not in span:
         raise ValueError(f"{context}: pred span missing offsets: {span}")
     label = span.get("type") or UNKNOWN_LABEL
     out = {
         "start_char": int(span["start_char"]),
         "end_char": int(span["end_char"]),
-        "type": str(label),
+        "type": canonicalize_label(
+            label,
+            collapse_entity_variants=collapse_entity_variants,
+            collapse_to_top_level=collapse_to_top_level,
+        ),
         "text": span.get("text"),
     }
     if out["end_char"] <= out["start_char"]:
         raise ValueError(f"{context}: invalid pred span offsets: {span}")
     return out
+
+
+def _prediction_span_key(span: Dict[str, Any]) -> Tuple[int, int, str]:
+    return (int(span["start_char"]), int(span["end_char"]), str(span["type"]))
+
+
+def _extract_pred_spans(
+    sentence: Dict[str, Any],
+    *,
+    prediction_field: str,
+    candidate_sources: Optional[Set[str]],
+    candidate_type_map: Dict[str, str],
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    if prediction_field == "final_spans":
+        return _get_pred_final_spans(sentence)
+
+    present, raw_candidates = _get_sentence_candidates(sentence)
+    if not present:
+        return False, []
+
+    pred_spans: List[Dict[str, Any]] = []
+    seen: Set[Tuple[int, int, str]] = set()
+    for cand in raw_candidates:
+        if not isinstance(cand, dict):
+            continue
+
+        source_entries: List[Dict[str, Any]] = []
+        raw_sources = cand.get("sources")
+        if isinstance(raw_sources, list):
+            source_entries.extend(s for s in raw_sources if isinstance(s, dict))
+
+        if not source_entries and cand.get("type"):
+            source_entries.append(
+                {
+                    "name": cand.get("source"),
+                    "type": cand.get("type"),
+                }
+            )
+
+        for src in source_entries:
+            src_name = str(src.get("name") or "").strip()
+            if candidate_sources and src_name not in candidate_sources:
+                continue
+            src_type = src.get("type")
+            if not src_type:
+                continue
+            try:
+                pred_span = {
+                    "start_char": int(cand["start_char"]),
+                    "end_char": int(cand["end_char"]),
+                    "type": canonicalize_candidate_label(src_type, candidate_type_map),
+                    "text": cand.get("text"),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            key = _prediction_span_key(pred_span)
+            if key in seen:
+                continue
+            seen.add(key)
+            pred_spans.append(pred_span)
+
+    return True, pred_spans
+
+
+def is_gold_sentence_annotated(sentence: Dict[str, Any]) -> bool:
+    """
+    Treat only sentences with a non-empty gold spans list as annotated.
+
+    This matches the current partial-annotation workflow where unfinished
+    sentences are represented as spans=[] and should be skipped.
+    """
+    spans = sentence.get("spans")
+    return isinstance(spans, list) and len(spans) > 0
 
 
 def align_sentences_by_text(
@@ -152,6 +307,174 @@ def boundary_key(span: Dict[str, Any]) -> Tuple[int, int]:
     return (int(span["start_char"]), int(span["end_char"]))
 
 
+def top_level_label(label: str) -> str:
+    label = str(label)
+    for prefix in TOP_LEVEL_LABEL_PREFIXES:
+        if label == prefix or label.startswith(prefix + " "):
+            return prefix
+    return label
+
+
+def _is_trivial_gap(text: str) -> bool:
+    return not any(ch.isalnum() for ch in (text or ""))
+
+
+def load_spacy_model(model_name: str):
+    try:
+        import spacy
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "spaCy is not installed in this environment. Install requirements and a parser-enabled model first."
+        ) from e
+    try:
+        nlp = spacy.load(model_name)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load spaCy model {model_name!r}. Install it with: python -m spacy download {model_name}"
+        ) from e
+
+    if "parser" not in getattr(nlp, "pipe_names", []):
+        raise RuntimeError(f"spaCy model {model_name!r} does not have the parser enabled.")
+    return nlp
+
+
+def span_head_token(doc, start_char: int, end_char: int):
+    span = doc.char_span(start_char, end_char, alignment_mode="expand")
+    if span is None:
+        tokens = [t for t in doc if t.idx < end_char and (t.idx + len(t)) > start_char]
+        if not tokens:
+            return None
+        span = doc[tokens[0].i : tokens[-1].i + 1]
+    return span.root
+
+
+def build_span_heads(doc, spans: List[Dict[str, Any]]) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    heads: List[Any] = []
+    failures: List[Dict[str, Any]] = []
+    for idx, span in enumerate(spans):
+        head = span_head_token(doc, int(span["start_char"]), int(span["end_char"]))
+        heads.append(head)
+        if head is None:
+            failures.append(
+                {
+                    "span_idx": idx,
+                    "span": span,
+                    "reason": "no_overlapping_tokens_for_span",
+                }
+            )
+    return heads, failures
+
+
+def _find_split_gold_match(
+    gold_span: Dict[str, Any],
+    pred_spans: List[Dict[str, Any]],
+    matched_pred_idxs: set[int],
+    sentence_text: str,
+) -> List[int]:
+    compatible = [
+        (idx, span)
+        for idx, span in enumerate(pred_spans)
+        if idx not in matched_pred_idxs
+        and top_level_label(span["type"]) == top_level_label(gold_span["type"])
+        and int(span["start_char"]) >= int(gold_span["start_char"])
+        and int(span["end_char"]) <= int(gold_span["end_char"])
+    ]
+    compatible.sort(key=lambda item: (int(item[1]["start_char"]), int(item[1]["end_char"]), item[0]))
+    if len(compatible) < 2:
+        return []
+
+    first_start = int(compatible[0][1]["start_char"])
+    last_end = int(compatible[-1][1]["end_char"])
+    gold_start = int(gold_span["start_char"])
+    gold_end = int(gold_span["end_char"])
+    if first_start != gold_start or last_end != gold_end:
+        return []
+
+    selected: List[int] = []
+    prev_end = gold_start
+    for idx, span in compatible:
+        start = int(span["start_char"])
+        end = int(span["end_char"])
+        if start < prev_end:
+            return []
+        if start > prev_end and not _is_trivial_gap(sentence_text[prev_end:start]):
+            return []
+        selected.append(idx)
+        prev_end = end
+
+    return selected if prev_end == gold_end else []
+
+
+def _find_head_aware_pred_gold_matches(
+    pred_spans: List[Dict[str, Any]],
+    gold_spans: List[Dict[str, Any]],
+    pred_heads: List[Any],
+    gold_heads: List[Any],
+    matched_pred_idxs: set[int],
+    matched_gold_idxs: set[int],
+) -> List[Tuple[int, List[int], int]]:
+    matches: List[Tuple[int, List[int], int]] = []
+    pred_order = sorted(
+        [idx for idx in range(len(pred_spans)) if idx not in matched_pred_idxs],
+        key=lambda idx: (
+            -(int(pred_spans[idx]["end_char"]) - int(pred_spans[idx]["start_char"])),
+            int(pred_spans[idx]["start_char"]),
+            idx,
+        ),
+    )
+
+    for pred_idx in pred_order:
+        pred_span = pred_spans[pred_idx]
+        pred_head = pred_heads[pred_idx]
+        if pred_head is None:
+            continue
+
+        contained_gold_idxs = [
+            gold_idx
+            for gold_idx, gold_span in enumerate(gold_spans)
+            if gold_idx not in matched_gold_idxs
+            and int(gold_span["start_char"]) >= int(pred_span["start_char"])
+            and int(gold_span["end_char"]) <= int(pred_span["end_char"])
+        ]
+        if not contained_gold_idxs:
+            continue
+
+        anchor_gold_idxs = [
+            gold_idx
+            for gold_idx in contained_gold_idxs
+            if gold_heads[gold_idx] is not None
+            and gold_heads[gold_idx].i == pred_head.i
+            and str(gold_spans[gold_idx]["type"]) == str(pred_span["type"])
+        ]
+        if not anchor_gold_idxs:
+            continue
+
+        anchor_gold_idxs.sort(
+            key=lambda gold_idx: (
+                -(int(gold_spans[gold_idx]["end_char"]) - int(gold_spans[gold_idx]["start_char"])),
+                int(gold_spans[gold_idx]["start_char"]),
+                gold_idx,
+            )
+        )
+        anchor_gold_idx = anchor_gold_idxs[0]
+
+        covered_gold_idxs: List[int] = []
+        for gold_idx in contained_gold_idxs:
+            gold_head = gold_heads[gold_idx]
+            if gold_head is None:
+                continue
+            if gold_head.i == pred_head.i or pred_head.is_ancestor(gold_head):
+                covered_gold_idxs.append(gold_idx)
+
+        if not covered_gold_idxs:
+            continue
+        matches.append((pred_idx, sorted(covered_gold_idxs), anchor_gold_idx))
+        matched_pred_idxs.add(pred_idx)
+        matched_gold_idxs.update(covered_gold_idxs)
+
+    return matches
+
+
 def _increment_confusion_boundary(
     cm: Dict[str, Counter],
     gold_spans: List[Dict[str, Any]],
@@ -208,9 +531,24 @@ def evaluate(
     confusion_matrix_csv: str,
     missed_gold_entities_csv: str,
     max_debug_examples: int = 10,
+    prediction_field: str = "final_spans",
+    candidate_sources: Optional[List[str]] = None,
+    candidate_type_map: Optional[Dict[str, str]] = None,
+    collapse_entity_variants: bool = False,
+    collapse_to_top_level: bool = False,
+    allow_split_family_matches: bool = False,
+    allow_head_subspan_matches: bool = False,
+    use_head_aware_relaxed_matching: bool = False,
+    spacy_model: str = "en_core_web_trf",
 ) -> Dict[str, Any]:
     gold_docs = load_docs(gold_file)
     model_docs = load_docs(model_file)
+    nlp = load_spacy_model(spacy_model) if use_head_aware_relaxed_matching else None
+    candidate_source_set = {s.strip() for s in (candidate_sources or []) if s and s.strip()} or None
+    candidate_type_map_normalized = {
+        str(k).strip().lower(): str(v)
+        for k, v in (candidate_type_map or DEFAULT_CANDIDATE_TYPE_MAP).items()
+    }
 
     gold_doc_ids = sorted(gold_docs.keys())
     model_doc_ids = sorted(model_docs.keys())
@@ -232,13 +570,19 @@ def evaluate(
     invalid_pred_span_examples: List[Dict[str, Any]] = []
     gold_missing_entity_examples: List[Dict[str, Any]] = []
     all_missed_gold_entities: List[Dict[str, Any]] = []
+    head_relaxed_match_examples: List[Dict[str, Any]] = []
+    head_parse_failure_examples: List[Dict[str, Any]] = []
 
     aligned_sentence_count = 0
     included_sentence_count = 0
+    skipped_unannotated_gold_sentences = 0
     skipped_empty_final_spans = 0
     skipped_missing_final_spans = 0
     model_only_extra_sentences_ignored = 0
     skipped_invalid_pred_spans = 0
+    head_relaxed_match_prediction_count = 0
+    head_relaxed_match_gold_span_count = 0
+    head_parse_failure_count = 0
 
     gold_sentence_total = 0
     model_sentence_total = 0
@@ -267,8 +611,17 @@ def evaluate(
             msent = model_sents[mi]
             sent_text = msent.get("text") or gsent.get("text") or ""
 
-            has_final_spans, final_spans_raw = _get_pred_final_spans(msent)
-            if not has_final_spans:
+            if not is_gold_sentence_annotated(gsent):
+                skipped_unannotated_gold_sentences += 1
+                continue
+
+            has_prediction_spans, prediction_spans_raw = _extract_pred_spans(
+                msent,
+                prediction_field=prediction_field,
+                candidate_sources=candidate_source_set,
+                candidate_type_map=candidate_type_map_normalized,
+            )
+            if not has_prediction_spans:
                 skipped_missing_final_spans += 1
                 if len(missing_final_spans_examples) < max_debug_examples:
                     missing_final_spans_examples.append(
@@ -281,18 +634,23 @@ def evaluate(
                     )
                 continue
 
-            if len(final_spans_raw) == 0:
+            if len(prediction_spans_raw) == 0:
                 skipped_empty_final_spans += 1
                 empty_final_spans_sentences.append(normalize_whitespace_one_line(sent_text))
                 continue
 
             gold_spans = [
-                normalize_gold_span(s, context=f"{doc_id}:{gi}")
+                normalize_gold_span(
+                    s,
+                    context=f"{doc_id}:{gi}",
+                    collapse_entity_variants=collapse_entity_variants,
+                    collapse_to_top_level=collapse_to_top_level,
+                )
                 for s in (gsent.get("spans", []) or [])
             ]
 
             pred_spans: List[Dict[str, Any]] = []
-            for p in final_spans_raw:
+            for p in prediction_spans_raw:
                 if not (p.get("type")) and len(untyped_pred_examples) < max_debug_examples:
                     untyped_pred_examples.append(
                         {
@@ -304,7 +662,14 @@ def evaluate(
                         }
                     )
                 try:
-                    pred_spans.append(normalize_pred_span(p, context=f"{doc_id}:{mi}"))
+                    pred_spans.append(
+                        normalize_pred_span(
+                            p,
+                            context=f"{doc_id}:{mi}",
+                            collapse_entity_variants=collapse_entity_variants,
+                            collapse_to_top_level=collapse_to_top_level,
+                        )
+                    )
                 except ValueError as e:
                     skipped_invalid_pred_spans += 1
                     if len(invalid_pred_span_examples) < max_debug_examples:
@@ -322,18 +687,126 @@ def evaluate(
 
             included_sentence_count += 1
 
-            gold_counter = Counter(span_key_full(s) for s in gold_spans)
-            pred_counter = Counter(span_key_full(s) for s in pred_spans)
+            matched_gold_idxs: set[int] = set()
+            matched_pred_idxs: set[int] = set()
+            matched_gold_labels: List[str] = []
 
-            matched_counter = Counter()
-            for k in set(gold_counter) & set(pred_counter):
-                m = min(gold_counter[k], pred_counter[k])
-                if m:
-                    matched_counter[k] = m
+            gold_key_to_idxs: Dict[Tuple[int, int, str], List[int]] = defaultdict(list)
+            pred_key_to_idxs: Dict[Tuple[int, int, str], List[int]] = defaultdict(list)
+            for idx, span in enumerate(gold_spans):
+                gold_key_to_idxs[span_key_full(span)].append(idx)
+            for idx, span in enumerate(pred_spans):
+                pred_key_to_idxs[span_key_full(span)].append(idx)
 
-            tp = sum(matched_counter.values())
-            fp = sum((pred_counter - matched_counter).values())
-            fn = sum((gold_counter - matched_counter).values())
+            for key in sorted(set(gold_key_to_idxs) & set(pred_key_to_idxs)):
+                gold_idxs = gold_key_to_idxs[key]
+                pred_idxs = pred_key_to_idxs[key]
+                for gold_idx, pred_idx in zip(gold_idxs, pred_idxs):
+                    matched_gold_idxs.add(gold_idx)
+                    matched_pred_idxs.add(pred_idx)
+                    matched_gold_labels.append(gold_spans[gold_idx]["type"])
+
+            if allow_split_family_matches:
+                for gold_idx, gold_span in enumerate(gold_spans):
+                    if gold_idx in matched_gold_idxs:
+                        continue
+                    split_pred_idxs = _find_split_gold_match(
+                        gold_span,
+                        pred_spans,
+                        matched_pred_idxs,
+                        sent_text,
+                    )
+                    if not split_pred_idxs:
+                        continue
+                    matched_gold_idxs.add(gold_idx)
+                    matched_pred_idxs.update(split_pred_idxs)
+                    matched_gold_labels.append(gold_span["type"])
+
+            if allow_head_subspan_matches:
+                for gold_idx, gold_span in enumerate(gold_spans):
+                    if gold_idx in matched_gold_idxs:
+                        continue
+                    head_pred_idx = _find_head_subspan_match(
+                        gold_span,
+                        pred_spans,
+                        matched_pred_idxs,
+                    )
+                    if head_pred_idx is None:
+                        continue
+                    matched_gold_idxs.add(gold_idx)
+                    matched_pred_idxs.add(head_pred_idx)
+                    matched_gold_labels.append(gold_span["type"])
+
+            if use_head_aware_relaxed_matching:
+                doc = nlp(sent_text)
+                gold_heads, gold_head_failures = build_span_heads(doc, gold_spans)
+                pred_heads, pred_head_failures = build_span_heads(doc, pred_spans)
+                head_parse_failure_count += len(gold_head_failures) + len(pred_head_failures)
+
+                for failure in gold_head_failures:
+                    if len(head_parse_failure_examples) >= max_debug_examples:
+                        break
+                    head_parse_failure_examples.append(
+                        {
+                            "doc_id": doc_id,
+                            "gold_sent_idx": gi,
+                            "model_sent_idx": mi,
+                            "sentence_text": normalize_whitespace_one_line(sent_text)[:300],
+                            "span_source": "gold",
+                            **failure,
+                        }
+                    )
+                for failure in pred_head_failures:
+                    if len(head_parse_failure_examples) >= max_debug_examples:
+                        break
+                    head_parse_failure_examples.append(
+                        {
+                            "doc_id": doc_id,
+                            "gold_sent_idx": gi,
+                            "model_sent_idx": mi,
+                            "sentence_text": normalize_whitespace_one_line(sent_text)[:300],
+                            "span_source": "pred",
+                            **failure,
+                        }
+                    )
+
+                relaxed_matches = _find_head_aware_pred_gold_matches(
+                    pred_spans,
+                    gold_spans,
+                    pred_heads,
+                    gold_heads,
+                    matched_pred_idxs,
+                    matched_gold_idxs,
+                )
+                for pred_idx, covered_gold_idxs, anchor_gold_idx in relaxed_matches:
+                    head_relaxed_match_prediction_count += 1
+                    head_relaxed_match_gold_span_count += len(covered_gold_idxs)
+                    for gold_idx in covered_gold_idxs:
+                        matched_gold_labels.append(gold_spans[gold_idx]["type"])
+                    if len(head_relaxed_match_examples) < max_debug_examples:
+                        pred_head = pred_heads[pred_idx]
+                        head_relaxed_match_examples.append(
+                            {
+                                "doc_id": doc_id,
+                                "gold_sent_idx": gi,
+                                "model_sent_idx": mi,
+                                "sentence_text": normalize_whitespace_one_line(sent_text)[:300],
+                                "pred_span": pred_spans[pred_idx],
+                                "pred_head": None
+                                if pred_head is None
+                                else {
+                                    "text": pred_head.text,
+                                    "idx": pred_head.i,
+                                    "pos": pred_head.pos_,
+                                },
+                                "anchor_gold_span": gold_spans[anchor_gold_idx],
+                                "covered_gold_spans": [gold_spans[idx] for idx in covered_gold_idxs],
+                            }
+                        )
+
+            tp = len(matched_gold_idxs)
+            fp = len(pred_spans) - len(matched_pred_idxs)
+            fn = len(gold_spans) - len(matched_gold_idxs)
 
             total_tp += tp
             total_fp += fp
@@ -341,11 +814,8 @@ def evaluate(
 
             # Collect examples for gold entities missed by the model (gold -> __NONE__).
             if len(gold_missing_entity_examples) < max_debug_examples:
-                matched_left = matched_counter.copy()
-                for gspan in gold_spans:
-                    k = span_key_full(gspan)
-                    if matched_left.get(k, 0) > 0:
-                        matched_left[k] -= 1
+                for gold_idx, gspan in enumerate(gold_spans):
+                    if gold_idx in matched_gold_idxs:
                         continue
                     gold_missing_entity_examples.append(
                         {
@@ -359,11 +829,8 @@ def evaluate(
                     if len(gold_missing_entity_examples) >= max_debug_examples:
                         break
 
-            matched_left_all = matched_counter.copy()
-            for gspan in gold_spans:
-                k = span_key_full(gspan)
-                if matched_left_all.get(k, 0) > 0:
-                    matched_left_all[k] -= 1
+            for gold_idx, gspan in enumerate(gold_spans):
+                if gold_idx in matched_gold_idxs:
                     continue
                 all_missed_gold_entities.append(
                     {
@@ -378,14 +845,19 @@ def evaluate(
                     }
                 )
 
-            for (_, _, label), cnt in matched_counter.items():
-                per_type_counts[label]["tp"] += cnt
-            for (_, _, label), cnt in (pred_counter - matched_counter).items():
-                per_type_counts[label]["fp"] += cnt
-            for (_, _, label), cnt in (gold_counter - matched_counter).items():
-                per_type_counts[label]["fn"] += cnt
+            for label in matched_gold_labels:
+                per_type_counts[label]["tp"] += 1
+                confusion[label][label] += 1
+            for pred_idx, pspan in enumerate(pred_spans):
+                if pred_idx not in matched_pred_idxs:
+                    per_type_counts[pspan["type"]]["fp"] += 1
+            for gold_idx, gspan in enumerate(gold_spans):
+                if gold_idx not in matched_gold_idxs:
+                    per_type_counts[gspan["type"]]["fn"] += 1
 
-            _increment_confusion_boundary(confusion, gold_spans, pred_spans)
+            remaining_gold_spans = [g for idx, g in enumerate(gold_spans) if idx not in matched_gold_idxs]
+            remaining_pred_spans = [p for idx, p in enumerate(pred_spans) if idx not in matched_pred_idxs]
+            _increment_confusion_boundary(confusion, remaining_gold_spans, remaining_pred_spans)
 
     # Build per-type metrics
     per_type_metrics: Dict[str, Dict[str, Any]] = {}
@@ -435,6 +907,18 @@ def evaluate(
             "evaluator": "evaluate_llm_final_spans.py",
             "matching_policy": "strict_exact_span_and_type",
             "alignment_policy": "exact_text_in_order",
+            "gold_annotation_policy": "score_only_sentences_with_nonempty_gold_spans",
+            "prediction_field": prediction_field,
+            "candidate_sources": sorted(candidate_source_set) if candidate_source_set else [],
+            "candidate_type_map": candidate_type_map_normalized if prediction_field == "candidates" else {},
+            "collapse_entity_variants": collapse_entity_variants,
+            "collapse_to_top_level": collapse_to_top_level,
+            "allow_split_family_matches": allow_split_family_matches,
+            "allow_head_subspan_matches": allow_head_subspan_matches,
+            "use_head_aware_relaxed_matching": use_head_aware_relaxed_matching,
+            "spacy_model": spacy_model if use_head_aware_relaxed_matching else None,
+            "collapsed_entity_label_map": COLLAPSED_ENTITY_LABEL_MAP if collapse_entity_variants else {},
+            "top_level_label_prefixes": list(TOP_LEVEL_LABEL_PREFIXES) if collapse_to_top_level else [],
             "untyped_prediction_policy": UNKNOWN_LABEL,
             "empty_final_spans_policy": "skip_and_export_sentence_text",
             "extra_model_only_sentences_policy": "ignored_for_scoring",
@@ -448,11 +932,15 @@ def evaluate(
             "model_sentence_total": model_sentence_total,
             "aligned_sentence_count": aligned_sentence_count,
             "included_sentence_count": included_sentence_count,
+            "skipped_unannotated_gold_sentences": skipped_unannotated_gold_sentences,
             "skipped_empty_final_spans": skipped_empty_final_spans,
             "skipped_missing_final_spans": skipped_missing_final_spans,
             "model_only_extra_sentences_ignored": model_only_extra_sentences_ignored,
             "empty_final_spans_txt_line_count": len(empty_final_spans_sentences),
             "skipped_invalid_pred_spans": skipped_invalid_pred_spans,
+            "head_relaxed_match_prediction_count": head_relaxed_match_prediction_count,
+            "head_relaxed_match_gold_span_count": head_relaxed_match_gold_span_count,
+            "head_parse_failure_count": head_parse_failure_count,
             "missed_gold_entities_count": len(all_missed_gold_entities),
         },
         "overall": {
@@ -479,6 +967,8 @@ def evaluate(
             "sample_untyped_predictions": untyped_pred_examples,
             "sample_invalid_pred_spans": invalid_pred_span_examples,
             "sample_gold_missing_entity_examples": gold_missing_entity_examples,
+            "sample_head_relaxed_matches": head_relaxed_match_examples,
+            "sample_head_parse_failures": head_parse_failure_examples,
         },
     }
 
@@ -561,9 +1051,16 @@ def _derive_default_outputs(
 def pretty_print(results: Dict[str, Any], max_types: int = 20) -> None:
     ds = results["dataset_stats"]
     ov = results["overall"]
+    md = results.get("metadata") or {}
+    prediction_field = md.get("prediction_field") or "final_spans"
     print("=" * 70)
     print("LLM ENTITY EXTRACTION EVALUATION (final_spans)")
     print("=" * 70)
+    if md.get("use_head_aware_relaxed_matching"):
+        print(f"Head-aware relaxed matching: ON ({md.get('spacy_model')})")
+    elif md.get("collapse_to_top_level"):
+        print("Head-aware relaxed matching: OFF")
+        print("Top-level label collapse:     ON")
     print("Overall (micro, strict exact span+type)")
     print(f"Precision: {ov['precision']:.4f}")
     print(f"Recall:    {ov['recall']:.4f}")
@@ -573,11 +1070,15 @@ def pretty_print(results: Dict[str, Any], max_types: int = 20) -> None:
     print("Dataset stats")
     print(f"Aligned sentences:            {ds['aligned_sentence_count']}")
     print(f"Included sentences:           {ds['included_sentence_count']}")
-    print(f"Skipped empty final_spans:    {ds['skipped_empty_final_spans']}")
-    print(f"Skipped missing final_spans:  {ds['skipped_missing_final_spans']}")
+    print(f"Skipped unannotated gold:     {ds.get('skipped_unannotated_gold_sentences', 0)}")
+    print(f"Skipped empty {prediction_field}:    {ds['skipped_empty_final_spans']}")
+    print(f"Skipped missing {prediction_field}:  {ds['skipped_missing_final_spans']}")
     print(f"Model-only extras ignored:    {ds['model_only_extra_sentences_ignored']}")
-    print(f"Empty-final-spans TXT lines:  {ds['empty_final_spans_txt_line_count']}")
+    print(f"Empty-{prediction_field} TXT lines:  {ds['empty_final_spans_txt_line_count']}")
     print(f"Skipped invalid pred spans:   {ds.get('skipped_invalid_pred_spans', 0)}")
+    print(f"Head-relaxed pred matches:    {ds.get('head_relaxed_match_prediction_count', 0)}")
+    print(f"Head-relaxed gold covered:    {ds.get('head_relaxed_match_gold_span_count', 0)}")
+    print(f"Head parse failures:          {ds.get('head_parse_failure_count', 0)}")
     print()
 
     per_type = results.get("per_type", {})
@@ -624,10 +1125,35 @@ def pretty_print(results: Dict[str, Any], max_types: int = 20) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Evaluate entity extraction pipeline output against annotated spans using llm.final_spans."
+        description="Evaluate entity extraction pipeline output against annotated spans using sentence final_spans or candidates."
     )
     ap.add_argument("--gold-file", required=True, help="Gold JSONL file with sentences[].spans")
-    ap.add_argument("--model-file", required=True, help="Model JSONL file with sentences[].llm.final_spans")
+    ap.add_argument(
+        "--model-file",
+        required=True,
+        help="Model JSONL file with sentence-level predictions in llm.final_spans/final_spans or candidates.",
+    )
+    ap.add_argument(
+        "--prediction-field",
+        choices=["final_spans", "candidates"],
+        default="final_spans",
+        help="Which model sentence field to score against gold spans.",
+    )
+    ap.add_argument(
+        "--candidate-sources",
+        nargs="+",
+        help=(
+            "When --prediction-field candidates is used, keep only candidate source entries whose "
+            "name matches one of these values, e.g. ner gazetteer."
+        ),
+    )
+    ap.add_argument(
+        "--candidate-type-map-json",
+        help=(
+            "Optional JSON file mapping candidate source labels to evaluation labels, "
+            "e.g. {'TAXON':'BIOTIC ENTITY'}."
+        ),
+    )
     ap.add_argument("--output-json", help="Path for structured JSON evaluation report")
     ap.add_argument(
         "--empty-final-spans-txt",
@@ -641,6 +1167,51 @@ def main() -> None:
         "--missed-gold-entities-csv",
         help="Path for CSV file containing all missed gold entities (gold -> __NONE__)",
     )
+    ap.add_argument(
+        "--collapse-entity-variants",
+        action="store_true",
+        help=(
+            "Treat collective entity labels as equivalent to their base entity labels "
+            "(ABIOTIC, BIOTIC, ANTHROPOGENIC) during scoring."
+        ),
+    )
+    ap.add_argument(
+        "--collapse-to-top-level",
+        action="store_true",
+        help=(
+            "Treat labels with the same top-level family as equivalent, such as "
+            "BIOTIC ENTITY/PROPERTY/PROCESS -> BIOTIC."
+        ),
+    )
+    ap.add_argument(
+        "--allow-split-family-matches",
+        action="store_true",
+        help=(
+            "Count one gold span as matched when multiple predicted subspans exactly cover it "
+            "and all belong to the same top-level family."
+        ),
+    )
+    ap.add_argument(
+        "--allow-head-subspan-matches",
+        action="store_true",
+        help=(
+            "Count one gold span as matched when a predicted subspan with the same label matches "
+            "the phrase head as an exact prefix or suffix."
+        ),
+    )
+    ap.add_argument(
+        "--use-head-aware-relaxed-matching",
+        action="store_true",
+        help=(
+            "Use a spaCy dependency parser to allow a broader predicted span to satisfy contained "
+            "gold spans when the prediction head aligns with a compatible gold head."
+        ),
+    )
+    ap.add_argument(
+        "--spacy-model",
+        default="en_core_web_trf",
+        help="spaCy model with parser enabled, used only with --use-head-aware-relaxed-matching",
+    )
     ap.add_argument("--max-debug-examples", type=int, default=10, help="Max examples to keep in diagnostics")
     args = ap.parse_args()
 
@@ -651,6 +1222,10 @@ def main() -> None:
         args.confusion_matrix_csv,
         args.missed_gold_entities_csv,
     )
+    candidate_type_map = None
+    if args.candidate_type_map_json:
+        with open(args.candidate_type_map_json, "r", encoding="utf-8") as f:
+            candidate_type_map = json.load(f)
     results = evaluate(
         gold_file=args.gold_file,
         model_file=args.model_file,
@@ -659,6 +1234,15 @@ def main() -> None:
         confusion_matrix_csv=confusion_csv,
         missed_gold_entities_csv=missed_gold_csv,
         max_debug_examples=args.max_debug_examples,
+        prediction_field=args.prediction_field,
+        candidate_sources=args.candidate_sources,
+        candidate_type_map=candidate_type_map,
+        collapse_entity_variants=args.collapse_entity_variants,
+        collapse_to_top_level=args.collapse_to_top_level,
+        allow_split_family_matches=args.allow_split_family_matches,
+        allow_head_subspan_matches=args.allow_head_subspan_matches,
+        use_head_aware_relaxed_matching=args.use_head_aware_relaxed_matching,
+        spacy_model=args.spacy_model,
     )
     pretty_print(results)
     print()
