@@ -364,13 +364,15 @@ def call_llm_batch_revision(client, model_type, requests, temperature=0.3):
     for req in requests:
         system_prompt = """You are revising an earlier extraction.
         Return STRICT JSON:
-        {"missing": [...], "notes": "short rationale ≤160 chars"}
+        {"missing": ["type": ...,  "concept_text": ..., "uncertain": ..., "text": ...], "notes": "short rationale ≤160 chars"}
             Rules:
             - Consider the previous output AND the running notes.
             - DO NOT DELETE earlier accepted spans.
             - Only propose NEW or CORRECTED spans (no duplicates).
             - Prefer precise boundaries; don't re-state identical spans.    
             - Use the same TYPE schema as before.
+            - If uncertain about a span, set "uncertain": true and explain briefly in notes.
+            - "concept_text" is a canonical form of the entity text, it does not have to be in the sentence verbatim but should be clearly linked to the surface text.
             """
         payload = {"sentence": req["sentence"], "previous": req["prev_json"],
                    "prev_notes": req.get("prev_notes", "")  # short running notes
@@ -395,9 +397,9 @@ def call_llm_batch_consolidate(client, model_type, requests):
     for req in requests:
         system_prompt = """Consolidate proposed spans.
             Return STRICT JSON:
-            {"accepted":[{"text":"...", "type":"...", "start_char":int, "end_char":int}], "rejected":[...], "missing":[], "notes":"optional"}
+            {"accepted":[{"text":"...", "type":"...", "start_char":int, "end_char":int, "concept_text: ..., "uncertain": ...}], "rejected":[...], "missing":[], "notes":"optional"}
             Rules:
-            - Merge overlapping duplicates; keep one with best boundaries
+            - Merge overlapping duplicates; keep one with best boundaries.
             """
         payload = {"sentence": req["sentence"], "proposals": req["proposals"]}
         if "qwen3-32B" in model_type:
