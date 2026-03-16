@@ -1122,7 +1122,7 @@ def main():
     parser.add_argument("--tokenizer-name", type=str, default=None,
                         help="Optional tokenizer model id/path when model repo lacks tokenizer assets.")
     parser.add_argument("--similarity-threshold", type=float, default=0.75,
-                        help="Cosine similarity threshold to accept a candidate.")
+                        help="Cosine similarity threshold to accept a candidate (minimum: 0.5).")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="Batch size for embedding.")
     parser.add_argument("--output-jsonl", type=Path, required=True,
@@ -1162,6 +1162,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.similarity_threshold < 0.5:
+        print(
+            f"Requested similarity threshold {args.similarity_threshold} is below the minimum; "
+            "using 0.5 instead."
+        )
+        args.similarity_threshold = 0.5
 
     # Validate weights sum to 1.0
     weight_sum = args.w_structural + args.w_relational + args.w_sentence
