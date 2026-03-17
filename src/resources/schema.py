@@ -661,8 +661,7 @@ BIOTIC PROCESS (DEFINITION: A biological action or interaction performed by or i
 
 BIOTIC PROPERTY (DEFINITION: A trait, attribute or measurable characteristic of organisms or biotic assemblages, e.g., biomass, species richness)
 
-CONCEPT (DEFINITION: An abstract concept or theoretical construct used in analysis or discourse (not directly a material object or process))
-
+T
 SPATIAL ENTITY (DEFINITION: A named or operational geographic extent or geometric unit used for mapping or aggregation, e.g., watershed, grid cell, elevation belt)
 
 SPATIAL PROPERTY (DEFINITION: A geometric or positional descriptor of an entity, e.g., elevation, slope, aspect, distance)

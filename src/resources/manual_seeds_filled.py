@@ -4,7 +4,7 @@
       "sentence": "What species of vascular plants have gone extinct in the Drakensberg since 2000",
       "e1": {
         "text": "species of vascular plants",
-        "type": "COLLECTIVE BIOTIC ENTITY"
+        "type": "BIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "extinct",
@@ -15,18 +15,18 @@
       "sentence": "Where are hotspots of plant diversity in the Andes?",
       "e1": {
         "text": "plant diversity",
-        "type": "COLLECTIVE BIOTIC ENTITY"
+        "type": "BIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "hotspots",
-        "type": "SPACIAL PROPERTY"
+        "type": "SPATIAL PROPERTY"
       }
     },
     {
       "sentence": "What are the effects of more frequent extreme weather events on mountain biodiversity?",
       "e1": {
         "text": "mountain biodiversity",
-        "type": "COLLECTIVE BIOTIC ENTITY"
+        "type": "BIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "frequent",
@@ -37,7 +37,7 @@
       "sentence": "Research shows worrying trends in climate change in the Alps since 2000.",
       "e1": {
         "text": "climate change",
-        "type": "COLLECTIVE ABIOTIC ENTITY"
+        "type": "ABIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "trends",
@@ -48,11 +48,11 @@
       "sentence": "Here, we integrate multiple datasets to assess the relationships between species richness in mountains, geology and climate at global and regional scales.",
       "e1": {
         "text": "climate",
-        "type": "COLLECTIVE ABIOTIC ENTITY"
+        "type": "ABIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "global and regional scales",
-        "type": "SPACIAL PROPERTY"
+        "type": "SPATIAL PROPERTY"
       }
     },
       {
@@ -85,7 +85,7 @@
       },
       "e2": {
         "text": "remote mountain areas",
-        "type": "SPACIAL PROPERTY"
+        "type": "SPATIAL PROPERTY"
       }
     },
       {
@@ -118,14 +118,14 @@
       },
       "e2": {
         "text": "unevenly distributed",
-        "type": "SPACIAL PROPERTY"
+        "type": "SPATIAL PROPERTY"
       }
     },
     {
       "sentence": "Temperature regimes in alpine environments are increasingly long-term.",
       "e1": {
         "text": "temperature regimes",
-        "type": "COLLECTIVE ABIOTIC ENTITY"
+        "type": "ABIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "long-term",
@@ -151,7 +151,7 @@
           },
           "e2": {
               "text": "widely distributed",
-              "type": "SPACIAL PROPERTY"
+              "type": "SPATIAL PROPERTY"
           }
       },
       {
@@ -259,22 +259,22 @@
       "sentence": "We recorded 46 ground-dwelling mammals and birds, including several threatened Annamite endemics.",
       "e1": {
         "text": "Annamite endemics",
-        "type": "COLLECTIVE BIOTIC ENTITY"
+        "type": "BIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "ground-dwelling mammals",
-        "type": "COLLECTIVE BIOTIC ENTITY"
+        "type": "BIOTIC COLLECTIVE ENTITY"
       }
     },
       {
           "sentence": "Seasonal precipitation patterns are part of regional climate regimes.",
           "e1": {
               "text": "Seasonal precipitation patterns",
-              "type": "COLLECTIVE ABIOTIC ENTITY"
+              "type": "ABIOTIC COLLECTIVE ENTITY"
           },
           "e2": {
               "text": "regional climate regimes",
-              "type": "COLLECTIVE ABIOTIC ENTITY"
+              "type": "ABIOTIC COLLECTIVE ENTITY"
           }
       },
       {
@@ -285,7 +285,7 @@
       },
       "e2": {
         "text": "threatened and endemic species",
-        "type": "COLLECTIVE BIOTIC ENTITY"
+        "type": "BIOTIC COLLECTIVE ENTITY"
       }
     },
     {
@@ -296,7 +296,7 @@
       },
       "e2": {
         "text": "continents",
-        "type": "COLLECTIVE ABIOTIC ENTITY"
+        "type": "ABIOTIC COLLECTIVE ENTITY"
       }
     },
     {
@@ -426,7 +426,7 @@
           "sentence": "Assemblages of alpine insects are concentrated in high-elevation meadows.",
           "e1": {
               "text": "alpine insects",
-              "type": "COLLECTIVE BIOTIC ENTITY"
+              "type": "BIOTIC COLLECTIVE ENTITY"
           },
           "e2": {
               "text": "high-elevation meadows",
@@ -437,7 +437,7 @@
           "sentence": "Many large mammal communities declined rapidly during the Late Quaternary.",
           "e1": {
               "text": "large mammal communities",
-              "type": "COLLECTIVE BIOTIC ENTITY"
+              "type": "BIOTIC COLLECTIVE ENTITY"
           },
           "e2": {
               "text": "Late Quaternary",
@@ -448,7 +448,7 @@
       "sentence": "This is the first study of bacterial communities in an Andean glacier in Ecuador.",
       "e1": {
         "text": "bacterial communities",
-        "type": "COLLECTIVE ABIOTIC ENTITY"
+        "type": "ABIOTIC COLLECTIVE ENTITY"
       },
       "e2": {
         "text": "an Andean glacier",
@@ -459,7 +459,7 @@
           "sentence": "The series of temperature anomalies recorded across mountain regions forms part of the late twentieth century climate.",
           "e1": {
               "text": "temperature anomalies",
-              "type": "COLLECTIVE ABIOTIC ENTITY"
+              "type": "ABIOTIC COLLECTIVE ENTITY"
           },
           "e2": {
               "text": "late twentieth century",
