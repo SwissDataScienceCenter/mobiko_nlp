@@ -1,5 +1,7 @@
 import argparse
 import ast
+from collections import defaultdict
+import heapq
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -741,6 +743,149 @@ def extract_relational_context(sentence: str,
     return f"[{first_type}] {between} [{second_type}]"
 
 
+def build_entity_type_triplet_key(example: dict) -> Tuple[str, str, str]:
+    """Return a balancing key as (relation, e1_type, e2_type)."""
+    return (
+        str(example.get("relation", "")),
+        str(example.get("e1", {}).get("type", "")),
+        str(example.get("e2", {}).get("type", "")),
+    )
+
+
+class BucketTracker:
+    """
+    Per-bucket rolling quality tracker backed by a capped min-heap.
+
+    Maintains up to `cap` highest-similarity examples per
+    (relation, e1_type, e2_type) bucket.
+
+    Two usage modes:
+      - Mining (try_add):  accepts a candidate if the bucket is not yet full
+        OR if its similarity beats the current bucket minimum, evicting the
+        worst.  The quality floor (min sim) of each bucket never decreases.
+      - LLM streaming (add / is_full):  no eviction since examples are
+        already written to disk; just track counts so full buckets are skipped.
+    """
+
+    def __init__(self, cap: Optional[int] = None):
+        self.cap = cap
+        # min-heap per bucket: entries are (sim, uid, example_dict)
+        self._heaps: Dict[Tuple[str, str, str], list] = defaultdict(list)
+        self._uid = 0
+
+    def _next_uid(self) -> int:
+        self._uid += 1
+        return self._uid
+
+    def key(self, example: dict) -> Tuple[str, str, str]:
+        return build_entity_type_triplet_key(example)
+
+    def is_full(self, example: dict) -> bool:
+        if self.cap is None:
+            return False
+        return len(self._heaps[self.key(example)]) >= self.cap
+
+    def bucket_min_sim(self, example: dict) -> float:
+        heap = self._heaps[self.key(example)]
+        return heap[0][0] if heap else 0.0
+
+    def try_add_with_eviction(self, example: dict) -> bool:
+        """
+        Attempt to add example to its bucket (mining mode, with eviction).
+        Returns True if accepted.  When the bucket is full and the candidate
+        beats the current worst, the worst is evicted and True is returned.
+        """
+        k = self.key(example)
+        heap = self._heaps[k]
+        sim = float(example.get("similarity", 0.0))
+
+        if self.cap is None or len(heap) < self.cap:
+            heapq.heappush(heap, (sim, self._next_uid(), example))
+            return True
+
+        if sim > heap[0][0]:  # beats current worst
+            heapq.heapreplace(heap, (sim, self._next_uid(), example))
+            return True
+
+        return False
+
+    def track_accepted(self, example: dict) -> None:
+        """Add without eviction (LLM streaming mode: track confirmed YES)."""
+        k = self.key(example)
+        sim = float(example.get("similarity", 0.0))
+        heapq.heappush(self._heaps[k], (sim, self._next_uid(), example))
+
+    def all_examples(self) -> List[dict]:
+        result = []
+        for heap in self._heaps.values():
+            result.extend(ex for _, _, ex in heap)
+        return result
+
+    def print_stats(self) -> None:
+        counts = {k: len(v) for k, v in self._heaps.items() if v}
+        if not counts:
+            return
+        total = sum(counts.values())
+        print(f"\n{'Count':>8}  {'Pct':>7}  {'MinSim':>8}  Triplet")
+        print("-" * 88)
+        for k, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+            rel, t1, t2 = k
+            pct = 100 * count / total if total else 0
+            min_sim = self._heaps[k][0][0] if self._heaps[k] else 0.0
+            print(f"{count:>8}  {pct:>6.2f}%  {min_sim:>8.4f}  {rel} | {t1} | {t2}")
+        print("-" * 88)
+
+
+def limit_examples_per_entity_type_triplet(
+    examples: List[dict],
+    max_per_entity_type_triplet: Optional[int] = None,
+    min_quality_percentile: float = 0.0,
+) -> List[dict]:
+    """
+    Filter examples per (relation, e1_type, e2_type) bucket by quality.
+
+    Two complementary controls (both optional, can be combined):
+      - max_per_entity_type_triplet: hard cap — keep at most N per bucket.
+      - min_quality_percentile: percentile floor — within each bucket drop
+        the bottom P fraction by similarity score, e.g. 0.4 keeps top 60%.
+        Large buckets shrink proportionally; small buckets lose few or none
+        (always retains at least 1 example per bucket).
+
+    Examples are ranked by (similarity, sim_relational, sim_structural,
+    sim_sentence) before either filter is applied, so both controls always
+    keep the highest-quality examples.
+    """
+    if not max_per_entity_type_triplet and min_quality_percentile <= 0.0:
+        return examples
+
+    sort_key = lambda ex: (  # noqa: E731
+        float(ex.get("similarity", 0.0)),
+        float(ex.get("sim_relational", 0.0)),
+        float(ex.get("sim_structural", 0.0)),
+        float(ex.get("sim_sentence", 0.0)),
+    )
+
+    buckets: Dict[Tuple[str, str, str], List[dict]] = defaultdict(list)
+    for example in examples:
+        buckets[build_entity_type_triplet_key(example)].append(example)
+
+    limited: List[dict] = []
+    for bucket_examples in buckets.values():
+        ranked = sorted(bucket_examples, key=sort_key, reverse=True)
+
+        if min_quality_percentile > 0.0:
+            keep_n = max(1, int(len(ranked) * (1.0 - min_quality_percentile)))
+            ranked = ranked[:keep_n]
+
+        if max_per_entity_type_triplet and max_per_entity_type_triplet > 0:
+            ranked = ranked[:max_per_entity_type_triplet]
+
+        limited.extend(ranked)
+
+    limited.sort(key=sort_key, reverse=True)
+    return limited
+
+
 def mine_candidates(
     embedder: SentenceEmbedder,
     seeds: List[SeedExample],
@@ -824,6 +969,7 @@ def mine_candidates_multiview(
     w_structural: float = 0.3,
     w_relational: float = 0.4,
     w_sentence: float = 0.3,
+    bucket_tracker: Optional[BucketTracker] = None,
     min_relational_sim: float = 0.0,
 ) -> List[dict]:
     """
@@ -965,26 +1111,32 @@ def mine_candidates_multiview(
             if min_relational_sim > 0.0 and best_sub_scores[1] < min_relational_sim:
                 continue
 
-            mined.append(
-                {
-                    "paper_id": cand.paper_id,
-                    "sent_id": cand.sent_id,
-                    "relation": best_rel,
-                    "similarity": best_score,
-                    "sim_structural": best_sub_scores[0],
-                    "sim_relational": best_sub_scores[1],
-                    "sim_sentence": best_sub_scores[2],
-                    "sentence": cand.sentence,
-                    "e1": {
-                        **entity_to_output_dict(cand.e1),
-                    },
-                    "e2": {
-                        **entity_to_output_dict(cand.e2),
-                    },
-                    "marked": cand.marked,
-                }
-            )
+            example = {
+                "paper_id": cand.paper_id,
+                "sent_id": cand.sent_id,
+                "relation": best_rel,
+                "similarity": best_score,
+                "sim_structural": best_sub_scores[0],
+                "sim_relational": best_sub_scores[1],
+                "sim_sentence": best_sub_scores[2],
+                "sentence": cand.sentence,
+                "e1": {
+                    **entity_to_output_dict(cand.e1),
+                },
+                "e2": {
+                    **entity_to_output_dict(cand.e2),
+                },
+                "marked": cand.marked,
+            }
+            if bucket_tracker is not None:
+                bucket_tracker.try_add_with_eviction(example)
+            else:
+                mined.append(example)
 
+    if bucket_tracker is not None:
+        result = bucket_tracker.all_examples()
+        result.sort(key=lambda ex: float(ex.get("similarity", 0.0)), reverse=True)
+        return result
     return mined
 
 
@@ -1042,11 +1194,15 @@ def llm_filter_and_stream_yes(
     resume: bool = False,
     checkpoint_every: int = 1,
     negatives_path: Optional[Path] = None,
+    bucket_tracker: Optional[BucketTracker] = None,
 ) -> Tuple[int, int]:
     """
     Validate candidates with LLM and stream results to disk immediately.
     YES-labeled examples go to output_path; NO-labeled hard negatives go to
     negatives_path (if provided).
+    If bucket_tracker is provided, candidates whose bucket is already at cap
+    are skipped before the LLM call; confirmed YES examples are registered
+    with the tracker.
     Returns (written_yes, written_no).
     """
     to_process = candidates if max_calls is None else candidates[:max_calls]
@@ -1070,11 +1226,15 @@ def llm_filter_and_stream_yes(
         print("Checkpoint indicates all selected candidates are already processed.")
         return written_yes, written_no
 
+    skipped_by_bucket = 0
     neg_ctx = negatives_path.open(file_mode, encoding="utf8") if negatives_path is not None else None
     try:
         with output_path.open(file_mode, encoding="utf8") as f:
             for idx in tqdm(range(start_idx, total), desc="LLM validating"):
                 ex = to_process[idx]
+                if bucket_tracker is not None and bucket_tracker.is_full(ex):
+                    skipped_by_bucket += 1
+                    continue
                 verdict = validator.validate(ex)
                 ex_llm = dict(ex)
                 ex_llm.update(verdict)
@@ -1083,6 +1243,8 @@ def llm_filter_and_stream_yes(
                     f.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
                     f.flush()
                     written_yes += 1
+                    if bucket_tracker is not None:
+                        bucket_tracker.track_accepted(ex_llm)
                 elif label == "NO" and neg_ctx is not None:
                     neg_ctx.write(json.dumps(ex_llm, ensure_ascii=False) + "\n")
                     neg_ctx.flush()
@@ -1102,6 +1264,8 @@ def llm_filter_and_stream_yes(
     finally:
         if neg_ctx is not None:
             neg_ctx.close()
+    if skipped_by_bucket:
+        print(f"Skipped {skipped_by_bucket} LLM calls (bucket already at cap).")
     return written_yes, written_no
 
 
@@ -1121,7 +1285,7 @@ def main():
                         help="HF model name for embeddings.")
     parser.add_argument("--tokenizer-name", type=str, default=None,
                         help="Optional tokenizer model id/path when model repo lacks tokenizer assets.")
-    parser.add_argument("--similarity-threshold", type=float, default=0.75,
+    parser.add_argument("--similarity-threshold", type=float, default=0.65,
                         help="Cosine similarity threshold to accept a candidate (minimum: 0.5).")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="Batch size for embedding.")
@@ -1129,6 +1293,27 @@ def main():
                         help="Where to write mined (and possibly LLM-filtered) candidates as JSONL.")
     parser.add_argument("--negatives-jsonl", type=Path, default=None,
                         help="Optional path to write LLM-rejected (NO-label) hard negatives as JSONL.")
+    parser.add_argument(
+        "--max-per-entity-type-triplet",
+        "--max-per-type-triplet",
+        dest="max_per_entity_type_triplet",
+        type=int,
+        default=20,
+        help="Optional hard cap per (relation, e1_type, e2_type) bucket after mining; "
+             "keeps the highest-similarity examples in each bucket. "
+             "--max-per-type-triplet is accepted as a backward-compatible alias.",
+    )
+    parser.add_argument(
+        "--min-quality-percentile",
+        dest="min_quality_percentile",
+        type=float,
+        default=0.2,
+        help="Within each (relation, e1_type, e2_type) bucket, drop the bottom "
+             "fraction of examples by similarity score. E.g. 0.4 keeps the top "
+             "60%% of each bucket; a 100-example bucket shrinks to 60, a "
+             "4-example bucket stays at 3 (always retains at least 1). "
+             "Can be combined with --max-per-entity-type-triplet. Default: 0.0 (disabled).",
+    )
 
     # LLM options
     parser.add_argument("--use-llm", action="store_true",
@@ -1152,7 +1337,7 @@ def main():
                         help="Weight for relational context similarity (default: 0.4).")
     parser.add_argument("--w-sentence", type=float, default=0.3,
                         help="Weight for full sentence similarity (default: 0.3).")
-    parser.add_argument("--min-relational-sim", type=float, default=0.8,
+    parser.add_argument("--min-relational-sim", type=float, default=0.6,
                         help="Minimum relational context similarity to accept a candidate (default: 0.8).")
     parser.add_argument(
         "--marker-style",
@@ -1160,6 +1345,7 @@ def main():
         default="generic",
         help="Marker format: generic (<E1>/<E2>) or type-specific (<BIOTIC_ENTITY>/...).",
     )
+
 
     args = parser.parse_args()
 
@@ -1196,6 +1382,21 @@ def main():
         marker_entity_types=schema_entity_types,
     )
 
+    if args.min_quality_percentile < 0.0 or args.min_quality_percentile >= 1.0:
+        parser.error(
+            f"--min-quality-percentile must be in [0.0, 1.0), got {args.min_quality_percentile}"
+        )
+    if args.max_per_entity_type_triplet is not None and args.max_per_entity_type_triplet < 1:
+        parser.error(
+            "--max-per-entity-type-triplet must be >= 1, "
+            f"got {args.max_per_entity_type_triplet}"
+        )
+
+
+    # Online quality-aware bucket tracker: maintains top-K per (rel, e1_type, e2_type)
+    # during mining via eviction, so the quality floor never decreases.
+    mining_tracker = BucketTracker(cap=args.max_per_entity_type_triplet)
+
     print(f"Using multiview weights: structural={args.w_structural}, "
           f"relational={args.w_relational}, sentence={args.w_sentence}")
     mined = mine_candidates_multiview(
@@ -1208,10 +1409,24 @@ def main():
         w_relational=args.w_relational,
         w_sentence=args.w_sentence,
         min_relational_sim=args.min_relational_sim,
+        bucket_tracker=mining_tracker,
     )
     print(f"Mined {len(mined)} candidates above similarity {args.similarity_threshold}.")
     if mined:
         print(mined[0])
+    mining_tracker.print_stats()
+
+    # Post-hoc percentile trim (optional; operates on top of the online cap)
+    if args.min_quality_percentile > 0.0:
+        original_count = len(mined)
+        mined = limit_examples_per_entity_type_triplet(
+            mined,
+            min_quality_percentile=args.min_quality_percentile,
+        )
+        print(
+            f"Applied min_quality_percentile={args.min_quality_percentile}: "
+            f"kept {len(mined)}/{original_count} mined candidates."
+        )
 
     # Optional LLM validation
     if args.use_llm:
@@ -1223,6 +1438,8 @@ def main():
         print(f"Running LLM validation with model={args.llm_model} ...")
         print(f"Checkpoint file: {checkpoint_path} (resume={args.resume}, every={args.checkpoint_every})")
         validator = OpenAILLMValidator(model_name=args.llm_model)
+        # Separate tracker for LLM step: tracks YES written to disk (no eviction)
+        llm_tracker = BucketTracker(cap=args.max_per_entity_type_triplet)
         written_yes, written_no = llm_filter_and_stream_yes(
             candidates=mined,
             validator=validator,
@@ -1232,10 +1449,12 @@ def main():
             resume=args.resume,
             checkpoint_every=args.checkpoint_every,
             negatives_path=args.negatives_jsonl,
+            bucket_tracker=llm_tracker,
         )
         print(f"Wrote {written_yes} YES records to {args.output_jsonl}")
         if args.negatives_jsonl is not None:
             print(f"Wrote {written_no} NO (hard negative) records to {args.negatives_jsonl}")
+        llm_tracker.print_stats()
         return
 
     with args.output_jsonl.open("w", encoding="utf8") as f:
