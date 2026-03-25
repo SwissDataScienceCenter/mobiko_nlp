@@ -353,7 +353,8 @@ Return a JSON object with keys:
 def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict) -> str:
     return f"""\
 You are Critic, a QA reviewer for biodiversity annotations.
-Review the Annotator's labels against the guideline and schema.
+Review the Annotator’s labels against the guideline and schema.
+It’s not necessary to fully agree with each other’s perspectives, as our objective is to find the correct answer.
 
 ## Entity Type Schema
 {entity_schema}
@@ -366,8 +367,8 @@ Review the Annotator's labels against the guideline and schema.
 
 ## Process
 1. Check EVERY entity annotation against the step-by-step key.
-2. Use schema_lookup to verify each relation's type pair.
-3. Use consistency_check for spans you're unsure about.
+2. Use schema_lookup to verify each relation’s type pair.
+3. Use consistency_check for spans you’re unsure about.
 4. Flag guideline violations, missing entities, wrong types.
 
 ## Output
@@ -377,7 +378,9 @@ Return a JSON object with keys:
 - "missing_annotations": [{{"text","entity_type","reasoning"}}]
 - "reasoning": your detailed review
 
-When there are no critical disagreements left, include "TERMINATE" in your response.
+TERMINATION RULE: If your "disagreements" list is empty and "missing_annotations" is empty,
+you MUST end your entire response with the word TERMINATE on its own line. Do not ask follow-up
+questions or summarise — just output the JSON and then TERMINATE.
 """
 
 
@@ -434,6 +437,36 @@ def _register_tools_on_agents(caller: ConversableAgent, executor: ConversableAge
             name=func.__name__,
             description=desc,
         )
+
+
+# ─────────────────────────────────────────────────────────────
+# Termination helpers
+# ─────────────────────────────────────────────────────────────
+
+def _critic_is_satisfied(msg: dict) -> bool:
+    """
+    Return True when the Critic's message signals no remaining issues.
+
+    Checks for explicit TERMINATE first, then falls back to parsing the
+    Critic's JSON: if both 'disagreements' and 'missing_annotations' are
+    empty lists, the conversation can stop without the LLM saying TERMINATE.
+    """
+    content = msg.get("content", "") or ""
+    if "TERMINATE" in content:
+        return True
+    # Strip thinking blocks before trying to parse JSON
+    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            no_disagreements = len(parsed.get("disagreements", ["placeholder"])) == 0
+            no_missing = len(parsed.get("missing_annotations", ["placeholder"])) == 0
+            if no_disagreements and no_missing:
+                return True
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -502,7 +535,9 @@ class MultiAgentAnnotator:
             system_message=_annotator_system_msg(guideline_summary, entity_schema_str, relation_schema),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
-            is_termination_msg=lambda msg: "TERMINATE" in (msg.get("content", "") or ""),
+            # Annotator receives Critic messages: stop when Critic is satisfied,
+            # whether or not it remembered to write "TERMINATE".
+            is_termination_msg=_critic_is_satisfied,
         )
 
         self.critic = ConversableAgent(
@@ -544,14 +579,16 @@ class MultiAgentAnnotator:
         Run the full 3-agent deliberation on one sentence.
 
         Flow:
-        1. Annotator↔Critic chat (max_rounds turns each).
-           Critic says TERMINATE when no critical issues remain.
+        1. Critic sends the task to the Annotator (initiates chat).
+           Annotator generates its annotation once as the first reply.
+           Critic reviews; says TERMINATE immediately if no critical issues.
+           Otherwise Annotator revises and Critic re-reviews, up to max_rounds.
         2. Adjudicator receives the full Annotator↔Critic transcript
            and produces the final labels.
         """
         record = DeliberationRecord(sentence=sentence)
 
-        # ── Phase 1a: Task proxy → Annotator (get initial annotation) ───
+        # ── Build task message ────────────────────────────────
         task_msg = f'Annotate this sentence:\n\n"{sentence}"'
         if pre_identified_entities:
             task_msg += (
@@ -559,47 +596,41 @@ class MultiAgentAnnotator:
                 f"{json.dumps(pre_identified_entities, ensure_ascii=False, indent=2)}"
             )
 
-        logger.info("Phase 1a: Task proxy → Annotator (generating initial annotation)")
+        # ── Phase 1: Annotator ↔ Critic deliberation ─────────
+        # The Critic initiates by forwarding the task to the Annotator.
+        # This way the Annotator produces its annotation exactly once (as its
+        # first reply), avoiding the duplication that arose when Phase 1a ran a
+        # separate chat and then the same annotation text was re-sent as the
+        # opening message of the deliberation.
+        #
+        # Turn counts (Critic is initiator):
+        #   Turn 1 : Annotator generates annotation
+        #   Turn 2 : Critic reviews  → says TERMINATE if no critical issues
+        #   Turn 3+: Annotator / Critic exchange until TERMINATE or max_turns
+        logger.info("Phase 1: Annotator ↔ Critic deliberation")
 
-        # A plain proxy with no LLM sends the task to the Annotator.
-        # The Annotator's LLM then generates the annotation and replies.
-        task_proxy = ConversableAgent(
-            name="Task",
-            llm_config=False,
-            human_input_mode="NEVER",
-            is_termination_msg=lambda msg: True,  # stop after one Annotator reply
-        )
-        annotator_result = task_proxy.initiate_chat(
+        # max_turns = 1 (annotation) + max_rounds review cycles × 2 (critic+annotator)
+        deliberation_max_turns = self.max_rounds * 2 + 1
+
+        chat_result = self.critic.initiate_chat(
             recipient=self.annotator,
             message=task_msg,
-            max_turns=1,
-        )
-        annotation_msg = annotator_result.chat_history[-1].get("content", task_msg)
-
-        # ── Phase 1b: Annotator ↔ Critic deliberation ────────
-        logger.info("Phase 1b: Annotator ↔ Critic deliberation")
-
-        # Annotator starts the review by sending its annotation to the Critic.
-        # In AG2, one turn = one full round-trip (annotator speaks + critic speaks).
-        chat_result = self.annotator.initiate_chat(
-            recipient=self.critic,
-            message=annotation_msg,
-            max_turns=self.max_rounds,
-            summary_method="reflection_with_llm",
-            summary_args={"summary_prompt": (
-                "Summarize the annotation discussion. List all entities and "
-                "relations that were agreed upon, and any unresolved disagreements."
-            )},
+            max_turns=deliberation_max_turns,
         )
 
-        # Collect messages from the deliberation
+        # Collect messages from the deliberation (skip the initiating task_msg
+        # from the Critic — it is just a relay and adds no annotation content).
         deliberation_messages = []
-        for msg in chat_result.chat_history:
+        for i, msg in enumerate(chat_result.chat_history):
+            if i == 0:
+                # This is the Critic's initiating task message; skip it.
+                continue
             deliberation_messages.append({
                 "agent": msg.get("name", msg.get("role", "unknown")),
                 "content": msg.get("content", ""),
             })
         record.messages = deliberation_messages
+        # Each deliberation "round" = one Annotator turn + one Critic turn
         record.rounds_used = len(deliberation_messages) // 2
 
         # ── Phase 2: Adjudicator resolves ─────────────────────
@@ -618,7 +649,7 @@ class MultiAgentAnnotator:
         adj_result = self.adjudicator.initiate_chat(
             recipient=self.tool_executor,
             message=adjudicator_msg,
-            max_turns=1,  # allow a couple of tool calls then final answer
+            max_turns=3,  # tool_executor turn + adjudicator reply + up to 1 extra tool round
         )
 
         # Extract final output from adjudicator's last message
@@ -701,14 +732,24 @@ class MultiAgentAnnotator:
     def _try_parse_json(text: str) -> Optional[Dict]:
         # Remove thinking blocks
         cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-        # Try extracting JSON
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-        return None
+        # Scan for all valid top-level JSON objects and return the last one.
+        # Using raw_decode avoids the greedy-regex pitfall where multiple JSON
+        # blocks in one string (e.g. a transcript) are merged into invalid JSON.
+        decoder = json.JSONDecoder()
+        last_obj = None
+        i = 0
+        while i < len(cleaned):
+            if cleaned[i] == "{":
+                try:
+                    obj, end = decoder.raw_decode(cleaned, i)
+                    if isinstance(obj, dict):
+                        last_obj = obj
+                    i = end
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            i += 1
+        return last_obj
 
     @staticmethod
     def _extract_last_json(chat_history: list) -> Optional[Dict]:
