@@ -323,38 +323,52 @@ def _build_guideline_summary(sections: List[Dict[str, str]]) -> str:
 
 def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: dict) -> str:
     return f"""\
-You are Annotator, a biodiversity NLP expert. You have to annotate all entities and relations between them 
-in the given sentence following the MoBiKo labelling guideline.
+You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM COVERAGE: identify \
+and annotate every possible entity and every valid relation (triplet) in the given sentence. \
+It is far better to over-annotate than to miss entities or relations — the Critic will filter errors later.
 
 ## Entity Type Schema
 {entity_schema}
 
-## Relation schema
+## Relation Schema
 {relation_schema}
 
 ## Guideline Summary
 {guideline}
 
+## Available Tools
+- list_entity_types   : retrieve the full list of valid entity types
+- schema_lookup       : check which relations are valid for a pair of entity types
+- guideline_search    : search the labelling guideline when a classification is unclear
+
 ## Process
-1. Identify meaningful entity spans.
-2. Classify each using Steps 1-6 (domain + ontological role).
-3. Use schema_lookup to verify entity type pairs → valid relations.
-4. Use guideline_search and consistency_check when uncertain.
+1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
+2. For each candidate span, call list_entity_types to confirm the type exists, then assign the best type \
+   using Steps 1-6 (domain + ontological role) from the guideline.
+3. For every pair of annotated entities, call schema_lookup to find valid relations. \
+   Annotate ALL valid triplets (e1, relation, e2).
+4. Call guideline_search when a classification is ambiguous.
+
+## Coverage Rules
+- Prefer more entities over fewer: if a span could plausibly be an entity, include it.
+- Propose ALL relations schema_lookup returns as valid for a given entity-type pair.
+- List ambiguous spans in "uncertain_cases" rather than dropping them.
 
 ## Output
 Return a JSON object with keys:
 - "entities": [{{"text","entity_type","guideline_step","confidence"}}]
 - "relations": [{{"relation","e1_text","e1_type","e2_text","e2_type","confidence","reasoning"}}]
-- "uncertain_cases": [descriptions of ambiguous spans]
+- "uncertain_cases": [descriptions of ambiguous spans you kept but flagged]
 - "reasoning": your step-by-step thought process
 """
 
 
 def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict) -> str:
     return f"""\
-You are Critic, a QA reviewer for biodiversity annotations.
-Review the Annotator’s labels against the guideline and schema.
-It’s not necessary to fully agree with each other’s perspectives, as our objective is to find the correct answer.
+You are Critic, a rigorous QA reviewer for biodiversity annotations. \
+Your objective is precision: scrutinise every label the Annotator proposes, \
+challenge anything that is incorrect or ambiguous, and surface anything that was missed. \
+Disagreement is expected and productive — correctness matters more than consensus.
 
 ## Entity Type Schema
 {entity_schema}
@@ -362,21 +376,46 @@ It’s not necessary to fully agree with each other’s perspectives, as our obj
 ## Guideline Summary
 {guideline}
 
-## Relation schema
+## Relation Schema
 {relation_schema}
 
-## Process
-1. Check EVERY entity annotation against the step-by-step key.
-2. Use schema_lookup to verify each relation’s type pair.
-3. Use consistency_check for spans you’re unsure about.
-4. Flag guideline violations, missing entities, wrong types.
+## Available Tools
+- guideline_search   : retrieve the exact guideline rule that applies to a disputed span
+- schema_lookup      : verify that a relation is valid for a given entity-type pair
+- consistency_check  : compare a span against seed examples to detect labelling inconsistencies
+- list_entity_types  : confirm entity type names
+
+## Review Process
+Work through the annotation systematically in this order:
+
+1. **Guideline violations** — for each entity label, call guideline_search with the span text \
+   and its proposed type. Check whether the guideline’s step-by-step decision tree supports \
+   the chosen category. Flag any label that contradicts the guideline rules.
+
+2. **Category confusions** — look for common misclassifications:
+   - BIOTIC PROPERTY vs ABIOTIC PROPERTY (check the modified noun, not the adjective)
+   - BIOTIC ENTITY vs BIOTIC COLLECTIVE ENTITY (individual/taxon vs assemblage)
+   - SPATIAL ENTITY vs ABIOTIC ENTITY (place/unit of analysis vs physical object)
+   - CONCEPT vs any concrete category (abstract theoretical construct vs real-world referent)
+   - BIOTIC PROCESS vs ANTHROPOGENIC PROCESS (organism-driven vs human-driven activity)
+   For each suspected confusion, call guideline_search to cite the relevant rule.
+
+3. **Edge cases** — spans that sit on a categorical boundary. Use consistency_check to see \
+   how similar spans were labelled in seed examples. If the seed label differs, flag it.
+
+4. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the \
+   relation is valid for that entity-type pair. Flag invalid or missing relations.
+
+5. **Missing spans** — re-read the original sentence. Identify any entity spans the \
+   Annotator overlooked. For each, state the span text, the correct entity type, and cite \
+   the guideline step that supports it.
 
 ## Output
 Return a JSON object with keys:
 - "agreements": [list of correct annotations]
 - "disagreements": [{{"target","annotator_label","proposed_label","guideline_reference","severity","explanation"}}]
-- "missing_annotations": [{{"text","entity_type","reasoning"}}]
-- "reasoning": your detailed review
+- "missing_annotations": [{{"text","entity_type","guideline_step","reasoning"}}]
+- "reasoning": your detailed step-by-step review
 
 TERMINATION RULE: If your "disagreements" list is empty and "missing_annotations" is empty,
 you MUST end your entire response with the word TERMINATE on its own line. Do not ask follow-up
@@ -419,7 +458,15 @@ End with "TERMINATE".
 # Tool registration helper
 # ─────────────────────────────────────────────────────────────
 
-TOOL_FUNCTIONS = [
+# Tools focused on proposing comprehensive annotations (entity + relation coverage)
+ANNOTATOR_TOOL_FUNCTIONS = [
+    (list_entity_types, "List all valid entity types from the schema."),
+    (schema_lookup, "Check which relations are valid between two entity types."),
+    (guideline_search, "Search the labelling guideline for relevant rules."),
+]
+
+# Tools focused on verifying and quality-checking annotations
+CRITIC_TOOL_FUNCTIONS = [
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
     (consistency_check, "Find how similar spans were labelled in seed examples."),
@@ -427,9 +474,13 @@ TOOL_FUNCTIONS = [
 ]
 
 
-def _register_tools_on_agents(caller: ConversableAgent, executor: ConversableAgent):
-    """Register all annotation tools: caller proposes, executor runs."""
-    for func, desc in TOOL_FUNCTIONS:
+def _register_tools_on_agents(
+    caller: ConversableAgent,
+    executor: ConversableAgent,
+    tool_functions: list,
+):
+    """Register the given tool functions: caller proposes, executor runs."""
+    for func, desc in tool_functions:
         register_function(
             func,
             caller=caller,
@@ -565,10 +616,12 @@ class MultiAgentAnnotator:
         )
 
         # ── Register tools ───────────────────────────────────
-        # Each LLM agent can propose tool calls; the executor runs them.
-        _register_tools_on_agents(self.annotator, self.tool_executor)
-        _register_tools_on_agents(self.critic, self.tool_executor)
-        _register_tools_on_agents(self.adjudicator, self.tool_executor)
+        # Annotator: coverage-focused tools (entity schema, relation schema, guideline)
+        _register_tools_on_agents(self.annotator, self.tool_executor, ANNOTATOR_TOOL_FUNCTIONS)
+        # Critic: QA-focused tools (adds consistency_check against seed examples)
+        _register_tools_on_agents(self.critic, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
+        # Adjudicator: same QA set as the Critic
+        _register_tools_on_agents(self.adjudicator, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
 
     def annotate_sentence(
         self,
