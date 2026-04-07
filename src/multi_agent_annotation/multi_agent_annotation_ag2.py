@@ -25,9 +25,10 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, Tuple, Any
+
+from pydantic import BaseModel, Field, ValidationError
 
 from autogen import (
     ConversableAgent,
@@ -42,11 +43,10 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
-# Data structures  (unchanged from vanilla version)
+# Data structures
 # ─────────────────────────────────────────────────────────────
 
-@dataclass
-class EntityAnnotation:
+class EntityAnnotation(BaseModel):
     text: str
     entity_type: str
     start: Optional[int] = None
@@ -56,8 +56,7 @@ class EntityAnnotation:
     reasoning: Optional[str] = None
 
 
-@dataclass
-class RelationAnnotation:
+class RelationAnnotation(BaseModel):
     relation: str
     e1: EntityAnnotation
     e2: EntityAnnotation
@@ -65,14 +64,80 @@ class RelationAnnotation:
     reasoning: Optional[str] = None
 
 
-@dataclass
-class DeliberationRecord:
+class DeliberationRecord(BaseModel):
     sentence: str
-    messages: List[Dict[str, Any]] = field(default_factory=list)
-    final_entities: List[EntityAnnotation] = field(default_factory=list)
-    final_relations: List[RelationAnnotation] = field(default_factory=list)
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    final_entities: List[EntityAnnotation] = Field(default_factory=list)
+    final_relations: List[RelationAnnotation] = Field(default_factory=list)
     agreement_score: Optional[float] = None
     rounds_used: int = 0
+
+
+# ─────────────────────────────────────────────────────────────
+# Agent output schemas
+# ─────────────────────────────────────────────────────────────
+
+class RelationFlat(BaseModel):
+    """Flat relation format as output by LLM agents (e1_text/e1_type instead of nested model)."""
+    relation: str
+    e1_text: str
+    e1_type: str
+    e2_text: str
+    e2_type: str
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+
+    def to_relation_annotation(self) -> RelationAnnotation:
+        return RelationAnnotation(
+            relation=self.relation,
+            e1=EntityAnnotation(text=self.e1_text, entity_type=self.e1_type),
+            e2=EntityAnnotation(text=self.e2_text, entity_type=self.e2_type),
+            confidence=self.confidence,
+            reasoning=self.reasoning,
+        )
+
+
+class AnnotatorOutput(BaseModel):
+    entities: List[EntityAnnotation] = Field(default_factory=list)
+    relations: List[RelationFlat] = Field(default_factory=list)
+    uncertain_cases: List[str] = Field(default_factory=list)
+    reasoning: str = ""
+
+
+class CriticDisagreement(BaseModel):
+    target: str = ""
+    annotator_label: str = ""
+    proposed_label: str = ""
+    guideline_reference: str = ""
+    severity: str = ""
+    explanation: str = ""
+
+
+class CriticMissingAnnotation(BaseModel):
+    text: str = ""
+    entity_type: str = ""
+    guideline_step: str = ""
+    reasoning: str = ""
+
+
+class CriticOutput(BaseModel):
+    agreements: List[str] = Field(default_factory=list)
+    disagreements: List[CriticDisagreement] = Field(default_factory=list)
+    missing_annotations: List[CriticMissingAnnotation] = Field(default_factory=list)
+    reasoning: str = ""
+
+
+class DisagreementResolution(BaseModel):
+    issue: str = ""
+    decision: str = ""
+    rationale: str = ""
+
+
+class AdjudicatorOutput(BaseModel):
+    final_entities: List[EntityAnnotation] = Field(default_factory=list)
+    final_relations: List[RelationFlat] = Field(default_factory=list)
+    disagreement_resolutions: List[DisagreementResolution] = Field(default_factory=list)
+    flagged_for_human_review: List[str] = Field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -416,11 +481,12 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 - List ambiguous spans in "uncertain_cases" rather than dropping them.
 
 ## Output
-Return a JSON object with keys:
-- "entities": [{{"text","entity_type","guideline_step","confidence"}}]
-- "relations": [{{"relation","e1_text","e1_type","e2_text","e2_type","confidence","reasoning"}}]
-- "uncertain_cases": [descriptions of ambiguous spans you kept but flagged]
-- "reasoning": your step-by-step thought process
+Return a JSON object conforming exactly to this schema:
+{json.dumps(AnnotatorOutput.model_json_schema(), indent=2)}
+
+Output rules:
+- Return JSON only. Do not include commentary, markdown, or <think> blocks.
+- Keep every reasoning field brief and evidence-based.
 """
 
 
@@ -472,15 +538,17 @@ Work through the annotation systematically in this order:
    the guideline step that supports it.
 
 ## Output
-Return a JSON object with keys:
-- "agreements": [list of correct annotations]
-- "disagreements": [{{"target","annotator_label","proposed_label","guideline_reference","severity","explanation"}}]
-- "missing_annotations": [{{"text","entity_type","guideline_step","reasoning"}}]
-- "reasoning": your detailed step-by-step review
+Return a JSON object conforming exactly to this schema:
+{json.dumps(CriticOutput.model_json_schema(), indent=2)}
 
 TERMINATION RULE: If your "disagreements" list is empty and "missing_annotations" is empty,
 you MUST end your entire response with the word TERMINATE on its own line. Do not ask follow-up
 questions or summarise — just output the JSON and then TERMINATE.
+
+Output rules:
+- Return JSON only, optionally followed by TERMINATE on its own line.
+- Do not restate the sentence or the full annotation.
+- Limit each disagreement to the minimal concrete correction needed.
 """
 
 
@@ -506,13 +574,14 @@ You see the Annotator's labels and the Critic's review.
 
 ## Output
 
-You have to return a JSON object with keys:
-- "final_entities": [{{"text","entity_type","confidence","source","guideline_step"}}]
-- "final_relations": [{{"relation","e1_text","e1_type","e2_text","e2_type","confidence","reasoning"}}]
-- "disagreement_resolutions": [{{"issue","decision","rationale"}}]
-- "flagged_for_human_review": [genuinely ambiguous cases]
+You have to return a JSON object conforming exactly to this schema:
+{json.dumps(AdjudicatorOutput.model_json_schema(), indent=2)}
 
 You must return this JSON right before the end of your message, and your message must end with "TERMINATE" on its own line.
+
+Output rules:
+- Return JSON only, then TERMINATE.
+- Do not reproduce the prior transcript.
 
 """
 
@@ -811,33 +880,22 @@ class MultiAgentAnnotator:
 
         # ── Parse final annotations ───────────────────────────
         if adj_output:
-            for ent in adj_output.get("final_entities", []):
-                record.final_entities.append(EntityAnnotation(
-                    text=ent.get("text", ""),
-                    entity_type=ent.get("entity_type", ""),
-                    confidence=ent.get("confidence"),
-                    guideline_step=ent.get("guideline_step"),
-                ))
-            for rel in adj_output.get("final_relations", []):
-                e1 = EntityAnnotation(text=rel.get("e1_text", ""), entity_type=rel.get("e1_type", ""))
-                e2 = EntityAnnotation(text=rel.get("e2_text", ""), entity_type=rel.get("e2_type", ""))
-                record.final_relations.append(RelationAnnotation(
-                    relation=rel.get("relation", ""),
-                    e1=e1, e2=e2,
-                    confidence=rel.get("confidence"),
-                    reasoning=rel.get("reasoning"),
-                ))
+            try:
+                parsed_adj = AdjudicatorOutput.model_validate(adj_output)
+                record.final_entities = parsed_adj.final_entities
+                record.final_relations = [r.to_relation_annotation() for r in parsed_adj.final_relations]
+            except ValidationError as e:
+                logger.warning(f"AdjudicatorOutput validation error: {e}")
 
         # ── Compute agreement ─────────────────────────────────
         # Parse critic messages to count agreements vs disagreements
         n_agree, n_disagree = 0, 0
         for msg in deliberation_messages:
-            content = msg.get("content", "")
             if msg["agent"] == "Critic":
-                parsed = self._try_parse_json(content)
-                if parsed:
-                    n_agree += len(parsed.get("agreements", []))
-                    n_disagree += len(parsed.get("disagreements", []))
+                critic_out = self._parse_critic_output(msg.get("content", ""))
+                if critic_out:
+                    n_agree += len(critic_out.agreements)
+                    n_disagree += len(critic_out.disagreements)
         total = n_agree + n_disagree
         record.agreement_score = n_agree / total if total > 0 else 1.0
 
@@ -914,17 +972,31 @@ class MultiAgentAnnotator:
         return None
 
     @staticmethod
+    def _parse_critic_output(text: str) -> Optional[CriticOutput]:
+        raw = MultiAgentAnnotator._try_parse_json(text)
+        if raw is None:
+            return None
+        try:
+            return CriticOutput.model_validate(raw)
+        except ValidationError as e:
+            logger.warning(f"CriticOutput validation failed: {e}")
+            return None
+
+    @staticmethod
+    def _parse_adjudicator_output(text: str) -> Optional[AdjudicatorOutput]:
+        raw = MultiAgentAnnotator._try_parse_json(text)
+        if raw is None:
+            return None
+        try:
+            return AdjudicatorOutput.model_validate(raw)
+        except ValidationError as e:
+            logger.warning(f"AdjudicatorOutput validation failed: {e}")
+            return None
+
+    @staticmethod
     def _append_jsonl(record: DeliberationRecord, path: Path):
-        obj = {
-            "sentence": record.sentence,
-            "final_entities": [asdict(e) for e in record.final_entities],
-            "final_relations": [asdict(r) for r in record.final_relations],
-            "agreement_score": record.agreement_score,
-            "rounds_used": record.rounds_used,
-            "messages": record.messages,
-        }
         with path.open("a", encoding="utf8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            f.write(record.model_dump_json() + "\n")
 
 
 # ─────────────────────────────────────────────────────────────
