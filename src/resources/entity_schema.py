@@ -636,6 +636,24 @@ Temporal property (A temporal descriptor or metric)
         long-term
         phenological timing
         short term
+
+Quantitative property (A measurable attribute that can be expressed as a quantity)
+        rate
+        mean
+        percentage
+        index
+        number
+        count
+        density
+        frequency
+        magnitude
+    
+Qualitative property (A non-numeric attribute that describes a quality or category)
+        high/low
+        present/absent
+        increasing/decreasing
+        good/poor
+        big/small
 """
 
 SCHEMA_BIODIV_SHORT = """
@@ -669,6 +687,10 @@ SPATIAL PROPERTY (DEFINITION: A geometric or positional descriptor of an entity,
 TEMPORAL ENTITY (DEFINITION: A named or identifiable time period or phase, e.g., breeding season, monsoon, Holocene)
 
 TEMPORAL PROPERTY (DEFINITION: A temporal descriptor or metric, e.g., annual, decadal, phenological timing)
+
+QUANTITATIVE PROPERTY (DEFINITION: A measurable attribute that can be expressed as a quantity, e.g., rate, mean, percentage, index)
+
+QUALITATIVE PROPERTY (DEFINITION: A non-numeric attribute that describes a quality or category, e.g., high/low, present/absent, increasing/decreasing, good/poor)
 """
 
 SCHEMA_BIODIV_LIST = [
@@ -687,5 +709,7 @@ SCHEMA_BIODIV_LIST = [
     "SPATIAL ENTITY",
     "SPATIAL PROPERTY",
     "TEMPORAL ENTITY",
-    "TEMPORAL PROPERTY"
+    "TEMPORAL PROPERTY",
+    "QUANTITATIVE PROPERTY",
+    "QUALITATIVE PROPERTY",
 ]
