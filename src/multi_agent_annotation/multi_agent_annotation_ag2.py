@@ -165,42 +165,37 @@ load_seeds = load_schema  # same format
 
 def load_decision_support(path: Path) -> List[Dict[str, str]]:
     """
-    Parse Decision support.docx — a table-based decision guide.
-    Each table row (category, question, examples, definition) becomes one section.
-    Falls back to an empty list if the file is missing or python-docx is unavailable.
+    Parse Decision_support.csv — a table-based decision guide.
+    Each row (LABEL, Question, Examples, Definition) becomes one section.
+    Falls back to an empty list if the file is missing or unreadable.
     """
     try:
-        from docx import Document
-        doc = Document(str(path))
-        sections: List[Dict[str, str]] = []
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells]
-                # Skip header rows and rows without enough content
-                if len(cells) < 2 or not cells[0] or cells[0].lower() in {
-                    "category", "entity type", "label", "type", ""
-                }:
-                    continue
-                category = cells[0]
-                question = cells[1] if len(cells) > 1 else ""
-                examples = cells[2] if len(cells) > 2 else ""
-                definition = cells[3] if len(cells) > 3 else ""
-                # Build title from category + question; skip fully empty rows
-                title_parts = [p for p in [category, question] if p]
-                if not title_parts:
-                    continue
-                content_parts = []
-                if definition:
-                    content_parts.append(f"Definition: {definition}")
-                if examples:
-                    content_parts.append(f"Examples: {examples}")
-                sections.append({
-                    "title": " — ".join(title_parts),
-                    "content": "\n".join(content_parts) if content_parts else question,
-                    "source": "decision_support",
-                })
-        return sections if sections else _get_embedded_guideline()
-    except (ImportError, Exception):
+        if path.suffix.lower() == ".csv":
+            import csv
+            sections: List[Dict[str, str]] = []
+            with open(path, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    label = (row.get("LABEL") or "").strip()
+                    question = (row.get("Question") or "").strip()
+                    examples = (row.get("Examples") or "").strip()
+                    definition = (row.get("Definition") or "").strip()
+                    if not label:
+                        continue
+                    content_parts = []
+                    if question:
+                        content_parts.append(f"Question: {question}")
+                    if definition:
+                        content_parts.append(f"Definition: {definition}")
+                    if examples:
+                        content_parts.append(f"Examples: {examples}")
+                    sections.append({
+                        "title": label,
+                        "content": "\n".join(content_parts),
+                        "source": "decision_support",
+                    })
+            return sections if sections else _get_embedded_guideline()
+    except Exception:
         return _get_embedded_guideline()
 
 
@@ -209,7 +204,7 @@ _MOBIKO_V2_SECTION_STARTS = (
     re.compile(r"^Step \d"),
     re.compile(r"^[IVX]+\."),
     re.compile(r"^(Step 1: identifying spans|Step 2: Labelling spans|General rules|Handling difficult|Typical difficult|Rule|Needs further"
-               r"|Species and Taxonomic|Ecological Attributes|System-Level|Polysemic terms|Polysemic Terms"
+               r"|Species and Taxonomic|Ecological Attributes|Human research activities|System-Level|Polysemic terms|Polysemic Terms"
                r"|Typical Difficult Cases|Rule for Tiebreaker)", re.IGNORECASE),
 )
 
@@ -593,7 +588,7 @@ def _critic_is_satisfied(msg: dict) -> bool:
 # ─────────────────────────────────────────────────────────────
 
 _THIS_DIR = Path(__file__).resolve().parent
-_DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision support.docx"
+_DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision_support.csv"
 _DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo label guidance draft v2.docx"
 
 
