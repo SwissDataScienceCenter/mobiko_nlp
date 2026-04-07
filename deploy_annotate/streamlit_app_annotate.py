@@ -700,7 +700,28 @@ def _label_options(cur_key, proposals):
 
 
 # Sentence navigation
-idx = st.slider("Sentence index", 0, len(keys)-1, 0, 1)
+if "sentence_idx" not in st.session_state:
+    st.session_state.sentence_idx = 0
+st.session_state.sentence_idx = max(0, min(st.session_state.sentence_idx, len(keys) - 1))
+
+nav_col1, nav_col2, nav_col3, nav_col4 = st.columns([1, 4, 2, 1])
+with nav_col1:
+    if st.button("◀ Prev", disabled=st.session_state.sentence_idx == 0):
+        st.session_state.sentence_idx -= 1
+        st.rerun()
+with nav_col2:
+    st.markdown(f"<div style='text-align:center;padding-top:6px'>Sentence {st.session_state.sentence_idx + 1} / {len(keys)}</div>", unsafe_allow_html=True)
+with nav_col3:
+    jump = st.number_input("Jump to", min_value=1, max_value=len(keys), value=st.session_state.sentence_idx + 1, step=1, label_visibility="collapsed")
+    if jump - 1 != st.session_state.sentence_idx:
+        st.session_state.sentence_idx = jump - 1
+        st.rerun()
+with nav_col4:
+    if st.button("Next ▶", disabled=st.session_state.sentence_idx == len(keys) - 1):
+        st.session_state.sentence_idx += 1
+        st.rerun()
+
+idx = st.session_state.sentence_idx
 cur_key = keys[idx]
 
 text = extract_text(gold.get(cur_key, []) or model.get(cur_key, []))
