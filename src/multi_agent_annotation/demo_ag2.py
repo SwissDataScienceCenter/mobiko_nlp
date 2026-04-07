@@ -35,8 +35,12 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     analyze_disagreements,
     load_schema,
     load_seeds,
+    load_decision_support,
+    load_guideline_from_docx,
     _init_tool_state,
     _ALL_ENTITY_TYPES,
+    _DEFAULT_DECISION_SUPPORT,
+    _DEFAULT_GUIDELINE,
     schema_lookup,
     guideline_search,
     consistency_check,
@@ -45,18 +49,14 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
 
 
 
+os.environ["OPEN_WEB_UI_API_KEY"] = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjcyNDE1ZDA3MmUwMjkzZDg5MmFhODliMTkzNDI2MTE3IiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2F1dGhlbnRpay1zZXJ2ZXItcnVuYWktY29kZXYtbGxtLmluZmVyZW5jZS5jb21wdXRlLmRhdGFzY2llbmNlLmNoL2FwcGxpY2F0aW9uL28vdmxsbS8iLCJzdWIiOiJiOWM3YWQ1ZmQ3NjMzNTRiZDdiMTQwZWNjOGVmN2E2YmFkNWIwMTdmODcwY2ExYjk1MWNiZDcwMGZiNDk5NDE5IiwiYXVkIjoiMDlCcm9CdlJFWEZTWVhCVGt3c2UwUGxPRjV3MXJtcmsiLCJleHAiOjE3NzcxMTA0NzIsImlhdCI6MTc3NDUxODQ3MiwiYXV0aF90aW1lIjoxNzc0NTE4NDcyLCJhY3IiOiJnb2F1dGhlbnRpay5pby9wcm92aWRlcnMvb2F1dGgyL2RlZmF1bHQiLCJlbWFpbCI6ImFuaXNpYS5rYXRpbnNrYWlhQGVwZmwuY2giLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwibmFtZSI6IkFuaXNpYSBLYXRpbnNrYWlhIiwiZ2l2ZW5fbmFtZSI6IkFuaXNpYSBLYXRpbnNrYWlhIiwicHJlZmVycmVkX3VzZXJuYW1lIjoia2F0aW5za2FpYSIsIm5pY2tuYW1lIjoia2F0aW5za2FpYSIsImdyb3VwcyI6W10sImF6cCI6IjA5QnJvQnZSRVhGU1lYQlRrd3NlMFBsT0Y1dzFybXJrIiwidWlkIjoiUkN0QlR0Z0FTZ0lUYmJWTnNPQ2xsUFNyN2hTc3ZDT3g0eDRaYXJpUiJ9.NQyqafS8uW_fA9EGs1HRJdcG9u-IrIgsGq7_gYY8N3lxuIsmamBB6s-7_ErzYLlmuNlcbCA7qzbx5-wgKT8yTpZnls56uSaL7vmX273MvW3E96S9UyOfpTrIAtNgvh7QwyRbUGPgSqLwXn7Y5dbfv-VgoEbw5rB6rfDCy_gw5st2bExZjmln2VEdWX6QLCQ7nBzwUhgJZjKqRcbrEkdSyqpcuLLWPU6bjpqjn5mhzKQeujoyYpwsREDHneVOx53Ej1x1ixdXVhY4UWDgnGEoQaCLmWElORastOvCOkni78TkMzq5hei5o5NQ0VEWcztQphVSvs9NsGZBNEe0MT-Ewlkho6CwRjFydbAHMDa_J9okNmVLQaIFSjXDGMeDZG5hoBzsW9ZG55x1SjFhyPJOTyK1TdUOpTEXa55HrtxJndL6gWYykgQUlvURpX0E5BHdWQUV0xew-CbSvjbx6-jlnVlCIKQUseh89e7M4P_ofjxw4lrBaX7aXd89mdVHnHTHJZf8f3HYV9ukIhKNVi1vXsfbKO9zl35CWz5sAHEmeV3742VQgqhvIAggsAWn7b3Q5sAu8ydSBk13SmuYDNwypttDnGCjeYjbiG2rWzzggxEEWkvab3anrRlja5GgFwMEhE-i7bde1SxK35q1WkE37DU6-qpTDtC5AiLHNXnIC4o"
 
 
 # ── Demo sentences ─────────────────────────────
 DEMO_SENTENCES = [
     "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
-    "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
-    "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
-    "Snow leopards in the Himalayas have declined due to habitat loss and poaching.",
-    "Climate warming is causing glacial retreat, reducing water availability for downstream ecosystems.",
-    "Alpine plant communities show decreasing species richness at higher elevations.",
-    "Overgrazing by livestock leads to soil erosion and loss of native vegetation cover.",
-    "The wolf population in Yellowstone has recovered following reintroduction programs.",
+    # "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
+    # "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
 ]
 
 
@@ -75,10 +75,24 @@ def run_dry(schema_path: Path, seeds_path: Path) -> None:
     total_seeds = sum(len(v) for v in seeds.values())
     print(f"[OK] Seeds loaded: {total_seeds} examples across {len(seeds)} relations")
 
-    # Initialise tool state with canonical entity list
-    from src.multi_agent_annotation.multi_agent_annotation_ag2 import _get_embedded_guideline
-    sections = _get_embedded_guideline()
-    _init_tool_state(schema, sections, seeds, entity_types_list=SCHEMA_BIODIV_LIST)
+    # Load guideline documents
+    decision_support_sections = (
+        load_decision_support(_DEFAULT_DECISION_SUPPORT)
+        if _DEFAULT_DECISION_SUPPORT.exists()
+        else []
+    )
+    guidance_sections = (
+        load_guideline_from_docx(_DEFAULT_GUIDELINE)
+        if _DEFAULT_GUIDELINE.exists()
+        else []
+    )
+    print(f"[OK] Decision support: {len(decision_support_sections)} sections "
+          f"(from {'file' if _DEFAULT_DECISION_SUPPORT.exists() else 'fallback'})")
+    print(f"[OK] MoBiKo v2 guidance: {len(guidance_sections)} sections "
+          f"(from {'file' if _DEFAULT_GUIDELINE.exists() else 'fallback'})")
+
+    all_sections = decision_support_sections + guidance_sections
+    _init_tool_state(schema, all_sections, seeds, entity_types_list=SCHEMA_BIODIV_LIST)
 
     # list_entity_types tool
     types_json = list_entity_types()
@@ -122,7 +136,7 @@ def run_live(
         critic_model=critic_model,
         adjudicator_model=adjudicator_model,
         schema_path=schema_path,
-        guideline_path=None,  # no .docx in repo — falls back to embedded guideline
+        # Defaults point to docs in src/multi_agent_annotation/ — no explicit paths needed
         seeds_path=seeds_path,
         max_rounds=max_rounds,
         entity_schema_str=SCHEMA_BIODIV_SHORT,
@@ -166,10 +180,10 @@ def main() -> None:
         "--adjudicator-model", type=str, default="qwen3-32B-vllm",
     )
     parser.add_argument(
-        "--max-rounds", type=int, default=2,
+        "--max-rounds", type=int, default=1,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("demo_ag2_results.jsonl"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_ag2_results.jsonl"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(

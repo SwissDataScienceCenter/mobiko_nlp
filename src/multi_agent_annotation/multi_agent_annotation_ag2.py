@@ -163,27 +163,93 @@ def load_schema(path: Path) -> Dict[str, List[List[str]]]:
 load_seeds = load_schema  # same format
 
 
-def load_guideline_from_docx(path: Path) -> List[Dict[str, str]]:
+def load_decision_support(path: Path) -> List[Dict[str, str]]:
+    """
+    Parse Decision support.docx — a table-based decision guide.
+    Each table row (category, question, examples, definition) becomes one section.
+    Falls back to an empty list if the file is missing or python-docx is unavailable.
+    """
     try:
         from docx import Document
         doc = Document(str(path))
-        sections, title, content = [], "Introduction", []
+        sections: List[Dict[str, str]] = []
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                # Skip header rows and rows without enough content
+                if len(cells) < 2 or not cells[0] or cells[0].lower() in {
+                    "category", "entity type", "label", "type", ""
+                }:
+                    continue
+                category = cells[0]
+                question = cells[1] if len(cells) > 1 else ""
+                examples = cells[2] if len(cells) > 2 else ""
+                definition = cells[3] if len(cells) > 3 else ""
+                # Build title from category + question; skip fully empty rows
+                title_parts = [p for p in [category, question] if p]
+                if not title_parts:
+                    continue
+                content_parts = []
+                if definition:
+                    content_parts.append(f"Definition: {definition}")
+                if examples:
+                    content_parts.append(f"Examples: {examples}")
+                sections.append({
+                    "title": " — ".join(title_parts),
+                    "content": "\n".join(content_parts) if content_parts else question,
+                    "source": "decision_support",
+                })
+        return sections if sections else _get_embedded_guideline()
+    except (ImportError, Exception):
+        return _get_embedded_guideline()
+
+
+# Section-boundary patterns for MoBiKo label guidance draft v2
+_MOBIKO_V2_SECTION_STARTS = (
+    re.compile(r"^Step \d"),
+    re.compile(r"^[IVX]+\."),
+    re.compile(r"^(Step 1: identifying spans|Step 2: Labelling spans|General rules|Handling difficult|Typical difficult|Rule|Needs further"
+               r"|Species and Taxonomic|Ecological Attributes|System-Level|Polysemic terms|Polysemic Terms"
+               r"|Typical Difficult Cases|Rule for Tiebreaker)", re.IGNORECASE),
+)
+
+
+def load_guideline_from_docx(path: Path) -> List[Dict[str, str]]:
+    """
+    Parse MoBiKo label guidance draft v2.docx — a narrative guideline with sections.
+    Each recognised heading starts a new section.
+    Falls back to the embedded guideline if python-docx is unavailable.
+    """
+    try:
+        from docx import Document
+        doc = Document(str(path))
+        sections: List[Dict[str, str]] = []
+        title, content = "Introduction", []
+
+        def _is_section_boundary(text: str) -> bool:
+            return any(pat.match(text) for pat in _MOBIKO_V2_SECTION_STARTS)
+
         for para in doc.paragraphs:
             text = para.text.strip()
             if not text:
                 continue
-            if (re.match(r"^Step \d", text) or re.match(r"^[IVX]+\.", text)
-                    or text.startswith("General rules") or text.startswith("Handling difficult")
-                    or text.startswith("Typical difficult") or text.startswith("Rule that may")
-                    or text.startswith("Needs further")):
+            # Also treat bold short paragraphs as section headings
+            is_heading = (
+                _is_section_boundary(text)
+                or para.style.name.startswith("Heading")
+                or (len(text) < 80 and all(run.bold for run in para.runs if run.text.strip()))
+            )
+            if is_heading:
                 if content:
-                    sections.append({"title": title, "content": "\n".join(content)})
+                    sections.append({"title": title, "content": "\n".join(content),
+                                     "source": "mobiko_v2"})
                 title, content = text, []
             else:
                 content.append(text)
         if content:
-            sections.append({"title": title, "content": "\n".join(content)})
-        return sections
+            sections.append({"title": title, "content": "\n".join(content),
+                              "source": "mobiko_v2"})
+        return sections if sections else _get_embedded_guideline()
     except ImportError:
         return _get_embedded_guideline()
 
@@ -444,13 +510,15 @@ You see the Annotator's labels and the Critic's review.
 3. Genuine ambiguity → flag for human review, pick the safer label.
 
 ## Output
-Return a JSON object with keys:
+
+You have to return a JSON object with keys:
 - "final_entities": [{{"text","entity_type","confidence","source","guideline_step"}}]
 - "final_relations": [{{"relation","e1_text","e1_type","e2_text","e2_type","confidence","reasoning"}}]
 - "disagreement_resolutions": [{{"issue","decision","rationale"}}]
 - "flagged_for_human_review": [genuinely ambiguous cases]
 
-End with "TERMINATE".
+You must return this JSON right before the end of your message, and your message must end with "TERMINATE" on its own line.
+
 """
 
 
@@ -521,6 +589,15 @@ def _critic_is_satisfied(msg: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
+# Default document paths (relative to this file)
+# ─────────────────────────────────────────────────────────────
+
+_THIS_DIR = Path(__file__).resolve().parent
+_DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision support.docx"
+_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo label guidance draft v2.docx"
+
+
+# ─────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────
 
@@ -534,8 +611,12 @@ class MultiAgentAnnotator:
         Keys into MODEL_ENDPOINTS.
     schema_path : Path
         Relation schema file.
+    decision_support_path : Path
+        Decision support .docx (table-based decision guide for the Annotator).
+        Defaults to the copy in src/multi_agent_annotation/.
     guideline_path : Path
-        MoBiKo labelling guideline .docx.
+        MoBiKo labelling guideline .docx (narrative, for Critic & Adjudicator).
+        Defaults to the copy in src/multi_agent_annotation/.
     seeds_path : Path
         Seed examples for consistency checking.
     max_rounds : int
@@ -548,6 +629,7 @@ class MultiAgentAnnotator:
         critic_model: str = "qwen3-32B-vllm",
         adjudicator_model: str = "qwen3-32B-vllm",
         schema_path: Optional[Path] = None,
+        decision_support_path: Optional[Path] = None,
         guideline_path: Optional[Path] = None,
         seeds_path: Optional[Path] = None,
         max_rounds: int = 2,
@@ -556,18 +638,38 @@ class MultiAgentAnnotator:
     ):
         self.max_rounds = max_rounds
 
-        # Load resources
+        # ── Load resources ───────────────────────────────────
         relation_schema = load_schema(schema_path) if schema_path else {}
         seeds = load_seeds(seeds_path) if seeds_path else {}
-        sections = (load_guideline_from_docx(guideline_path)
-                    if guideline_path and guideline_path.exists()
-                    else _get_embedded_guideline())
 
-        # Populate tool state (use canonical entity type list if provided)
-        _init_tool_state(relation_schema, sections, seeds,
+        # Decision support doc → Annotator system prompt (compact decision table)
+        ds_path = decision_support_path or _DEFAULT_DECISION_SUPPORT
+        decision_support_sections = (
+            load_decision_support(ds_path)
+            if ds_path and ds_path.exists()
+            else _get_embedded_guideline()
+        )
+
+        # MoBiKo v2 narrative → Critic & Adjudicator system prompts (edge cases, tiebreaker)
+        gl_path = guideline_path or _DEFAULT_GUIDELINE
+        guidance_sections = (
+            load_guideline_from_docx(gl_path)
+            if gl_path and gl_path.exists()
+            else _get_embedded_guideline()
+        )
+
+        # guideline_search tool searches across both documents combined
+        all_sections = decision_support_sections + guidance_sections
+        _init_tool_state(relation_schema, all_sections, seeds,
                          entity_types_list=entity_types_list or _FALLBACK_ENTITY_TYPES)
 
-        guideline_summary = _build_guideline_summary(sections)
+        logger.info(
+            f"Loaded decision support: {len(decision_support_sections)} sections | "
+            f"guidance: {len(guidance_sections)} sections"
+        )
+
+        annotator_guideline = _build_guideline_summary(decision_support_sections)
+        critic_guideline = _build_guideline_summary(guidance_sections)
 
         # Build entity schema string for system prompts
         if entity_schema_str is None:
@@ -583,7 +685,7 @@ class MultiAgentAnnotator:
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
             name="Annotator",
-            system_message=_annotator_system_msg(guideline_summary, entity_schema_str, relation_schema),
+            system_message=_annotator_system_msg(annotator_guideline, entity_schema_str, relation_schema),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
             # Annotator receives Critic messages: stop when Critic is satisfied,
@@ -593,7 +695,7 @@ class MultiAgentAnnotator:
 
         self.critic = ConversableAgent(
             name="Critic",
-            system_message=_critic_system_msg(guideline_summary, entity_schema_str, relation_schema),
+            system_message=_critic_system_msg(critic_guideline, entity_schema_str, relation_schema),
             llm_config=critic_llm,
             human_input_mode="NEVER",
             is_termination_msg=lambda msg: "TERMINATE" in (msg.get("content", "") or ""),
@@ -601,7 +703,7 @@ class MultiAgentAnnotator:
 
         self.adjudicator = ConversableAgent(
             name="Adjudicator",
-            system_message=_adjudicator_system_msg(guideline_summary, entity_schema_str, relation_schema),
+            system_message=_adjudicator_system_msg(critic_guideline, entity_schema_str, relation_schema),
             llm_config=adjudicator_llm,
             human_input_mode="NEVER",
             is_termination_msg=lambda msg: "TERMINATE" in (msg.get("content", "") or ""),
