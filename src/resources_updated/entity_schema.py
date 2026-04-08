@@ -1,14 +1,11 @@
 SCHEMA_BIODIV_FULL = """
-
-Abiotic collective entity (An aggregation or assemblage of abiotic entities forming a functional unit)
+Abiotic entity (A non-living natural physical object or component of the environment)
         Abiotic assemblance
                 glacial deposits
                 glacial moraine complex
                 sediment layers
                 soil horizons
                 watershed network (abiotic components)
-
-Abiotic entity (A non-living natural physical object or component of the environment)
         Abiotic physical object
                 boulder
                 glacier
@@ -162,8 +159,8 @@ Antropoggenic social institution (Non-material human constructs such as laws, po
                 protected area designation (legal)
                 traditional knowledge
         
-Biotic collective entity (An assemblage of organisms functioning as a unit (community, guild, ecosystem).
-        Community
+Biotic entity (A living organism or taxon at the individual/species level)
+                Community
                 epiphyte assemblage
                 fauna
                 mixed broadleaf forest
@@ -184,8 +181,6 @@ Biotic collective entity (An assemblage of organisms functioning as a unit (comm
         Population
                 wolf population
                 population (biology)
-
-Biotic entity (A living organism or taxon at the individual/species level)
         Organism
                 animals
                 fir tree
@@ -367,13 +362,11 @@ Temporal property (A temporal descriptor or metric)
 
 SCHEMA_BIODIV = """
 
-Abiotic collective entity (An aggregation or assemblage of abiotic entities forming a functional unit)
+Abiotic entity (A non-living natural physical object or component of the environment)
         glacial deposits
         sediment layers
         soil horizons
         watershed network (abiotic components)
-
-Abiotic entity (A non-living natural physical object or component of the environment)
         glacier
         permafrost layer
         soil
@@ -478,7 +471,7 @@ Anthropogenic entity (A human-made object)
         land tenure regime
         management plan
 
-Biotic collective entity (An assemblage of organisms functioning as a unit (community, guild, ecosystem)).
+Biotic entity (An assemblage of organisms functioning as a unit (community, guild, ecosystem) or a living organism or taxon at the individual/species level)
         epiphyte assemblage
         fauna
         mixed broadleaf forest
@@ -495,8 +488,6 @@ Biotic collective entity (An assemblage of organisms functioning as a unit (comm
         shrubland
         wetland ecosystem
         wolf population
-
-Biotic entity (A living organism or taxon at the individual/species level)
         animals
         fir tree
         herbivorous species
@@ -657,8 +648,6 @@ Qualitative property (A non-numeric attribute that describes a quality or catego
 """
 
 SCHEMA_BIODIV_SHORT = """
-ABIOTIC COLLECTIVE ENTITY (DEFINITION: A non-living natural physical object or component of the environment, e.g., rock, glacier, soil, river)
-
 ABIOTIC ENTITY (DEFINITION: A non-living natural physical object or component of the environment, e.g., rock, glacier, soil, river)
 
 ABIOTIC PROCESS (DEFINITION: A physical or chemical change in the environment (e.g., erosion, landsliding, glacial melt).
@@ -671,9 +660,7 @@ ANTHROPOGENIC PROCESS (DEFINITION: An activity or action performed by humans tha
 
 ANTHROPOGENIC PROPERTY (DEFINITION: A measurable social, economic or governance attribute, e.g., population density, land tenure type)
 
-BIOTIC COLLECTIVE ENTITY (DEFINITION: An assemblage of organisms functioning as a unit, e.g., community, guild, ecosystem)
-
-BIOTIC ENTITY (DEFINITION: A living organism or taxon at the individual/species level, e.g., snow leopard, juniper species)
+BIOTIC ENTITY (DEFINITION: An assemblage of organisms functioning as a unit or a living organism or taxon at the individual/species level, e.g., snow leopard, juniper species)
 
 BIOTIC PROCESS (DEFINITION: A biological action or interaction performed by or involving living organisms, e.g., pollination, predation, succession)
 
@@ -693,14 +680,12 @@ QUALITATIVE PROPERTY (DEFINITION: A non-numeric attribute that describes a quali
 """
 
 SCHEMA_BIODIV_LIST = [
-    "ABIOTIC COLLECTIVE ENTITY",
     "ABIOTIC ENTITY",
     "ABIOTIC PROCESS",
     "ABIOTIC PROPERTY",
     "ANTHROPOGENIC ENTITY",
     "ANTHROPOGENIC PROCESS",
     "ANTHROPOGENIC PROPERTY",
-    "BIOTIC COLLECTIVE ENTITY",
     "BIOTIC ENTITY",
     "BIOTIC PROCESS",
     "BIOTIC PROPERTY",
