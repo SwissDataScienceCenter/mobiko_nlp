@@ -154,7 +154,7 @@ def call_llm_batch(
 
 
     # Configure model-specific parameters
-    if model_type in ["qwen3-32B", "gpt4o", "qwen3-32B-vllm"]:
+    if model_type in ["qwen3-32B", "gpt4o", "qwen3-32B-vllm", "qwen3-35B-vllm"]:
         max_tokens = 1024
     else:
         max_tokens = 500
@@ -199,7 +199,7 @@ def call_llm_batch(
 
 
         # Modify system prompt for Qwen 32B
-        if "qwen3-32B" in model_type:
+        if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
         full_prompt = f"{system_prompt}\n\nUser input: {json.dumps(user_payload, ensure_ascii=False)}"
@@ -377,7 +377,7 @@ def call_llm_batch_revision(client, model_type, requests, temperature=0.3):
         payload = {"sentence": req["sentence"], "previous": req["prev_json"],
                    "prev_notes": req.get("prev_notes", "")  # short running notes
 }
-        if "qwen3-32B" in model_type:
+        if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
         content = client.call(
@@ -402,7 +402,7 @@ def call_llm_batch_consolidate(client, model_type, requests):
             - Merge overlapping duplicates; keep one with best boundaries.
             """
         payload = {"sentence": req["sentence"], "proposals": req["proposals"]}
-        if "qwen3-32B" in model_type:
+        if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
         content = client.call(
