@@ -53,7 +53,7 @@ def process_sentences_batch(
 
 
     # All-chunks mode
-    if candidates_from == "chunks" and use_chunks:
+    if candidates_from == "chunks":
         nlp = get_spacy_model(spacy_model)
         docs = list(nlp.pipe(sentence_batch))
         for sent_text, sent_doc in zip(sentence_batch, docs):
@@ -64,9 +64,6 @@ def process_sentences_batch(
                 if len(gz):
                     print(gz)
                     cands.extend(gz)
-
-            if not cands:
-                continue
 
             fused = fuse_candidates(
                 cands,
@@ -150,10 +147,51 @@ def process_sentences_batch(
                         batch_results.append({"sentence": sent_text, "candidates": None})
         return batch_results
 
+    # NER + chunks + gazetteer combined mode
+    if candidates_from == "all":
+        if ner_runtime is None:
+            raise ValueError(
+                "candidates_from='all' requires ner_runtime. "
+                "Initialize with NerInferencer(model_dir) and pass it in."
+            )
+
+        spans_lists = ner_runtime.predict_spans_for_sentences(
+            sentences=sentence_batch,
+            batch_size=ner_runtime_batch_size,
+            max_length=ner_max_length,
+            entity_threshold=0.25,
+            entity_bias=0.25
+        )
+
+        nlp = get_spacy_model(spacy_model)
+        docs = list(nlp.pipe(sentence_batch))
+
+        for i, (sent_text, sent_doc) in enumerate(zip(sentence_batch, docs)):
+            ner_spans = spans_lists[i] or []
+            for c in ner_spans:
+                c.setdefault("source", "ner")
+
+            chunk_spans = process_with_chunks(sent_doc)
+            gz = gazetteer_candidates(sent_text, gazetteer_matcher) if gazetteer_matcher is not None else []
+
+            cands = ner_spans + chunk_spans + gz
+            if cands:
+                fused = fuse_candidates(cands, type_map=type_map, source_weights=source_weights)
+                batch_results.append({"sentence": sent_text, "candidates": fused})
+            else:
+                batch_results.append({"sentence": sent_text, "candidates": None})
+        print(f'Processed {len(batch_results)} sentences with NER + chunks + gazetteer')
+        return batch_results
+
     # candidates_from == "none"
     for sent_text in sentence_batch:
-        batch_results.append({"sentence": sent_text, "candidates": None})
-        print(f'Processed {len(batch_results)} sentences without candidates')
+        gz = gazetteer_candidates(sent_text, gazetteer_matcher) if gazetteer_matcher is not None else []
+        if gz:
+            fused = fuse_candidates(gz, type_map=type_map, source_weights=source_weights)
+            batch_results.append({"sentence": sent_text, "candidates": fused})
+        else:
+            batch_results.append({"sentence": sent_text, "candidates": None})
+    print(f'Processed {len(batch_results)} sentences without candidates (gazetteer only)')
     return batch_results
 
 

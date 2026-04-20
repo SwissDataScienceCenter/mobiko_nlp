@@ -1,14 +1,22 @@
 # llm/client.py
-from typing import Optional, Dict, Any
+from typing import Dict
 from dataclasses import dataclass
 import threading
 from openai import OpenAI
 import regex as re
 import os
-from dotenv import load_dotenv
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
 
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
-
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ENV_FILE = os.getenv("MOBIKO_ENV_FILE") or _REPO_ROOT / ".env"
+if load_dotenv is not None:
+    load_dotenv(_ENV_FILE, override=False)
 
 def remove_thinking_blocks(content: str) -> str:
     """Strip <think>...</think> and unwrap ```json fences."""
@@ -34,14 +42,9 @@ class ModelRegistry:
 
     CONFIGS: Dict[str, ModelConfig] = {
         "qwen3-4B": ModelConfig(
-            base_url="https://qwen3-4b-instruct.runai-mobiko-anisia.inference.compute.datascience.ch/v1",
+            base_url="https://qwen3-4b-instruct-runai-mobiko-anisia.inference.compute.datascience.ch/v1",
             api_key="EMPTY",
             model_name="Qwen/Qwen3-4B-Instruct-2507"
-        ),
-        "qwen3-32B": ModelConfig(
-            base_url="https://openwebui-runai-codev-llm.inference.compute.datascience.ch/api",
-            api_key=None,  # Will use OPEN_WEB_UI_API_KEY env var
-            model_name="Qwen/Qwen3-32B-AWQ"
         ),
         "medgemma-4b": ModelConfig(
             base_url="http://medgemma-4b-it.runai-mobiko-anisia.inference.compute.datascience.ch",
@@ -58,10 +61,16 @@ class ModelRegistry:
             api_key=None,  # Will use OPENAI_API_KEY env var
             model_name="gpt-4o"
         ),
+        "qwen3-35B-vllm": ModelConfig(
+            base_url="https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
+            # base_url="https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
+            api_key=None,  # read from env
+            model_name="Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"  # use the exact id your gateway serves
+        ),
         "qwen3-32B-vllm": ModelConfig(
             base_url="https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
-            api_key=None,  # read from env
-            model_name="Qwen/Qwen3-32B-AWQ"  # use the exact id your gateway serves
+            api_key=None,
+            model_name="Qwen/Qwen3-32B-AWQ",
         ),
     }
 
@@ -85,6 +94,10 @@ class LLMClient:
         self.model_type = model_type
         self.config = ModelRegistry.get_config(model_type)
         self._local = threading.local()
+        self._stats_lock = threading.Lock()
+        self._query_count = 0
+        self._prompt_tokens_total = 0
+        self._completion_tokens_total = 0
 
     @property
     def client(self) -> OpenAI:
@@ -130,9 +143,27 @@ class LLMClient:
             **kwargs
         )
         content = response.choices[0].message.content
-        if self.model_type in ("qwen3-32B", "gpt4o", "qwen3-32B-vllm"):
+        if self.model_type in ("qwen3-32B", "gpt4o", "qwen3-35B-vllm", "qwen3-32B-vllm"):
             content = remove_thinking_blocks(content)
+        usage = response.usage
+        if usage is not None:
+            with self._stats_lock:
+                self._query_count += 1
+                self._prompt_tokens_total += usage.prompt_tokens or 0
+                self._completion_tokens_total += usage.completion_tokens or 0
         return content
+
+    def token_stats(self) -> dict:
+        """Return token usage statistics accumulated across all calls."""
+        with self._stats_lock:
+            n = self._query_count
+            return {
+                "queries": n,
+                "prompt_tokens_total": self._prompt_tokens_total,
+                "completion_tokens_total": self._completion_tokens_total,
+                "prompt_tokens_mean": self._prompt_tokens_total / n if n else 0.0,
+                "completion_tokens_mean": self._completion_tokens_total / n if n else 0.0,
+            }
 
     def call_batch(self, message_batches: list, temperature: float = 0.0, **kwargs) -> list:
         """Make multiple LLM calls (not true batching, sequential calls)."""

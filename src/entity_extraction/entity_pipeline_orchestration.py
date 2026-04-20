@@ -296,7 +296,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--in_bioc_dir", required=False, default=None,
                     help="Folder with BioC JSON files. Passage text is used as input.")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
-    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq", "qwen3-32B-vllm"],
+    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq", "qwen3-35B-vllm", "qwen3-32B-vllm"],
                     default="gpt4o", help="LLM model to use")
     ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
     ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
@@ -309,8 +309,8 @@ def parse_args() -> argparse.Namespace:
                     help="Resume from existing checkpoints and skip processed sentences.")
 
     # ==== Candidate source switch ====
-    ap.add_argument("--candidates_from", choices=["chunks", "ner", "bioc"], default="ner",
-                    help="Generate LLM candidates from spaCy noun chunks or NER predictions.")
+    ap.add_argument("--candidates_from", choices=["chunks", "ner", "bioc", "none", "all"], default="ner",
+                    help="Generate LLM candidates from spaCy noun chunks, NER predictions, BioC, none (gazetteer-only if --gaz_dir set), or all (NER + chunks + gazetteer).")
 
     # ==== BioC ====
     ap.add_argument("--bioc_candidates_dir", type=str, default=None,
@@ -371,7 +371,8 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--base_seed", type=int, default=0, help="Random seed.")
 
-    ap.add_argument("--iou_thr", type=float, default=0.5, help="IoU threshold for span merging.")
+    ap.add_argument("--iou_thr", type=float, default=0.5, help="IoU threshold for span deduplication and tier assignment.")
+    ap.add_argument("--lock_iou_thr", type=float, default=0.75, help="IoU threshold for locking high-confidence candidates before LLM.")
 
     ap.add_argument(
         "--ablation",
@@ -421,7 +422,7 @@ def main():
     gaz_matcher = load_gazetteer_matcher(args.gaz_dir, args.general_table_dir)
 
     # Validate spaCy model
-    if args.use_chunks:
+    if args.candidates_from in ("chunks", "ner", "all") or args.np_fallback:
         try:
             test_nlp = spacy.load(args.spacy_model)
             if "parser" not in test_nlp.pipe_names:
@@ -466,9 +467,9 @@ def main():
 
     # NER runtime (loaded once)
     ner_runtime = None
-    if args.candidates_from == "ner":
+    if args.candidates_from in ("ner", "all"):
         if not args.ner_model_dir:
-            print("Provide --ner_model_dir for candidates_from=ner", file=sys.stderr)
+            print("Provide --ner_model_dir for candidates_from=ner/all", file=sys.stderr)
             sys.exit(1)
         ner_runtime = load_ner(args.ner_model_dir)
 
@@ -538,20 +539,6 @@ def main():
                         continue
                     batch = [sentences[j] for j in pending_indices]
 
-                    # # ---- FACT FILTER: classify sentences in this batch
-                    # if args.fact_filter == "llm":
-                    #     fact_labels = classify_sentences_fact_llm(client, model_name, args.model_type, batch)
-                    # else:
-                    #     fact_labels = ["FACT"] * len(batch)  # no filtering
-                    #
-                    # def _passes(label: str) -> bool:
-                    #     if args.fact_filter == "off":
-                    #         return True
-                    #     if args.fact_filter_policy == "strict":
-                    #         return label == "FACT"
-                    #     # lenient: FACT or UNSURE
-                    #     return label in ("FACT", "UNSURE")
-
                     # === Candidate generation in-batch (spaCy tokenization for both modes)
                     candidate_results = process_sentences_batch(
                         batch,
@@ -569,73 +556,8 @@ def main():
                         source_weights=source_weights
                     )
 
-                    # === FACT-GATE at clause level ===
-                    if args.fact_filter != "off":
-                        nlp = get_spacy_model(args.spacy_model)  # already used elsewhere
-                        for idx, cr in enumerate(candidate_results):
-                            sent = cr["sentence"]
-                            cands = cr.get("candidates")
-                            if not cands:
-                                cr["notes"] = (cr.get("notes", "") + "|fact_gate:no_cands").strip("|")
-                                continue
-
-                            # derive sentence/clause labels
-                            if args.fact_filter_scope == "sentence":
-                                def _passes_label(lbl: str) -> bool:
-                                    return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
-                                                lbl in ("FACT", "UNSURE"))
-
-                                lbl = classify_clauses_llm(llm, args.model_type,
-                                                                 [{"text": sent, "start": 0, "end": len(sent)}])[0]
-                                if not _passes_label(lbl):
-                                    cr["candidates"] = None
-                                    cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
-                                    continue
-                                else:
-                                    cr["notes"] = (cr.get("notes", "") + f"|fact_gate_sentence:{lbl}").strip("|")
-                                    continue  # sentence-level all pass
-
-                            # clause scope
-                            clauses = split_into_clauses_spacy(sent, nlp)
-                            labels = classify_clauses_llm(llm, args.model_type, clauses)
-
-                            def _passes(lbl: str) -> bool:
-                                return (lbl == "FACT") if args.fact_filter_policy == "strict" else (
-                                            lbl in ("FACT", "UNSURE"))
-
-                            # build filtered candidate list
-                            filtered = []
-                            for c in cands:
-                                # take span midpoint to assign to a clause
-                                mid = int((int(c["start_char"]) + int(c["end_char"])) / 2)
-                                # find clause containing midpoint
-                                cl_idx = next((i for i, cl in enumerate(clauses) if cl["start"] <= mid < cl["end"]), None)
-                                lbl = labels[cl_idx] if cl_idx is not None else "UNSURE"
-                                if _passes(lbl):
-                                    filtered.append(c)
-                            if filtered:
-                                cr["candidates"] = filtered
-                                # keep audit: per-clause labels
-                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_clauses:{labels}").strip("|")
-                            else:
-                                cr["candidates"] = None
-                                cr["notes"] = (cr.get("notes", "") + f"|fact_gate_all_filtered:{labels}").strip("|")
-
-                # # wipe ALL candidates (NER/NP/gaz/gold) for sentences that do not pass the fact gate
-                # for j, cr in enumerate(candidate_results):
-                #     label = fact_labels[j]
-                #     if not _passes(label):
-                #         # Remove all candidates; also stash a note for transparency
-                #         cr["candidates"] = None
-                #         cr["notes"] = f"filtered_out_by_fact_gate:{label}"
-                #     else:
-                #         cr["notes"] = f"fact_gate:{label}"
-
                     assert len(candidate_results) == len(batch), \
                         f"Lost sentences in candidate building: {len(batch)} -> {len(candidate_results)}"
-
-                # llm_results = call_llm_batch_two_path(client, model_name, args.model_type, args.few_shot,
-                #                                       candidate_results, lock_over_iou=0.5)
 
                     if args.ablation != "off":
                         llm_results = []
@@ -650,27 +572,27 @@ def main():
                             dec = dict(temperature=0.0, top_p=1.0, presence_penalty=0.0)
                             llm_results = call_llm_batch_two_path(llm, args.model_type, args.few_shot,
                                                                   candidate_results,
-                                                                  lock_over_iou=args.iou_thr, #todo: T = 0.4
+                                                                  lock_over_iou=args.lock_iou_thr,
                                                                   decoding=dec, gaz_lock=args.gaz_locked)
                         elif cond == "C1":
                             llm_results = run_C1_vanilla(llm, args.model_type, args.few_shot,
                                                          candidate_results, T=args.passes,
-                                                         lock_over_iou=args.iou_thr,
+                                                         lock_over_iou=args.lock_iou_thr,
                                                          gaz_lock=args.gaz_locked)
                         elif cond == "C2":
                             llm_results = run_C2_diverse(llm, args.model_type, args.few_shot,
                                                          candidate_results, T=args.passes,
-                                                         lock_over_iou=args.iou_thr,
+                                                         lock_over_iou=args.lock_iou_thr,
                                                          gaz_lock=args.gaz_locked)
                         elif cond == "C3":
                             llm_results = run_C3_critique_revise(llm, args.model_type, args.few_shot,
                                                                  candidate_results, T=args.passes,
-                                                                 lock_over_iou=args.iou_thr,
+                                                                 lock_over_iou=args.lock_iou_thr,
                                                                  gaz_lock=args.gaz_locked)
                         elif cond == "C4":
                             llm_results = run_C4_self_consistency(llm, args.model_type, args.few_shot,
                                                                   candidate_results, K=args.samples_k,
-                                                                  lock_over_iou=args.iou_thr,
+                                                                  lock_over_iou=args.lock_iou_thr,
                                                                   gaz_lock=args.gaz_locked)
                         else:
                             raise ValueError(f"Unknown --llm_condition {cond}")
@@ -767,6 +689,12 @@ def main():
 
     mode_str = "with chunks" if args.use_chunks else "without chunks"
     print(f"Done. Processed {docs_written} documents using {args.model_type} {mode_str} and wrote to {args.out_jsonl}")
+    stats = llm.token_stats()
+    print(f"Token usage — queries: {stats['queries']}, "
+          f"prompt: {stats['prompt_tokens_total']}, "
+          f"completion: {stats['completion_tokens_total']}, "
+          f"mean prompt/query: {stats['prompt_tokens_mean']:.1f}, "
+          f"mean completion/query: {stats['completion_tokens_mean']:.1f}")
 
 
 if __name__ == "__main__":

@@ -24,10 +24,17 @@ import sys
 from pathlib import Path
 import os
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
 # ── Ensure repo root is on sys.path so src.* imports work ────────────────────
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if load_dotenv is not None:
+    load_dotenv(os.getenv("MOBIKO_ENV_FILE") or _REPO_ROOT / ".env", override=False)
 
 from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIODIV_LIST
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
@@ -45,10 +52,6 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     consistency_check,
     list_entity_types,
 )
-
-
-
-
 
 # ── Demo sentences ─────────────────────────────
 DEMO_SENTENCES = [
