@@ -1,8 +1,4 @@
-from src.resources.entity_schema import SCHEMA_BIODIV
-from src.resources.entity_schema import SCHEMA_BIODIV_SHORT
-
-
-
+from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT
 
 DEFAULT_SYSTEM_PROMPT_NEW = f"""You are a careful information extractor with expertise in mountain biodiversity research.
 
