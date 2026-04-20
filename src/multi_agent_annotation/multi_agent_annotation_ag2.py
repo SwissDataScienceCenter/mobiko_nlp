@@ -165,6 +165,11 @@ MODEL_ENDPOINTS = {
         "api_key": None,
         "model": "gpt-4o",
     },
+    "qwen3-35B-vllm": {
+        "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
+        "api_key": None,
+        "model_name": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+    },
 }
 
 
@@ -623,6 +628,101 @@ def _register_tools_on_agents(
 
 
 # ─────────────────────────────────────────────────────────────
+# Tool-call extraction from AG2 chat history
+# ─────────────────────────────────────────────────────────────
+
+def _extract_tool_calls_from_msg(msg: dict) -> List[Dict[str, Any]]:
+    """
+    Extract structured tool-call records from a single AG2 chat-history
+    message.
+
+    AG2 represents tool calls in two message types:
+      1. The *proposal* from the LLM agent:
+         {"role": "assistant", "tool_calls": [{"id": ..., "function": {"name": ..., "arguments": ...}}]}
+      2. The *result* from the executor:
+         {"role": "tool", "tool_call_id": ..., "content": "..."}
+
+    This function only processes type 1 (proposals).  Results are attached
+    to their proposals by `_pair_tool_results` below.
+    """
+    raw_calls = msg.get("tool_calls") or []
+    extracted: List[Dict[str, Any]] = []
+    for tc in raw_calls:
+        func = tc.get("function") or {}
+        name = func.get("name", "")
+        args_raw = func.get("arguments", "{}")
+        # Try to parse arguments as JSON for cleaner logging
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+        except (json.JSONDecodeError, TypeError):
+            args = args_raw
+        extracted.append({
+            "tool_call_id": tc.get("id", ""),
+            "tool_name": name,
+            "arguments": args,
+            "result": None,   # filled in by _pair_tool_results
+        })
+    return extracted
+
+
+def _pair_tool_results(
+    chat_history: List[dict],
+) -> Dict[str, str]:
+    """
+    Walk an AG2 chat_history and build a mapping
+    tool_call_id → result_content for every tool-result message.
+    """
+    results: Dict[str, str] = {}
+    for msg in chat_history:
+        if msg.get("role") == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            if tc_id:
+                results[tc_id] = msg.get("content", "")
+    return results
+
+
+def _collect_messages_with_tools(
+    chat_history: List[dict],
+    skip_first: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Convert an AG2 chat_history into our record format, attaching
+    tool_calls (with results) to the agent message that proposed them.
+
+    Skips pure tool-result messages (role="tool") since their content is
+    folded into the proposing message's tool_calls[].result field.
+    """
+    # First pass: collect all tool results keyed by call ID
+    result_map = _pair_tool_results(chat_history)
+
+    messages: List[Dict[str, Any]] = []
+    for i, msg in enumerate(chat_history):
+        if skip_first and i == 0:
+            continue
+        # Skip bare tool-result messages — they'll be paired with proposals
+        if msg.get("role") == "tool":
+            continue
+
+        agent = msg.get("name", msg.get("role", "unknown"))
+        content = msg.get("content", "") or ""
+
+        # Extract and enrich tool calls
+        tool_calls = _extract_tool_calls_from_msg(msg)
+        for tc in tool_calls:
+            tc_id = tc.get("tool_call_id", "")
+            if tc_id in result_map:
+                tc["result"] = result_map[tc_id]
+
+        messages.append({
+            "agent": agent,
+            "content": content,
+            "tool_calls": tool_calls,   # empty list if no tool calls
+        })
+
+    return messages
+
+
+# ─────────────────────────────────────────────────────────────
 # Termination helpers
 # ─────────────────────────────────────────────────────────────
 
@@ -664,6 +764,82 @@ _DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo label guidance draft v2.docx"
 # ─────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Deliberation diff helpers
+# ─────────────────────────────────────────────────────────────
+
+def _diff_annotator_rounds(
+    prev: AnnotatorOutput,
+    curr: AnnotatorOutput,
+) -> str:
+    """
+    Compare two successive AnnotatorOutput objects and return a concise
+    natural-language summary of what changed (added / removed / re-typed
+    entities and relations).
+
+    Returns an empty string if nothing changed.
+    """
+    changes: List[str] = []
+
+    # ── Entity diffs ──────────────────────────────────────────
+    prev_ents = {(e.text.lower(), e.entity_type) for e in prev.entities}
+    curr_ents = {(e.text.lower(), e.entity_type) for e in curr.entities}
+
+    # Entities present in prev but not curr (removed or re-typed)
+    prev_texts = {text for text, _ in prev_ents}
+    curr_texts = {text for text, _ in curr_ents}
+
+    added_texts = curr_texts - prev_texts
+    removed_texts = prev_texts - curr_texts
+
+    # Entities whose text stayed but type changed
+    shared_texts = prev_texts & curr_texts
+    prev_by_text = {text: typ for text, typ in prev_ents}
+    curr_by_text = {text: typ for text, typ in curr_ents}
+    for text in sorted(shared_texts):
+        old_type = prev_by_text.get(text)
+        new_type = curr_by_text.get(text)
+        if old_type and new_type and old_type != new_type:
+            changes.append(f'Re-typed "{text}": {old_type} → {new_type}')
+
+    if added_texts:
+        added_details = []
+        for text in sorted(added_texts):
+            typ = curr_by_text.get(text, "?")
+            added_details.append(f'"{text}" ({typ})')
+        changes.append(f"Added entities: {', '.join(added_details)}")
+
+    if removed_texts:
+        removed_details = []
+        for text in sorted(removed_texts):
+            typ = prev_by_text.get(text, "?")
+            removed_details.append(f'"{text}" ({typ})')
+        changes.append(f"Removed entities: {', '.join(removed_details)}")
+
+    # ── Relation diffs ────────────────────────────────────────
+    def _rel_key(r: RelationFlat) -> tuple:
+        return (r.e1_text.lower(), r.relation, r.e2_text.lower())
+
+    prev_rels = {_rel_key(r) for r in prev.relations}
+    curr_rels = {_rel_key(r) for r in curr.relations}
+
+    added_rels = curr_rels - prev_rels
+    removed_rels = prev_rels - curr_rels
+
+    if added_rels:
+        changes.append(
+            f"Added {len(added_rels)} relation(s): "
+            + "; ".join(f"({e1}, {rel}, {e2})" for e1, rel, e2 in sorted(added_rels))
+        )
+    if removed_rels:
+        changes.append(
+            f"Removed {len(removed_rels)} relation(s): "
+            + "; ".join(f"({e1}, {rel}, {e2})" for e1, rel, e2 in sorted(removed_rels))
+        )
+
+    return " | ".join(changes)
+
 
 class MultiAgentAnnotator:
     """
@@ -839,15 +1015,10 @@ class MultiAgentAnnotator:
 
         # Collect messages from the deliberation (skip the initiating task_msg
         # from the Critic — it is just a relay and adds no annotation content).
-        deliberation_messages = []
-        for i, msg in enumerate(chat_result.chat_history):
-            if i == 0:
-                # This is the Critic's initiating task message; skip it.
-                continue
-            deliberation_messages.append({
-                "agent": msg.get("name", msg.get("role", "unknown")),
-                "content": msg.get("content", ""),
-            })
+        # Tool calls and their results are attached to the proposing message.
+        deliberation_messages = _collect_messages_with_tools(
+            chat_result.chat_history, skip_first=True
+        )
         record.messages = deliberation_messages
         # Each deliberation "round" = one Annotator turn + one Critic turn
         record.rounds_used = len(deliberation_messages) // 2
@@ -855,14 +1026,10 @@ class MultiAgentAnnotator:
         # ── Phase 2: Adjudicator resolves ─────────────────────
         logger.info("Phase 2: Adjudicator resolving")
 
-        # Build adjudicator input from the full transcript
-        transcript = "\n\n".join(
-            f"**{m['agent']}**: {m['content']}" for m in deliberation_messages
-        )
-        adjudicator_msg = (
-            f'Sentence: "{sentence}"\n\n'
-            f"## Deliberation transcript\n{transcript}\n\n"
-            f"Produce the final annotation."
+        # Build a condensed summary of the full deliberation trajectory:
+        # final annotation + final critique + per-round dispute history.
+        adjudicator_msg = self._build_adjudicator_summary(
+            sentence, deliberation_messages
         )
 
         adj_result = self.adjudicator.initiate_chat(
@@ -873,10 +1040,12 @@ class MultiAgentAnnotator:
 
         # Extract final output from adjudicator's last message
         adj_output = self._extract_last_json(adj_result.chat_history)
-        record.messages.append({
-            "agent": "Adjudicator",
-            "content": adj_result.chat_history[-1].get("content", "") if adj_result.chat_history else "",
-        })
+
+        # Collect adjudicator messages (including tool calls to/from ToolExecutor)
+        adj_messages = _collect_messages_with_tools(
+            adj_result.chat_history, skip_first=True  # skip the task message we sent
+        )
+        record.messages.extend(adj_messages)
 
         # ── Parse final annotations ───────────────────────────
         if adj_output:
@@ -888,21 +1057,49 @@ class MultiAgentAnnotator:
                 logger.warning(f"AdjudicatorOutput validation error: {e}")
 
         # ── Compute agreement ─────────────────────────────────
-        # Parse critic messages to count agreements vs disagreements
-        n_agree, n_disagree = 0, 0
-        for msg in deliberation_messages:
-            if msg["agent"] == "Critic":
-                critic_out = self._parse_critic_output(msg.get("content", ""))
-                if critic_out:
-                    n_agree += len(critic_out.agreements)
-                    n_disagree += len(critic_out.disagreements)
-        total = n_agree + n_disagree
-        record.agreement_score = n_agree / total if total > 0 else 1.0
+        # Use the last round only (earlier disputes may have been resolved).
+        # Denominator = Annotator's proposed items (entities + relations).
+        # Disputes  = Critic's disagreements + missing_annotations.
+        # Score     = (proposed − disagreed) / (proposed + missing).
+        #
+        # This avoids the granularity mismatch of the free-text
+        # "agreements" list (which might pack multiple items into one
+        # string) and correctly penalises for missing annotations.
+
+        # Find the last Annotator and last Critic messages
+        last_annotator_out = None
+        last_critic_out = None
+        for m in reversed(deliberation_messages):
+            if m["agent"] == "Annotator" and last_annotator_out is None:
+                last_annotator_out = self._parse_annotator_output(m.get("content", ""))
+            elif m["agent"] == "Critic" and last_critic_out is None:
+                last_critic_out = self._parse_critic_output(m.get("content", ""))
+            if last_annotator_out is not None and last_critic_out is not None:
+                break
+
+        if last_annotator_out and last_critic_out:
+            n_proposed = len(last_annotator_out.entities) + len(last_annotator_out.relations)
+            n_disagreed = len(last_critic_out.disagreements)
+            n_missing = len(last_critic_out.missing_annotations)
+            n_agreed = max(n_proposed - n_disagreed, 0)
+            total_considered = n_proposed + n_missing
+            record.agreement_score = (
+                n_agreed / total_considered if total_considered > 0 else 1.0
+            )
+        elif last_critic_out:
+            # No parseable annotator output — fall back to disagreement count
+            n_agree = len(last_critic_out.agreements)
+            n_disagree = len(last_critic_out.disagreements)
+            n_missing = len(last_critic_out.missing_annotations)
+            total = n_agree + n_disagree + n_missing
+            record.agreement_score = n_agree / total if total > 0 else 1.0
+        else:
+            record.agreement_score = None
 
         logger.info(
             f"Done: {len(record.final_entities)} entities, "
             f"{len(record.final_relations)} relations, "
-            f"agreement={record.agreement_score:.2f}"
+            f"agreement={record.agreement_score if record.agreement_score is None else f'{record.agreement_score:.2f}'}"
         )
         return record
 
@@ -992,6 +1189,117 @@ class MultiAgentAnnotator:
         except ValidationError as e:
             logger.warning(f"AdjudicatorOutput validation failed: {e}")
             return None
+
+    @staticmethod
+    def _parse_annotator_output(text: str) -> Optional[AnnotatorOutput]:
+        raw = MultiAgentAnnotator._try_parse_json(text)
+        if raw is None:
+            return None
+        try:
+            return AnnotatorOutput.model_validate(raw)
+        except ValidationError as e:
+            logger.warning(f"AnnotatorOutput validation failed: {e}")
+            return None
+
+    @staticmethod
+    def _build_adjudicator_summary(
+        sentence: str,
+        deliberation_messages: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Build a condensed summary of the Annotator↔Critic deliberation
+        for the Adjudicator, including:
+        - The final annotation and final review (always present).
+        - A per-round dispute trajectory (only for multi-round deliberations)
+          showing what was challenged and what changed.
+        """
+        parse_a = MultiAgentAnnotator._parse_annotator_output
+        parse_c = MultiAgentAnnotator._parse_critic_output
+
+        # ── Separate messages by round ────────────────────────
+        # Messages alternate: Annotator (round 1), Critic (round 1),
+        # Annotator (round 2), Critic (round 2), ...
+        annotator_msgs: List[Dict[str, Any]] = []
+        critic_msgs: List[Dict[str, Any]] = []
+        for m in deliberation_messages:
+            if m["agent"] == "Annotator":
+                annotator_msgs.append(m)
+            elif m["agent"] == "Critic":
+                critic_msgs.append(m)
+
+        n_rounds = min(len(annotator_msgs), max(len(critic_msgs), 1))
+
+        # ── Parse all structured outputs ──────────────────────
+        annotator_outputs = [parse_a(m["content"]) for m in annotator_msgs]
+        critic_outputs = [parse_c(m["content"]) for m in critic_msgs]
+
+        # ── Build dispute trajectory (only if >1 round) ──────
+        trajectory_lines: List[str] = []
+        if n_rounds > 1:
+            for r in range(n_rounds):
+                round_lines = [f"### Round {r + 1}"]
+
+                # Annotator summary for this round
+                a_out = annotator_outputs[r] if r < len(annotator_outputs) else None
+                if a_out:
+                    n_ent = len(a_out.entities)
+                    n_rel = len(a_out.relations)
+                    round_lines.append(
+                        f"Annotator proposed {n_ent} entities, {n_rel} relations."
+                    )
+                    # If round > 0, show what changed from previous round
+                    if r > 0:
+                        prev = annotator_outputs[r - 1]
+                        if prev:
+                            changes = _diff_annotator_rounds(prev, a_out)
+                            if changes:
+                                round_lines.append(f"Changes from round {r}: {changes}")
+                            else:
+                                round_lines.append("No changes from previous round.")
+
+                # Critic summary for this round
+                c_out = critic_outputs[r] if r < len(critic_outputs) else None
+                if c_out:
+                    n_agree = len(c_out.agreements)
+                    n_disagree = len(c_out.disagreements)
+                    n_missing = len(c_out.missing_annotations)
+                    round_lines.append(
+                        f"Critic: {n_agree} agreements, "
+                        f"{n_disagree} disagreements, "
+                        f"{n_missing} missing annotations."
+                    )
+                    # List each disagreement concisely
+                    for d in c_out.disagreements:
+                        sev = f" [{d.severity}]" if d.severity else ""
+                        ref = f" (guideline: {d.guideline_reference})" if d.guideline_reference else ""
+                        round_lines.append(
+                            f"  - {d.target}: "
+                            f"{d.annotator_label} → {d.proposed_label}{sev}{ref}"
+                        )
+                    for miss in c_out.missing_annotations:
+                        round_lines.append(
+                            f"  - MISSING: \"{miss.text}\" → {miss.entity_type}"
+                        )
+
+                trajectory_lines.append("\n".join(round_lines))
+
+        # ── Build final-state sections ────────────────────────
+        last_annotator_content = annotator_msgs[-1]["content"] if annotator_msgs else "(none)"
+        last_critic_content = critic_msgs[-1]["content"] if critic_msgs else "(none)"
+
+        # ── Assemble the full summary ─────────────────────────
+        parts = [f'Sentence: "{sentence}"']
+
+        if trajectory_lines:
+            parts.append(
+                "## Dispute trajectory\n" + "\n\n".join(trajectory_lines)
+            )
+
+        parts.append(f"## Final annotation (Annotator)\n{last_annotator_content}")
+        parts.append(f"## Final review (Critic)\n{last_critic_content}")
+        parts.append("Produce the final annotation.")
+
+        return "\n\n".join(parts)
 
     @staticmethod
     def _append_jsonl(record: DeliberationRecord, path: Path):
