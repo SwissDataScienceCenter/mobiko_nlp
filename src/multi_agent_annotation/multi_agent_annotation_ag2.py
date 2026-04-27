@@ -71,6 +71,8 @@ class DeliberationRecord(BaseModel):
     final_relations: List[RelationAnnotation] = Field(default_factory=list)
     agreement_score: Optional[float] = None
     rounds_used: int = 0
+    adjudication_status: Optional[str] = None
+    adjudication_audit: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,6 +140,23 @@ class AdjudicatorOutput(BaseModel):
     final_relations: List[RelationFlat] = Field(default_factory=list)
     disagreement_resolutions: List[DisagreementResolution] = Field(default_factory=list)
     flagged_for_human_review: List[str] = Field(default_factory=list)
+
+
+class ConstrainedAdjudication(BaseModel):
+    final_entities: List[EntityAnnotation] = Field(default_factory=list)
+    final_relations: List[RelationFlat] = Field(default_factory=list)
+    status: str = "constrained"
+    audit: Dict[str, Any] = Field(default_factory=dict)
+
+
+ANNOTATOR_REQUIRED_KEYS = {"entities", "relations", "uncertain_cases", "reasoning"}
+CRITIC_REQUIRED_KEYS = {"agreements", "disagreements", "missing_annotations", "reasoning"}
+ADJUDICATOR_REQUIRED_KEYS = {
+    "final_entities",
+    "final_relations",
+    "disagreement_resolutions",
+    "flagged_for_human_review",
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -401,11 +420,11 @@ def guideline_search(
     query: Annotated[str, "Keywords to search in the labelling guideline, e.g. 'habitat spatial property'"],
 ) -> str:
     """Search the MoBiKo labelling guideline for relevant rules and classification steps."""
-    tokens = set(query.lower().split())
+    tokens = set(re.findall(r"\w+", query.lower()))
     scored = []
     for sec in _GUIDELINE_SECTIONS:
-        title_tokens = set(sec["title"].lower().split())
-        content_tokens = set(sec["content"].lower().split())
+        title_tokens = set(re.findall(r"\w+", sec["title"].lower()))
+        content_tokens = set(re.findall(r"\w+", sec["content"].lower()))
         score = len(tokens & title_tokens) * 3 + len(tokens & content_tokens)
         if score > 0:
             scored.append((score, sec))
@@ -495,13 +514,14 @@ Return a JSON object with exactly these fields:
   "relations": [
     {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.85, "reasoning": "..."}}
   ],
-  "uncertain_cases": ["optional span text if ambiguous"],
+  "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
 }}
 
 Output rules:
 - Return JSON only. Do not include commentary, markdown, or <think> blocks.
 - Keep every reasoning field brief and evidence-based.
+- Every uncertain_cases item must be a complete JSON string. Put any explanation inside the quotes.
 """
 
 
@@ -551,6 +571,9 @@ Work through the annotation systematically in this order:
    Annotator overlooked. For each, state the span text, the correct entity type, and cite \
    the guideline step that supports it.
 
+After any tool calls return, you MUST produce the final review JSON. Do not stop after tool
+results or ask for another turn.
+
 ## Output
 Return a JSON object with exactly these fields:
 {{
@@ -590,10 +613,14 @@ You see the Annotator's labels and the Critic's review.
 {guideline}
 
 ## Decision Rules
-1. Agreement between Annotator and Critic → accept (high confidence).
-2. Disagreement → check guideline via tools, apply tiebreaker:
+1. Agreement between Annotator and Critic -> accept unchanged (high confidence).
+2. You may only change Annotator labels that appear in the Critic's final
+   "disagreements" list, or add spans that appear in "missing_annotations".
+3. If the Critic did not dispute a span or relation, keep the Annotator's
+   label exactly. Do not independently re-annotate accepted items.
+4. Disagreement -> check guideline via tools, apply tiebreaker:
    "choose the category describing the primary referent in the sentence."
-3. Genuine ambiguity → flag for human review, pick the safer label.
+5. Genuine ambiguity -> flag for human review, pick the safer label.
 
 ## Output
 
@@ -1029,14 +1056,11 @@ class MultiAgentAnnotator:
         # separate chat and then the same annotation text was re-sent as the
         # opening message of the deliberation.
         #
-        # Turn counts (Critic is initiator):
-        #   Turn 1 : Annotator generates annotation
-        #   Turn 2 : Critic reviews  → says TERMINATE if no critical issues
-        #   Turn 3+: Annotator / Critic exchange until TERMINATE or max_turns
+        # Tool calls and tool results count as AG2 turns, so max_turns includes
+        # a buffer that keeps those exchanges from consuming the review budget.
         logger.info("Phase 1: Annotator ↔ Critic deliberation")
 
-        # max_turns = 1 (annotation) + max_rounds review cycles × 2 (critic+annotator)
-        deliberation_max_turns = self.max_rounds * 2 + 1
+        deliberation_max_turns = self._deliberation_max_turns(self.max_rounds)
 
         chat_result = self.critic.initiate_chat(
             recipient=self.annotator,
@@ -1053,6 +1077,48 @@ class MultiAgentAnnotator:
         record.messages = deliberation_messages
         # Each deliberation "round" = one Annotator turn + one Critic turn
         record.rounds_used = len(deliberation_messages) // 2
+        last_annotator_out, last_critic_out = self._last_deliberation_outputs(
+            deliberation_messages
+        )
+
+        if last_annotator_out is None:
+            raw_annotator = self._last_agent_content(deliberation_messages, "Annotator")
+            repair_messages, repaired_text = self._repair_agent_json(
+                requester=self.critic,
+                producer=self.annotator,
+                output_kind="Annotator",
+                original_text=raw_annotator,
+                sentence=sentence,
+            )
+            if repair_messages:
+                deliberation_messages.extend(repair_messages)
+                last_annotator_out = self._parse_annotator_output(repaired_text)
+
+        if last_annotator_out is None:
+            record.adjudication_status = "annotator_parse_failed"
+            record.adjudication_audit = self._base_adjudication_audit(
+                "Annotator output missing, malformed, or schema-incomplete after one repair attempt."
+            )
+            record.agreement_score = None
+            logger.info(
+                "Done: 0 entities, 0 relations, agreement=None "
+                "(annotator_parse_failed)"
+            )
+            return record
+
+        if last_critic_out is None:
+            raw_critic = self._last_agent_content(deliberation_messages, "Critic")
+            repair_messages, repaired_text = self._repair_agent_json(
+                requester=self.annotator,
+                producer=self.critic,
+                output_kind="Critic",
+                original_text=raw_critic,
+                sentence=sentence,
+                reference_annotation=last_annotator_out.model_dump_json(),
+            )
+            if repair_messages:
+                deliberation_messages.extend(repair_messages)
+                last_critic_out = self._parse_critic_output(repaired_text)
 
         # ── Phase 2: Adjudicator resolves ─────────────────────
         logger.info("Phase 2: Adjudicator resolving")
@@ -1070,7 +1136,9 @@ class MultiAgentAnnotator:
         )
 
         # Extract final output from adjudicator's last message
-        adj_output = self._extract_last_json(adj_result.chat_history)
+        adj_output = self._extract_last_json_with_keys(
+            adj_result.chat_history, ADJUDICATOR_REQUIRED_KEYS
+        )
 
         # Collect adjudicator messages (including tool calls to/from ToolExecutor)
         adj_messages = _collect_messages_with_tools(
@@ -1078,14 +1146,46 @@ class MultiAgentAnnotator:
         )
         record.messages.extend(adj_messages)
 
-        # ── Parse final annotations ───────────────────────────
+        # ── Parse and constrain final annotations ─────────────
+        parsed_adj = None
         if adj_output:
             try:
                 parsed_adj = AdjudicatorOutput.model_validate(adj_output)
-                record.final_entities = parsed_adj.final_entities
-                record.final_relations = [r.to_relation_annotation() for r in parsed_adj.final_relations]
             except ValidationError as e:
                 logger.warning(f"AdjudicatorOutput validation error: {e}")
+
+        if parsed_adj is None:
+            raw_adjudicator = self._last_agent_content(adj_messages, "Adjudicator")
+            repair_messages, repaired_text = self._repair_agent_json(
+                requester=self.tool_executor,
+                producer=self.adjudicator,
+                output_kind="Adjudicator",
+                original_text=raw_adjudicator,
+                sentence=sentence,
+                reference_annotation=self._build_adjudicator_summary(
+                    sentence, deliberation_messages
+                ),
+            )
+            if repair_messages:
+                record.messages.extend(repair_messages)
+                repaired_raw = self._try_parse_json_with_keys(
+                    repaired_text, ADJUDICATOR_REQUIRED_KEYS
+                )
+                if repaired_raw:
+                    try:
+                        parsed_adj = AdjudicatorOutput.model_validate(repaired_raw)
+                    except ValidationError as e:
+                        logger.warning(f"Repaired AdjudicatorOutput validation error: {e}")
+
+        constrained = self._constrain_adjudicator_output(
+            last_annotator_out, last_critic_out, parsed_adj
+        )
+        record.final_entities = constrained.final_entities
+        record.final_relations = [
+            r.to_relation_annotation() for r in constrained.final_relations
+        ]
+        record.adjudication_status = constrained.status
+        record.adjudication_audit = constrained.audit
 
         # ── Compute agreement ─────────────────────────────────
         # Use the last round only (earlier disputes may have been resolved).
@@ -1096,17 +1196,6 @@ class MultiAgentAnnotator:
         # This avoids the granularity mismatch of the free-text
         # "agreements" list (which might pack multiple items into one
         # string) and correctly penalises for missing annotations.
-
-        # Find the last Annotator and last Critic messages
-        last_annotator_out = None
-        last_critic_out = None
-        for m in reversed(deliberation_messages):
-            if m["agent"] == "Annotator" and last_annotator_out is None:
-                last_annotator_out = self._parse_annotator_output(m.get("content", ""))
-            elif m["agent"] == "Critic" and last_critic_out is None:
-                last_critic_out = self._parse_critic_output(m.get("content", ""))
-            if last_annotator_out is not None and last_critic_out is not None:
-                break
 
         if last_annotator_out and last_critic_out:
             n_proposed = len(last_annotator_out.entities) + len(last_annotator_out.relations)
@@ -1188,6 +1277,33 @@ class MultiAgentAnnotator:
         return last_obj
 
     @staticmethod
+    def _try_parse_json_with_keys(
+        text: str,
+        required_keys: set[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the last parseable JSON object containing all required top-level
+        keys. This prevents a malformed outer agent response from being reduced
+        to a nested entity/relation fragment.
+        """
+        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        decoder = json.JSONDecoder()
+        last_obj = None
+        i = 0
+        while i < len(cleaned):
+            if cleaned[i] == "{":
+                try:
+                    obj, end = decoder.raw_decode(cleaned, i)
+                    if isinstance(obj, dict) and required_keys.issubset(obj.keys()):
+                        last_obj = obj
+                    i = end
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            i += 1
+        return last_obj
+
+    @staticmethod
     def _extract_last_json(chat_history: list) -> Optional[Dict]:
         """Walk backward through chat history to find the last JSON output."""
         for msg in reversed(chat_history):
@@ -1200,8 +1316,25 @@ class MultiAgentAnnotator:
         return None
 
     @staticmethod
+    def _extract_last_json_with_keys(
+        chat_history: list,
+        required_keys: set[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Walk backward through chat history to find schema-complete JSON."""
+        for msg in reversed(chat_history):
+            content = msg.get("content", "")
+            if not content:
+                continue
+            parsed = MultiAgentAnnotator._try_parse_json_with_keys(
+                content, required_keys
+            )
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
     def _parse_critic_output(text: str) -> Optional[CriticOutput]:
-        raw = MultiAgentAnnotator._try_parse_json(text)
+        raw = MultiAgentAnnotator._try_parse_json_with_keys(text, CRITIC_REQUIRED_KEYS)
         if raw is None:
             return None
         try:
@@ -1212,7 +1345,9 @@ class MultiAgentAnnotator:
 
     @staticmethod
     def _parse_adjudicator_output(text: str) -> Optional[AdjudicatorOutput]:
-        raw = MultiAgentAnnotator._try_parse_json(text)
+        raw = MultiAgentAnnotator._try_parse_json_with_keys(
+            text, ADJUDICATOR_REQUIRED_KEYS
+        )
         if raw is None:
             return None
         try:
@@ -1223,7 +1358,9 @@ class MultiAgentAnnotator:
 
     @staticmethod
     def _parse_annotator_output(text: str) -> Optional[AnnotatorOutput]:
-        raw = MultiAgentAnnotator._try_parse_json(text)
+        raw = MultiAgentAnnotator._try_parse_json_with_keys(
+            text, ANNOTATOR_REQUIRED_KEYS
+        )
         if raw is None:
             return None
         try:
@@ -1231,6 +1368,407 @@ class MultiAgentAnnotator:
         except ValidationError as e:
             logger.warning(f"AnnotatorOutput validation failed: {e}")
             return None
+
+    @staticmethod
+    def _last_deliberation_outputs(
+        deliberation_messages: List[Dict[str, Any]],
+    ) -> Tuple[Optional[AnnotatorOutput], Optional[CriticOutput]]:
+        """Return the final parseable Annotator and Critic outputs."""
+        last_annotator_out = None
+        last_critic_out = None
+        for m in reversed(deliberation_messages):
+            if m["agent"] == "Annotator" and last_annotator_out is None:
+                last_annotator_out = MultiAgentAnnotator._parse_annotator_output(
+                    m.get("content", "")
+                )
+            elif m["agent"] == "Critic" and last_critic_out is None:
+                last_critic_out = MultiAgentAnnotator._parse_critic_output(
+                    m.get("content", "")
+                )
+            if last_annotator_out is not None and last_critic_out is not None:
+                break
+        return last_annotator_out, last_critic_out
+
+    @staticmethod
+    def _last_agent_content(
+        messages: List[Dict[str, Any]],
+        agent_name: str,
+    ) -> str:
+        for m in reversed(messages):
+            if m.get("agent") == agent_name:
+                return m.get("content", "") or ""
+        return ""
+
+    @staticmethod
+    def _deliberation_max_turns(max_rounds: int) -> int:
+        """
+        Reserve enough AG2 turns for content replies plus tool-call/result
+        exchanges. Tool exchanges still count inside AG2, so we budget them
+        separately instead of allowing them to consume the review round.
+        """
+        content_turns = 1 + max_rounds * 2
+        tool_exchange_buffer = 4 + max_rounds * 6
+        return content_turns + tool_exchange_buffer
+
+    @staticmethod
+    def _json_repair_prompt(
+        output_kind: str,
+        original_text: str,
+        sentence: str,
+        reference_annotation: Optional[str] = None,
+    ) -> str:
+        schemas = {
+            "Annotator": """
+Return exactly this JSON shape:
+{
+  "entities": [],
+  "relations": [],
+  "uncertain_cases": [],
+  "reasoning": ""
+}
+""",
+            "Critic": """
+Return exactly this JSON shape:
+{
+  "agreements": [],
+  "disagreements": [],
+  "missing_annotations": [],
+  "reasoning": ""
+}
+""",
+            "Adjudicator": """
+Return exactly this JSON shape:
+{
+  "final_entities": [],
+  "final_relations": [],
+  "disagreement_resolutions": [],
+  "flagged_for_human_review": []
+}
+""",
+        }
+        reference = (
+            f"\nReference annotation/review context:\n{reference_annotation}\n"
+            if reference_annotation
+            else ""
+        )
+        return f"""\
+Your previous {output_kind} output was not parseable as the required JSON schema.
+Repair syntax and schema only. Do not add new reasoning, labels, spans, or relations.
+Return JSON only, with no markdown and no commentary.
+
+Sentence:
+"{sentence}"
+{reference}
+Required schema:
+{schemas[output_kind]}
+Previous output to repair:
+{original_text}
+"""
+
+    def _repair_agent_json(
+        self,
+        requester: ConversableAgent,
+        producer: ConversableAgent,
+        output_kind: str,
+        original_text: str,
+        sentence: str,
+        reference_annotation: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """Ask the producing agent for one JSON-only repair response."""
+        prompt = self._json_repair_prompt(
+            output_kind,
+            original_text,
+            sentence,
+            reference_annotation=reference_annotation,
+        )
+        try:
+            repair_result = requester.initiate_chat(
+                recipient=producer,
+                message=prompt,
+                max_turns=1,
+            )
+        except Exception as e:
+            logger.warning(f"{output_kind} JSON repair failed to run: {e}")
+            return [], ""
+
+        repair_messages = _collect_messages_with_tools(
+            repair_result.chat_history, skip_first=True
+        )
+        repaired_text = self._last_agent_content(repair_messages, output_kind)
+        return repair_messages, repaired_text
+
+    @staticmethod
+    def _base_adjudication_audit(warning: str) -> Dict[str, Any]:
+        return {
+            "preserved_consensus": [],
+            "allowed_changes": [],
+            "rejected_changes": [],
+            "warnings": [warning],
+        }
+
+    @staticmethod
+    def _normalize_annotation_text(text: str) -> str:
+        """Normalize spans and free-text Critic targets for exact matching."""
+        text = (text or "").strip().strip("\"'`")
+        return re.sub(r"\s+", " ", text).lower()
+
+    @staticmethod
+    def _relation_slot(rel: RelationFlat) -> Tuple[str, str]:
+        """Relation identity slot for replacing relation/type decisions."""
+        return (
+            MultiAgentAnnotator._normalize_annotation_text(rel.e1_text),
+            MultiAgentAnnotator._normalize_annotation_text(rel.e2_text),
+        )
+
+    @staticmethod
+    def _relation_key(rel: RelationFlat) -> Tuple[str, str, str, str, str]:
+        return (
+            MultiAgentAnnotator._normalize_annotation_text(rel.relation),
+            MultiAgentAnnotator._normalize_annotation_text(rel.e1_text),
+            MultiAgentAnnotator._normalize_annotation_text(rel.e1_type),
+            MultiAgentAnnotator._normalize_annotation_text(rel.e2_text),
+            MultiAgentAnnotator._normalize_annotation_text(rel.e2_type),
+        )
+
+    @staticmethod
+    def _target_matches_relation(target: str, rel: RelationFlat) -> bool:
+        target_norm = MultiAgentAnnotator._normalize_annotation_text(target)
+        if not target_norm:
+            return False
+
+        e1 = MultiAgentAnnotator._normalize_annotation_text(rel.e1_text)
+        e2 = MultiAgentAnnotator._normalize_annotation_text(rel.e2_text)
+        relation = MultiAgentAnnotator._normalize_annotation_text(rel.relation)
+        descriptors = {
+            f"{e1} {relation} {e2}",
+            f"{e1} -> {relation} -> {e2}",
+            f"{relation}: {e1} -> {e2}",
+        }
+        if target_norm in descriptors:
+            return True
+        return e1 in target_norm and e2 in target_norm and relation in target_norm
+
+    @staticmethod
+    def _sync_relation_endpoint_types(
+        rel: RelationFlat,
+        final_entity_type_by_text: Dict[str, str],
+    ) -> RelationFlat:
+        updates: Dict[str, str] = {}
+        e1_key = MultiAgentAnnotator._normalize_annotation_text(rel.e1_text)
+        e2_key = MultiAgentAnnotator._normalize_annotation_text(rel.e2_text)
+        if e1_key in final_entity_type_by_text:
+            updates["e1_type"] = final_entity_type_by_text[e1_key]
+        if e2_key in final_entity_type_by_text:
+            updates["e2_type"] = final_entity_type_by_text[e2_key]
+        return rel.model_copy(update=updates) if updates else rel
+
+    @staticmethod
+    def _constrain_adjudicator_output(
+        annotator: AnnotatorOutput,
+        critic: Optional[CriticOutput],
+        adjudicator: Optional[AdjudicatorOutput],
+    ) -> ConstrainedAdjudication:
+        """
+        Enforce the adjudicator's authority boundary:
+        keep Annotator/Critic consensus, resolve only final Critic disputes,
+        and add only final Critic missing annotations.
+        """
+        audit: Dict[str, Any] = {
+            "preserved_consensus": [],
+            "allowed_changes": [],
+            "rejected_changes": [],
+            "warnings": [],
+        }
+
+        if critic is None:
+            audit["warnings"].append(
+                "Critic output missing or unparseable; kept final Annotator output unchanged."
+            )
+            return ConstrainedAdjudication(
+                final_entities=annotator.entities,
+                final_relations=annotator.relations,
+                status="critic_missing_fallback",
+                audit=audit,
+            )
+
+        if adjudicator is None:
+            audit["warnings"].append(
+                "Adjudicator output missing or unparseable; kept final Annotator output unchanged."
+            )
+            return ConstrainedAdjudication(
+                final_entities=annotator.entities,
+                final_relations=annotator.relations,
+                status="adjudicator_parse_failed",
+                audit=audit,
+            )
+
+        disagreement_targets = {
+            MultiAgentAnnotator._normalize_annotation_text(d.target)
+            for d in critic.disagreements
+            if d.target
+        }
+        missing_by_text = {
+            MultiAgentAnnotator._normalize_annotation_text(m.text): m
+            for m in critic.missing_annotations
+            if m.text
+        }
+
+        annotator_entities_by_text = {
+            MultiAgentAnnotator._normalize_annotation_text(e.text): e
+            for e in annotator.entities
+        }
+        entity_order = [
+            MultiAgentAnnotator._normalize_annotation_text(e.text)
+            for e in annotator.entities
+        ]
+        final_entities_by_text = dict(annotator_entities_by_text)
+
+        for key, entity in annotator_entities_by_text.items():
+            if key not in disagreement_targets:
+                audit["preserved_consensus"].append(
+                    f'entity "{entity.text}": {entity.entity_type}'
+                )
+
+        for adj_entity in adjudicator.final_entities:
+            key = MultiAgentAnnotator._normalize_annotation_text(adj_entity.text)
+            original = annotator_entities_by_text.get(key)
+
+            if original is not None:
+                if key in disagreement_targets:
+                    final_entities_by_text[key] = adj_entity
+                    if original.entity_type != adj_entity.entity_type:
+                        audit["allowed_changes"].append(
+                            f'entity "{adj_entity.text}": '
+                            f"{original.entity_type} -> {adj_entity.entity_type}"
+                        )
+                    continue
+
+                if original.entity_type != adj_entity.entity_type:
+                    audit["rejected_changes"].append(
+                        f'entity "{adj_entity.text}": '
+                        f"{original.entity_type} -> {adj_entity.entity_type} "
+                        "(not in final Critic disagreements)"
+                    )
+                continue
+
+            missing = missing_by_text.get(key)
+            if missing is not None and adj_entity.entity_type == missing.entity_type:
+                final_entities_by_text[key] = adj_entity
+                entity_order.append(key)
+                audit["allowed_changes"].append(
+                    f'entity "{adj_entity.text}" added as {adj_entity.entity_type} '
+                    "(final Critic missing annotation)"
+                )
+            elif missing is not None:
+                audit["rejected_changes"].append(
+                    f'entity "{adj_entity.text}" add as {adj_entity.entity_type} '
+                    f"rejected; final Critic proposed {missing.entity_type}"
+                )
+            else:
+                audit["rejected_changes"].append(
+                    f'entity "{adj_entity.text}" add as {adj_entity.entity_type} '
+                    "(not in final Critic missing annotations)"
+                )
+
+        final_entities = [final_entities_by_text[key] for key in entity_order]
+        final_entity_type_by_text = {
+            MultiAgentAnnotator._normalize_annotation_text(e.text): e.entity_type
+            for e in final_entities
+        }
+
+        annotator_relations_by_slot = {
+            MultiAgentAnnotator._relation_slot(r): r
+            for r in annotator.relations
+        }
+        disputed_relation_slots = {
+            MultiAgentAnnotator._relation_slot(r)
+            for r in annotator.relations
+            if any(
+                MultiAgentAnnotator._target_matches_relation(d.target, r)
+                for d in critic.disagreements
+            )
+        }
+
+        relation_order = [
+            MultiAgentAnnotator._relation_slot(r)
+            for r in annotator.relations
+        ]
+        final_relations_by_slot = {
+            MultiAgentAnnotator._relation_slot(r): MultiAgentAnnotator._sync_relation_endpoint_types(
+                r, final_entity_type_by_text
+            )
+            for r in annotator.relations
+        }
+
+        for slot, relation in final_relations_by_slot.items():
+            if slot not in disputed_relation_slots:
+                audit["preserved_consensus"].append(
+                    f'relation "{relation.e1_text} {relation.relation} {relation.e2_text}"'
+                )
+
+        for adj_relation in adjudicator.final_relations:
+            synced_adj_relation = MultiAgentAnnotator._sync_relation_endpoint_types(
+                adj_relation, final_entity_type_by_text
+            )
+            slot = MultiAgentAnnotator._relation_slot(synced_adj_relation)
+            original = annotator_relations_by_slot.get(slot)
+            current = final_relations_by_slot.get(slot)
+
+            if original is not None:
+                if slot in disputed_relation_slots:
+                    final_relations_by_slot[slot] = synced_adj_relation
+                    if (
+                        current is not None
+                        and MultiAgentAnnotator._relation_key(current)
+                        != MultiAgentAnnotator._relation_key(synced_adj_relation)
+                    ):
+                        audit["allowed_changes"].append(
+                            f'relation "{synced_adj_relation.e1_text} '
+                            f"{synced_adj_relation.relation} "
+                            f'{synced_adj_relation.e2_text}" changed '
+                            "(final Critic disagreement)"
+                        )
+                    continue
+
+                if (
+                    current is not None
+                    and MultiAgentAnnotator._relation_key(current)
+                    != MultiAgentAnnotator._relation_key(synced_adj_relation)
+                ):
+                    audit["rejected_changes"].append(
+                        f'relation "{synced_adj_relation.e1_text} '
+                        f"{synced_adj_relation.relation} "
+                        f'{synced_adj_relation.e2_text}" changed '
+                        "(not in final Critic disagreements)"
+                    )
+                continue
+
+            if any(
+                MultiAgentAnnotator._target_matches_relation(d.target, synced_adj_relation)
+                for d in critic.disagreements
+            ):
+                final_relations_by_slot[slot] = synced_adj_relation
+                relation_order.append(slot)
+                audit["allowed_changes"].append(
+                    f'relation "{synced_adj_relation.e1_text} '
+                    f"{synced_adj_relation.relation} "
+                    f'{synced_adj_relation.e2_text}" added '
+                    "(final Critic disagreement)"
+                )
+            else:
+                audit["rejected_changes"].append(
+                    f'relation "{synced_adj_relation.e1_text} '
+                    f"{synced_adj_relation.relation} "
+                    f'{synced_adj_relation.e2_text}" added '
+                    "(not in final Critic disagreements)"
+                )
+
+        return ConstrainedAdjudication(
+            final_entities=[final_entities_by_text[key] for key in entity_order],
+            final_relations=[final_relations_by_slot[key] for key in relation_order],
+            status="constrained",
+            audit=audit,
+        )
 
     @staticmethod
     def _build_adjudicator_summary(
