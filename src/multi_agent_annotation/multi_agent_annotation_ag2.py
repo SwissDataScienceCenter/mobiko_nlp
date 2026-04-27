@@ -69,6 +69,7 @@ class DeliberationRecord(BaseModel):
     messages: List[Dict[str, Any]] = Field(default_factory=list)
     final_entities: List[EntityAnnotation] = Field(default_factory=list)
     final_relations: List[RelationAnnotation] = Field(default_factory=list)
+    flagged_for_human_review: List[str] = Field(default_factory=list)
     agreement_score: Optional[float] = None
     rounds_used: int = 0
     adjudication_status: Optional[str] = None
@@ -145,6 +146,7 @@ class AdjudicatorOutput(BaseModel):
 class ConstrainedAdjudication(BaseModel):
     final_entities: List[EntityAnnotation] = Field(default_factory=list)
     final_relations: List[RelationFlat] = Field(default_factory=list)
+    flagged_for_human_review: List[str] = Field(default_factory=list)
     status: str = "constrained"
     audit: Dict[str, Any] = Field(default_factory=dict)
 
@@ -621,6 +623,9 @@ You see the Annotator's labels and the Critic's review.
 4. Disagreement -> check guideline via tools, apply tiebreaker:
    "choose the category describing the primary referent in the sentence."
 5. Genuine ambiguity -> flag for human review, pick the safer label.
+6. Always copy Annotator "uncertain_cases" into "flagged_for_human_review".
+7. If a Critic disagreement has severity "critical" and no clear
+   guideline_reference, include that target in "flagged_for_human_review".
 
 ## Output
 
@@ -1205,6 +1210,7 @@ class MultiAgentAnnotator:
         record.final_relations = [
             r.to_relation_annotation() for r in constrained.final_relations
         ]
+        record.flagged_for_human_review = constrained.flagged_for_human_review
         record.adjudication_status = constrained.status
         record.adjudication_audit = constrained.audit
 
@@ -1582,8 +1588,73 @@ Previous output to repair:
             "preserved_consensus": [],
             "allowed_changes": [],
             "rejected_changes": [],
+            "human_review_flags": [],
             "warnings": [warning],
         }
+
+    @staticmethod
+    def _has_clear_guideline_reference(guideline_reference: str) -> bool:
+        ref = re.sub(r"\s+", " ", (guideline_reference or "").strip()).lower()
+        placeholder_refs = {
+            "",
+            "n/a",
+            "na",
+            "none",
+            "null",
+            "unknown",
+            "unclear",
+            "not cited",
+            "not provided",
+            "not specified",
+            "no citation",
+            "no guideline citation",
+        }
+        return ref not in placeholder_refs
+
+    @staticmethod
+    def _human_review_flags(
+        annotator: AnnotatorOutput,
+        critic: Optional[CriticOutput],
+        adjudicator: Optional[AdjudicatorOutput],
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        flags: List[str] = []
+        provenance: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_flag(text: str, source: str) -> None:
+            flag = re.sub(r"\s+", " ", (text or "").strip())
+            if not flag:
+                return
+            key = flag.lower()
+            if key in seen:
+                for item in provenance:
+                    if item["flag"].lower() == key and source not in item["sources"]:
+                        item["sources"].append(source)
+                return
+            seen.add(key)
+            flags.append(flag)
+            provenance.append({"flag": flag, "sources": [source]})
+
+        for case in annotator.uncertain_cases:
+            add_flag(case, "annotator_uncertain_case")
+
+        if adjudicator is not None:
+            for flag in adjudicator.flagged_for_human_review:
+                add_flag(flag, "adjudicator_flag")
+
+        if critic is not None:
+            for disagreement in critic.disagreements:
+                if disagreement.severity.strip().lower() != "critical":
+                    continue
+                if MultiAgentAnnotator._has_clear_guideline_reference(
+                    disagreement.guideline_reference
+                ):
+                    continue
+                flag = disagreement.target or disagreement.explanation
+                if flag:
+                    add_flag(flag, "critic_critical_no_guideline")
+
+        return flags, provenance
 
     @staticmethod
     def _normalize_annotation_text(text: str) -> str:
@@ -1685,8 +1756,13 @@ Previous output to repair:
             "preserved_consensus": [],
             "allowed_changes": [],
             "rejected_changes": [],
+            "human_review_flags": [],
             "warnings": [],
         }
+        human_review_flags, human_review_provenance = (
+            MultiAgentAnnotator._human_review_flags(annotator, critic, adjudicator)
+        )
+        audit["human_review_flags"] = human_review_provenance
 
         if critic is None:
             audit["warnings"].append(
@@ -1695,6 +1771,7 @@ Previous output to repair:
             return ConstrainedAdjudication(
                 final_entities=annotator.entities,
                 final_relations=annotator.relations,
+                flagged_for_human_review=human_review_flags,
                 status="critic_missing_fallback",
                 audit=audit,
             )
@@ -1706,6 +1783,7 @@ Previous output to repair:
             return ConstrainedAdjudication(
                 final_entities=annotator.entities,
                 final_relations=annotator.relations,
+                flagged_for_human_review=human_review_flags,
                 status="adjudicator_parse_failed",
                 audit=audit,
             )
@@ -1886,6 +1964,7 @@ Previous output to repair:
         return ConstrainedAdjudication(
             final_entities=[final_entities_by_text[key] for key in entity_order],
             final_relations=[final_relations_by_slot[key] for key in relation_order],
+            flagged_for_human_review=human_review_flags,
             status="constrained",
             audit=audit,
         )
@@ -2021,6 +2100,10 @@ def analyze_disagreements(records: List[DeliberationRecord]) -> Dict[str, Any]:
         for rel in rec.final_relations:
             stats["relation_distribution"][rel.relation] = (
                 stats["relation_distribution"].get(rel.relation, 0) + 1
+            )
+        for flag in rec.flagged_for_human_review:
+            stats["flagged_for_review"].append(
+                {"sentence": rec.sentence, "flag": flag}
             )
     stats["avg_agreement"] = sum(scores) / len(scores) if scores else 0
     stats["avg_rounds"] = sum(rounds) / len(rounds) if rounds else 0

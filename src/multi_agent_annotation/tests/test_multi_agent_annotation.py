@@ -959,6 +959,135 @@ class TestConstrainAdjudicatorOutput:
         }
         assert sum("removed" in item for item in result.audit["allowed_changes"]) == 4
 
+    def test_uncertain_cases_are_flagged_even_when_adjudicator_omits_flags(self):
+        uncertainty = "food insecurity: BIOTIC PROCESS vs BIOTIC PROPERTY"
+        annotator = AnnotatorOutput(
+            entities=[
+                EntityAnnotation(text="food insecurity", entity_type="BIOTIC PROCESS")
+            ],
+            relations=[],
+            uncertain_cases=[uncertainty],
+        )
+        critic = CriticOutput(disagreements=[], missing_annotations=[])
+        adjudicator = AdjudicatorOutput(
+            final_entities=annotator.entities,
+            final_relations=[],
+            flagged_for_human_review=[],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        assert result.flagged_for_human_review == [uncertainty]
+        assert result.audit["human_review_flags"] == [
+            {"flag": uncertainty, "sources": ["annotator_uncertain_case"]}
+        ]
+
+    def test_critical_disagreement_without_guideline_reference_is_flagged(self):
+        annotator = AnnotatorOutput(
+            entities=[
+                EntityAnnotation(text="food insecurity", entity_type="BIOTIC PROCESS")
+            ],
+            relations=[],
+        )
+        critic = CriticOutput(
+            disagreements=[
+                CriticDisagreement(
+                    target="food insecurity",
+                    annotator_label="BIOTIC PROCESS",
+                    proposed_label="BIOTIC PROPERTY",
+                    guideline_reference="n/a",
+                    severity="critical",
+                )
+            ],
+            missing_annotations=[],
+        )
+        adjudicator = AdjudicatorOutput(
+            final_entities=annotator.entities,
+            final_relations=[],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        assert result.flagged_for_human_review == ["food insecurity"]
+        assert result.audit["human_review_flags"] == [
+            {"flag": "food insecurity", "sources": ["critic_critical_no_guideline"]}
+        ]
+
+    def test_critical_disagreement_with_guideline_reference_is_not_auto_flagged(self):
+        annotator = AnnotatorOutput(
+            entities=[
+                EntityAnnotation(text="food insecurity", entity_type="BIOTIC PROCESS")
+            ],
+            relations=[],
+        )
+        critic = CriticOutput(
+            disagreements=[
+                CriticDisagreement(
+                    target="food insecurity",
+                    annotator_label="BIOTIC PROCESS",
+                    proposed_label="BIOTIC PROPERTY",
+                    guideline_reference="Step 5",
+                    severity="critical",
+                )
+            ],
+            missing_annotations=[],
+        )
+        adjudicator = AdjudicatorOutput(
+            final_entities=annotator.entities,
+            final_relations=[],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        assert result.flagged_for_human_review == []
+        assert result.audit["human_review_flags"] == []
+
+    def test_human_review_flags_are_deduplicated_with_all_sources(self):
+        annotator = AnnotatorOutput(
+            entities=[
+                EntityAnnotation(text="food insecurity", entity_type="BIOTIC PROCESS")
+            ],
+            relations=[],
+            uncertain_cases=["food insecurity"],
+        )
+        critic = CriticOutput(
+            disagreements=[
+                CriticDisagreement(
+                    target="food insecurity",
+                    severity="critical",
+                    guideline_reference="",
+                )
+            ],
+            missing_annotations=[],
+        )
+        adjudicator = AdjudicatorOutput(
+            final_entities=annotator.entities,
+            final_relations=[],
+            flagged_for_human_review=[" food   insecurity "],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        assert result.flagged_for_human_review == ["food insecurity"]
+        assert result.audit["human_review_flags"] == [
+            {
+                "flag": "food insecurity",
+                "sources": [
+                    "annotator_uncertain_case",
+                    "adjudicator_flag",
+                    "critic_critical_no_guideline",
+                ],
+            }
+        ]
+
 
 # ─────────────────────────────────────────────────────────────
 # analyze_disagreements
@@ -1015,6 +1144,19 @@ class TestAnalyzeDisagreements:
         stats = analyze_disagreements([rec])
         assert stats["avg_agreement"] == pytest.approx(0.0)
 
+    def test_flagged_for_review_includes_sentence_context(self):
+        rec = self._make_record("Food insecurity affects anxiety.")
+        rec.flagged_for_human_review = ["food insecurity"]
+
+        stats = analyze_disagreements([rec])
+
+        assert stats["flagged_for_review"] == [
+            {
+                "sentence": "Food insecurity affects anxiety.",
+                "flag": "food insecurity",
+            }
+        ]
+
 
 # ─────────────────────────────────────────────────────────────
 # _append_jsonl
@@ -1065,6 +1207,7 @@ class TestAppendJsonl:
             "preserved_consensus": ["entity \"oak\": BIOTIC ENTITY"],
             "allowed_changes": [],
             "rejected_changes": [],
+            "human_review_flags": [],
             "warnings": [],
         }
 
@@ -1073,6 +1216,16 @@ class TestAppendJsonl:
         obj = json.loads(path.read_text().strip())
         assert obj["adjudication_status"] == "constrained"
         assert obj["adjudication_audit"]["preserved_consensus"]
+
+    def test_flagged_for_human_review_serializes(self, tmp_path):
+        path = tmp_path / "output.jsonl"
+        rec = DeliberationRecord(sentence="Food insecurity affects anxiety.")
+        rec.flagged_for_human_review = ["food insecurity"]
+
+        MultiAgentAnnotator._append_jsonl(rec, path)
+
+        obj = json.loads(path.read_text().strip())
+        assert obj["flagged_for_human_review"] == ["food insecurity"]
 
 
 # ─────────────────────────────────────────────────────────────
