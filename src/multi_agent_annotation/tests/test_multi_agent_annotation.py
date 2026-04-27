@@ -323,10 +323,59 @@ class TestConsistencyCheck:
         assert results[0]["entity_text"] == "species"
         assert results[0]["entity_type"] == "BIOTIC ENTITY"
 
-    def test_substring_match(self, initialized_state):
-        # "population" is in e1 of LOCATED_IN seed
+    def test_single_token_match(self, initialized_state):
         results = json.loads(consistency_check("population"))
         assert len(results) > 0
+        assert results[0]["entity_text"] == "population"
+
+    def test_single_token_does_not_match_phrase(self):
+        seeds = {
+            "HAS_PROPERTY": [
+                {
+                    "e1": {"text": "food insecurity", "type": "ANTHROPOGENIC PROPERTY"},
+                    "e2": {"text": "dietary quality", "type": "BIOTIC PROPERTY"},
+                    "sentence": "Food insecurity affects dietary quality.",
+                }
+            ]
+        }
+        _init_tool_state({}, [], seeds)
+        results = json.loads(consistency_check("food"))
+        assert results == []
+
+    def test_single_token_does_not_match_substring_inside_token(self):
+        seeds = {
+            "HAS_PROPERTY": [
+                {
+                    "e1": {"text": "seafood", "type": "BIOTIC ENTITY"},
+                    "e2": {"text": "availability", "type": "ANTHROPOGENIC PROPERTY"},
+                    "sentence": "Seafood availability varies.",
+                }
+            ]
+        }
+        _init_tool_state({}, [], seeds)
+        results = json.loads(consistency_check("food"))
+        assert results == []
+
+    def test_phrase_matches_near_variant_by_token_overlap(self):
+        seeds = {
+            "IS_AFFECTING": [
+                {
+                    "e1": {"text": "chronic food insecurity", "type": "ANTHROPOGENIC PROPERTY"},
+                    "e2": {"text": "anxiety", "type": "BIOTIC PROPERTY"},
+                    "sentence": "Chronic food insecurity is associated with anxiety.",
+                }
+            ]
+        }
+        _init_tool_state({}, [], seeds)
+        results = json.loads(consistency_check("food insecurity"))
+        assert len(results) == 1
+        assert results[0]["entity_text"] == "chronic food insecurity"
+        assert results[0]["matched_tokens"] == ["food", "insecurity"]
+        assert results[0]["match_score"] >= 0.5
+
+    def test_stopword_only_query_does_not_match(self, initialized_state):
+        results = json.loads(consistency_check("of the"))
+        assert results == []
 
     def test_no_match_returns_empty(self, initialized_state):
         results = json.loads(consistency_check("nonexistent_span_xyz"))

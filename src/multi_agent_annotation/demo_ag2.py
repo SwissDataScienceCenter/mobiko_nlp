@@ -119,8 +119,9 @@ def run_dry(schema_path: Path, seeds_path: Path) -> None:
     )
 
     # consistency_check tool
-    matches = json.loads(consistency_check("species"))
-    print(f"\n[OK] consistency_check('species') → {len(matches)} match(es)")
+    consistency_query = "species of vascular plants"
+    matches = json.loads(consistency_check(consistency_query))
+    print(f"\n[OK] consistency_check('{consistency_query}') → {len(matches)} match(es)")
 
     # Entity schema string
     print(f"\n[OK] SCHEMA_BIODIV_SHORT ({len(SCHEMA_BIODIV_SHORT)} chars) — first 200 chars:")

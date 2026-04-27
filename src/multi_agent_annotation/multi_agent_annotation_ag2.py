@@ -376,6 +376,11 @@ _GUIDELINE_EMBEDDING_ERROR: Optional[str] = None
 
 _GUIDELINE_SEARCH_NO_MATCH_SUGGESTION = "This concept may not be covered in the guideline"
 _GUIDELINE_EMBEDDING_MIN_SCORE = 0.25
+_CONSISTENCY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "into",
+    "is", "of", "on", "or", "the", "to", "with",
+}
+_CONSISTENCY_MIN_TOKEN_OVERLAP = 0.5
 
 
 _FALLBACK_ENTITY_TYPES = [
@@ -576,26 +581,59 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _consistency_tokens(text: str) -> List[str]:
+    tokens = re.findall(r"\w+", text.lower())
+    return [tok for tok in tokens if tok not in _CONSISTENCY_STOPWORDS]
+
+
+def _consistency_match(query_tokens: List[str], candidate_text: str) -> Optional[Tuple[float, List[str]]]:
+    candidate_tokens = _consistency_tokens(candidate_text)
+    if not query_tokens or not candidate_tokens:
+        return None
+
+    query_set = set(query_tokens)
+    candidate_set = set(candidate_tokens)
+    overlap = query_set & candidate_set
+    if not overlap:
+        return None
+
+    if len(query_set) == 1:
+        if len(candidate_set) == 1 and query_set == candidate_set:
+            return 1.0, sorted(overlap)
+        return None
+
+    score = len(overlap) / max(len(query_set), len(candidate_set))
+    if score < _CONSISTENCY_MIN_TOKEN_OVERLAP:
+        return None
+    return score, sorted(overlap)
+
+
 def consistency_check(
     span_text: Annotated[str, "The entity text to look up, e.g. 'species'"],
 ) -> str:
     """Find how similar spans were labelled in existing seed examples for consistency."""
-    span_lower = span_text.lower().strip()
+    query_tokens = _consistency_tokens(span_text)
     matches = []
     for rel, examples in _SEED_EXAMPLES.items():
         for ex in examples:
-            e1t = ex.get("e1", {}).get("text", "").lower()
-            e2t = ex.get("e2", {}).get("text", "").lower()
+            e1 = ex.get("e1", {})
+            e2 = ex.get("e2", {})
             matched = None
-            if span_lower in e1t or e1t in span_lower:
-                matched = ("e1", ex["e1"])
-            elif span_lower in e2t or e2t in span_lower:
-                matched = ("e2", ex["e2"])
+            e1_match = _consistency_match(query_tokens, e1.get("text", ""))
+            if e1_match:
+                matched = ("e1", e1, e1_match)
+            else:
+                e2_match = _consistency_match(query_tokens, e2.get("text", ""))
+                if e2_match:
+                    matched = ("e2", e2, e2_match)
             if matched:
-                role, ent = matched
+                role, ent, (score, matched_tokens) = matched
                 matches.append({
                     "relation": rel, "matched_entity": role,
                     "entity_text": ent["text"], "entity_type": ent["type"],
+                    "match_score": round(score, 3),
+                    "query_tokens": query_tokens,
+                    "matched_tokens": matched_tokens,
                     "sentence_snippet": ex["sentence"][:120],
                 })
             if len(matches) >= 5:
@@ -731,12 +769,12 @@ Return a JSON object with exactly these fields:
   "reasoning": "brief overall reasoning"
 }}
 
-TERMINATION RULE: If your "disagreements" list is empty and "missing_annotations" is empty,
-you MUST end your entire response with the word TERMINATE on its own line. Do not ask follow-up
-questions or summarise — just output the JSON and then TERMINATE.
+TERMINATION RULE:
+- If "disagreements" is empty AND "missing_annotations" is empty: end your response with TERMINATE on its own line.
+- If either list is non-empty: do NOT write TERMINATE. The Annotator will revise and you will review again.
 
 Output rules:
-- Return JSON only, optionally followed by TERMINATE on its own line.
+- Return JSON only. Append TERMINATE on its own line only when the termination rule requires it.
 - Do not restate the sentence or the full annotation.
 - Limit each disagreement to the minimal concrete correction needed.
 """
@@ -1365,16 +1403,32 @@ class MultiAgentAnnotator:
         # ── Compute agreement ─────────────────────────────────
         # Use the last round only (earlier disputes may have been resolved).
         # Denominator = Annotator's proposed items (entities + relations).
-        # Disputes  = Critic's disagreements + missing_annotations.
+        # Disputes  = Critic's explicit disagreements + relations whose endpoints
+        #             are disputed (entity-type changes cascade to their relations)
+        #             + missing_annotations.
         # Score     = (proposed − disagreed) / (proposed + missing).
-        #
-        # This avoids the granularity mismatch of the free-text
-        # "agreements" list (which might pack multiple items into one
-        # string) and correctly penalises for missing annotations.
 
         if last_annotator_out and last_critic_out:
+            entity_dispute_targets = {
+                MultiAgentAnnotator._normalize_annotation_text(d.target)
+                for d in last_critic_out.disagreements
+                if d.target
+            }
             n_proposed = len(last_annotator_out.entities) + len(last_annotator_out.relations)
             n_disagreed = len(last_critic_out.disagreements)
+            # Count relations whose endpoints are disputed but weren't flagged directly.
+            n_implicated_relations = sum(
+                1 for r in last_annotator_out.relations
+                if (
+                    MultiAgentAnnotator._normalize_annotation_text(r.e1_text) in entity_dispute_targets
+                    or MultiAgentAnnotator._normalize_annotation_text(r.e2_text) in entity_dispute_targets
+                )
+                and not any(
+                    MultiAgentAnnotator._disagreement_matches_relation(d, r)
+                    for d in last_critic_out.disagreements
+                )
+            )
+            n_disagreed += n_implicated_relations
             n_missing = len(last_critic_out.missing_annotations)
             n_agreed = max(n_proposed - n_disagreed, 0)
             total_considered = n_proposed + n_missing
@@ -2020,6 +2074,9 @@ Previous output to repair:
             if any(
                 MultiAgentAnnotator._disagreement_matches_relation(d, r)
                 for d in critic.disagreements
+            ) or (
+                MultiAgentAnnotator._normalize_annotation_text(r.e1_text) in disagreement_targets
+                or MultiAgentAnnotator._normalize_annotation_text(r.e2_text) in disagreement_targets
             )
         }
 
