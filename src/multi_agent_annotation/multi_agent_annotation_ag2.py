@@ -347,10 +347,11 @@ _SEED_EXAMPLES: Dict[str, List[dict]] = {}
 
 
 _FALLBACK_ENTITY_TYPES = [
-    "ABIOTIC COLLECTIVE ENTITY", "ABIOTIC ENTITY", "ABIOTIC PROCESS", "ABIOTIC PROPERTY",
+    "ABIOTIC ENTITY", "ABIOTIC PROCESS", "ABIOTIC PROPERTY",
     "ANTHROPOGENIC ENTITY", "ANTHROPOGENIC PROCESS", "ANTHROPOGENIC PROPERTY",
-    "BIOTIC COLLECTIVE ENTITY", "BIOTIC ENTITY", "BIOTIC PROCESS", "BIOTIC PROPERTY",
+    "BIOTIC ENTITY", "BIOTIC PROCESS", "BIOTIC PROPERTY",
     "CONCEPT", "SPATIAL ENTITY", "SPATIAL PROPERTY", "TEMPORAL ENTITY", "TEMPORAL PROPERTY",
+    "QUALITATIVE ENTITY", "QUANTITATIVE ENTITY"
 ]
 
 
@@ -492,7 +493,7 @@ Return a JSON object with exactly these fields:
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_step": "Step 5", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
   ],
   "relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC COLLECTIVE ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.85, "reasoning": "..."}}
+    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.85, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -535,7 +536,6 @@ Work through the annotation systematically in this order:
 
 2. **Category confusions** — look for common misclassifications:
    - BIOTIC PROPERTY vs ABIOTIC PROPERTY (check the modified noun, not the adjective)
-   - BIOTIC ENTITY vs BIOTIC COLLECTIVE ENTITY (individual/taxon vs assemblage)
    - SPATIAL ENTITY vs ABIOTIC ENTITY (place/unit of analysis vs physical object)
    - CONCEPT vs any concrete category (abstract theoretical construct vs real-world referent)
    - BIOTIC PROCESS vs ANTHROPOGENIC PROCESS (organism-driven vs human-driven activity)
@@ -603,7 +603,7 @@ Return a JSON object with exactly these fields, then end your message with TERMI
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC COLLECTIVE ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "guideline step Z says..."}}
