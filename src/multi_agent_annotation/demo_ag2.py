@@ -111,8 +111,12 @@ def run_dry(schema_path: Path, seeds_path: Path) -> None:
     print(f"     forward relations: {result['valid_relations_forward']}")
 
     # guideline_search tool
-    hits = json.loads(guideline_search("habitat spatial property"))
-    print(f"\n[OK] guideline_search('habitat spatial property') → {len(hits)} section(s) matched")
+    search_result = json.loads(guideline_search("habitat spatial property"))
+    hits = search_result["results"]
+    print(
+        f"\n[OK] guideline_search('habitat spatial property') → "
+        f"{len(hits)} section(s) matched via {search_result['backend']}"
+    )
 
     # consistency_check tool
     matches = json.loads(consistency_check("species"))

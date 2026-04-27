@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -365,6 +366,16 @@ _TYPE_PAIR_TO_RELATIONS: Dict[Tuple[str, str], List[str]] = {}
 _ALL_ENTITY_TYPES: set = set()
 _GUIDELINE_SECTIONS: List[Dict[str, str]] = []
 _SEED_EXAMPLES: Dict[str, List[dict]] = {}
+_GUIDELINE_SEARCH_BACKEND = "lexical"
+_DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+_GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME = _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL
+_GUIDELINE_SECTION_EMBEDDINGS: Optional[List[List[float]]] = None
+_GUIDELINE_EMBEDDING_MODEL = None
+_GUIDELINE_EMBEDDING_MODEL_LOADED_NAME: Optional[str] = None
+_GUIDELINE_EMBEDDING_ERROR: Optional[str] = None
+
+_GUIDELINE_SEARCH_NO_MATCH_SUGGESTION = "This concept may not be covered in the guideline"
+_GUIDELINE_EMBEDDING_MIN_SCORE = 0.25
 
 
 _FALLBACK_ENTITY_TYPES = [
@@ -377,14 +388,36 @@ _FALLBACK_ENTITY_TYPES = [
 
 
 def _init_tool_state(schema, guideline_sections, seed_examples,
-                     entity_types_list: Optional[list] = None):
+                     entity_types_list: Optional[list] = None,
+                     guideline_search_backend: Optional[str] = None,
+                     guideline_search_embedding_model: Optional[str] = None):
     """Populate module-level state used by tool functions."""
     global _SCHEMA, _TYPE_PAIR_TO_RELATIONS, _ALL_ENTITY_TYPES
     global _GUIDELINE_SECTIONS, _SEED_EXAMPLES
+    global _GUIDELINE_SEARCH_BACKEND, _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
+    global _GUIDELINE_SECTION_EMBEDDINGS, _GUIDELINE_EMBEDDING_ERROR
 
     _SCHEMA = schema
     _GUIDELINE_SECTIONS = guideline_sections
     _SEED_EXAMPLES = seed_examples
+    _GUIDELINE_SEARCH_BACKEND = (
+        guideline_search_backend
+        or os.getenv("GUIDELINE_SEARCH_BACKEND")
+        or "lexical"
+    ).strip().lower()
+    if _GUIDELINE_SEARCH_BACKEND not in {"lexical", "embedding"}:
+        logger.warning(
+            "Unknown GUIDELINE_SEARCH_BACKEND=%r; falling back to lexical",
+            _GUIDELINE_SEARCH_BACKEND,
+        )
+        _GUIDELINE_SEARCH_BACKEND = "lexical"
+    _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME = (
+        guideline_search_embedding_model
+        or os.getenv("GUIDELINE_SEARCH_EMBEDDING_MODEL")
+        or _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL
+    )
+    _GUIDELINE_SECTION_EMBEDDINGS = None
+    _GUIDELINE_EMBEDDING_ERROR = None
 
     _TYPE_PAIR_TO_RELATIONS.clear()
     _ALL_ENTITY_TYPES.clear()
@@ -422,6 +455,35 @@ def guideline_search(
     query: Annotated[str, "Keywords to search in the labelling guideline, e.g. 'habitat spatial property'"],
 ) -> str:
     """Search the MoBiKo labelling guideline for relevant rules and classification steps."""
+    backend = _GUIDELINE_SEARCH_BACKEND
+    if backend == "embedding":
+        try:
+            results = _guideline_search_embedding(query)
+            if results is not None:
+                return _format_guideline_search_response(query, "embedding", results)
+        except Exception as exc:
+            logger.warning("Embedding guideline_search failed; falling back to lexical: %s", exc)
+
+    results = _guideline_search_lexical(query)
+    return _format_guideline_search_response(query, "lexical", results)
+
+
+def _format_guideline_search_response(
+    query: str,
+    backend: str,
+    results: List[Dict[str, Any]],
+) -> str:
+    status = "matched" if results else "no_match"
+    return json.dumps({
+        "status": status,
+        "backend": backend,
+        "query": query,
+        "results": results,
+        "suggestion": None if results else _GUIDELINE_SEARCH_NO_MATCH_SUGGESTION,
+    }, ensure_ascii=False)
+
+
+def _guideline_search_lexical(query: str) -> List[Dict[str, Any]]:
     tokens = set(re.findall(r"\w+", query.lower()))
     scored = []
     for sec in _GUIDELINE_SECTIONS:
@@ -431,7 +493,87 @@ def guideline_search(
         if score > 0:
             scored.append((score, sec))
     scored.sort(key=lambda x: -x[0])
-    return json.dumps([s[1] for s in scored[:3]], ensure_ascii=False)
+    return [s[1] for s in scored[:3]]
+
+
+def _guideline_search_embedding(query: str) -> Optional[List[Dict[str, Any]]]:
+    section_embeddings = _ensure_guideline_section_embeddings()
+    if section_embeddings is None:
+        return None
+
+    query_embedding = _embed_guideline_texts([query])[0]
+    scored = []
+    for sec, sec_embedding in zip(_GUIDELINE_SECTIONS, section_embeddings):
+        score = _cosine_similarity(query_embedding, sec_embedding)
+        if score >= _GUIDELINE_EMBEDDING_MIN_SCORE:
+            scored.append((score, sec))
+    scored.sort(key=lambda x: -x[0])
+    return [s[1] for s in scored[:3]]
+
+
+def _ensure_guideline_section_embeddings() -> Optional[List[List[float]]]:
+    global _GUIDELINE_SECTION_EMBEDDINGS, _GUIDELINE_EMBEDDING_ERROR
+
+    if _GUIDELINE_SECTION_EMBEDDINGS is not None:
+        return _GUIDELINE_SECTION_EMBEDDINGS
+    if not _GUIDELINE_SECTIONS:
+        _GUIDELINE_SECTION_EMBEDDINGS = []
+        return _GUIDELINE_SECTION_EMBEDDINGS
+    if _GUIDELINE_EMBEDDING_ERROR:
+        return None
+
+    try:
+        section_texts = [
+            f"{sec.get('title', '')}\n{sec.get('content', '')}"
+            for sec in _GUIDELINE_SECTIONS
+        ]
+        _GUIDELINE_SECTION_EMBEDDINGS = _embed_guideline_texts(section_texts)
+        return _GUIDELINE_SECTION_EMBEDDINGS
+    except Exception as exc:
+        _GUIDELINE_EMBEDDING_ERROR = str(exc)
+        logger.warning("Could not initialize guideline embeddings: %s", exc)
+        return None
+
+
+def _embed_guideline_texts(texts: List[str]) -> List[List[float]]:
+    model = _get_guideline_embedding_model()
+    vectors = model.encode(texts, normalize_embeddings=True)
+    if hasattr(vectors, "tolist"):
+        vectors = vectors.tolist()
+    return [_as_float_vector(vec) for vec in vectors]
+
+
+def _get_guideline_embedding_model():
+    global _GUIDELINE_EMBEDDING_MODEL, _GUIDELINE_EMBEDDING_MODEL_LOADED_NAME
+
+    if (
+        _GUIDELINE_EMBEDDING_MODEL is not None
+        and _GUIDELINE_EMBEDDING_MODEL_LOADED_NAME == _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
+    ):
+        return _GUIDELINE_EMBEDDING_MODEL
+
+    from sentence_transformers import SentenceTransformer
+
+    _GUIDELINE_EMBEDDING_MODEL = SentenceTransformer(_GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME)
+    _GUIDELINE_EMBEDDING_MODEL_LOADED_NAME = _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
+    return _GUIDELINE_EMBEDDING_MODEL
+
+
+def _as_float_vector(vec: Any) -> List[float]:
+    if hasattr(vec, "tolist"):
+        vec = vec.tolist()
+    return [float(x) for x in vec]
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 def consistency_check(
@@ -929,6 +1071,8 @@ class MultiAgentAnnotator:
         Seed examples for consistency checking.
     max_rounds : int
         Max Annotator↔Critic turns before adjudication.
+    guideline_search_backend : str
+        "lexical" by default; set to "embedding" to opt into SentenceTransformer retrieval.
     """
 
     def __init__(
@@ -943,6 +1087,8 @@ class MultiAgentAnnotator:
         max_rounds: int = 2,
         entity_schema_str: Optional[str] = None,
         entity_types_list: Optional[list] = None,
+        guideline_search_backend: Optional[str] = None,
+        guideline_search_embedding_model: Optional[str] = None,
     ):
         self.max_rounds = max_rounds
 
@@ -969,7 +1115,9 @@ class MultiAgentAnnotator:
         # guideline_search tool searches across both documents combined
         all_sections = decision_support_sections + guidance_sections
         _init_tool_state(relation_schema, all_sections, seeds,
-                         entity_types_list=entity_types_list or _FALLBACK_ENTITY_TYPES)
+                         entity_types_list=entity_types_list or _FALLBACK_ENTITY_TYPES,
+                         guideline_search_backend=guideline_search_backend,
+                         guideline_search_embedding_model=guideline_search_embedding_model)
 
         logger.info(
             f"Loaded decision support: {len(decision_support_sections)} sections | "
@@ -2130,6 +2278,18 @@ def main():
     parser.add_argument("--critic-model", type=str, default="qwen3-32B-vllm")
     parser.add_argument("--adjudicator-model", type=str, default="qwen3-32B-vllm")
     parser.add_argument("--max-rounds", type=int, default=2)
+    parser.add_argument(
+        "--guideline-search-backend",
+        choices=["lexical", "embedding"],
+        default=None,
+        help="Optional guideline_search backend. Defaults to GUIDELINE_SEARCH_BACKEND or lexical.",
+    )
+    parser.add_argument(
+        "--guideline-search-embedding-model",
+        type=str,
+        default=None,
+        help="SentenceTransformer model name used when --guideline-search-backend=embedding.",
+    )
 
     args = parser.parse_args()
 
@@ -2158,6 +2318,8 @@ def main():
         guideline_path=args.guideline,
         seeds_path=args.seeds,
         max_rounds=args.max_rounds,
+        guideline_search_backend=args.guideline_search_backend,
+        guideline_search_embedding_model=args.guideline_search_embedding_model,
     )
 
     records = annotator.annotate_batch(sentences, output_path=args.output)

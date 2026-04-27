@@ -79,6 +79,7 @@ SAMPLE_SEEDS = {
 
 SAMPLE_GUIDELINE = [
     {"title": "Step 1 — Abstract/theoretical", "content": "Scientific concept → CONCEPT"},
+    {"title": "Step 4 — Anthropogenic", "content": "Human system characteristic → ANTHROPOGENIC PROPERTY."},
     {"title": "Step 5 — Biotic", "content": "Single organism → BIOTIC ENTITY. habitat property → BIOTIC PROPERTY."},
     {"title": "Step 3 — Spatial", "content": "Place → SPATIAL ENTITY. spatial attribute → SPATIAL PROPERTY."},
 ]
@@ -247,23 +248,72 @@ class TestSchemaLookup:
 
 class TestGuidelineSearch:
     def test_matching_query(self, initialized_state):
-        results = json.loads(guideline_search("biotic habitat property"))
-        assert len(results) > 0
-        titles = [r["title"] for r in results]
+        result = json.loads(guideline_search("biotic habitat property"))
+        assert result["status"] == "matched"
+        assert result["backend"] == "lexical"
+        assert result["suggestion"] is None
+        titles = [r["title"] for r in result["results"]]
         assert any("Biotic" in t or "biotic" in t.lower() for t in titles)
 
-    def test_no_match_returns_empty(self, initialized_state):
-        results = json.loads(guideline_search("xyzzy frobnicator"))
-        assert results == []
+    def test_no_match_returns_explicit_status(self, initialized_state):
+        result = json.loads(guideline_search("xyzzy frobnicator"))
+        assert result["status"] == "no_match"
+        assert result["backend"] == "lexical"
+        assert result["results"] == []
+        assert result["suggestion"] == "This concept may not be covered in the guideline"
 
     def test_returns_at_most_3_results(self, initialized_state):
-        results = json.loads(guideline_search("entity property concept spatial biotic"))
-        assert len(results) <= 3
+        result = json.loads(guideline_search("entity property concept spatial biotic"))
+        assert len(result["results"]) <= 3
 
     def test_title_tokens_weighted_higher(self, initialized_state):
         # "Step 1" appears in title only → should rank first
-        results = json.loads(guideline_search("Abstract"))
-        assert len(results) > 0
+        result = json.loads(guideline_search("Abstract"))
+        assert len(result["results"]) > 0
+
+    def test_embedding_backend_can_match_semantic_section(self, monkeypatch):
+        def fake_embed(texts):
+            vectors = []
+            for text in texts:
+                if text == "food insecurity":
+                    vectors.append([1.0, 0.0])
+                elif "Anthropogenic" in text or "Human system" in text:
+                    vectors.append([1.0, 0.0])
+                else:
+                    vectors.append([0.0, 1.0])
+            return vectors
+
+        monkeypatch.setattr(mod, "_embed_guideline_texts", fake_embed)
+        _init_tool_state(
+            SAMPLE_SCHEMA,
+            SAMPLE_GUIDELINE,
+            SAMPLE_SEEDS,
+            guideline_search_backend="embedding",
+        )
+
+        result = json.loads(guideline_search("food insecurity"))
+
+        assert result["status"] == "matched"
+        assert result["backend"] == "embedding"
+        assert result["results"][0]["title"] == "Step 4 — Anthropogenic"
+
+    def test_embedding_backend_falls_back_to_lexical(self, monkeypatch):
+        def failing_embed(texts):
+            raise RuntimeError("model unavailable")
+
+        monkeypatch.setattr(mod, "_embed_guideline_texts", failing_embed)
+        _init_tool_state(
+            SAMPLE_SCHEMA,
+            SAMPLE_GUIDELINE,
+            SAMPLE_SEEDS,
+            guideline_search_backend="embedding",
+        )
+
+        result = json.loads(guideline_search("biotic habitat property"))
+
+        assert result["status"] == "matched"
+        assert result["backend"] == "lexical"
+        assert result["results"]
 
 
 class TestConsistencyCheck:
