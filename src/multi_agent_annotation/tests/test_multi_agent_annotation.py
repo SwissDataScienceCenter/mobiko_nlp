@@ -34,6 +34,7 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     _init_tool_state,
     _critic_is_satisfied,
     _get_embedded_guideline,
+    _is_final_terminate_msg,
     analyze_disagreements,
     build_llm_config,
     consistency_check,
@@ -340,8 +341,16 @@ class TestCriticIsSatisfied:
     def test_terminate_keyword(self):
         assert _critic_is_satisfied({"content": "All good.\nTERMINATE"}) is True
 
-    def test_terminate_in_middle(self):
-        assert _critic_is_satisfied({"content": "TERMINATE some trailing text"}) is True
+    def test_terminate_in_middle_does_not_stop(self):
+        assert _critic_is_satisfied({"content": "TERMINATE some trailing text"}) is False
+
+    def test_embedded_terminate_does_not_stop_tool_executor(self):
+        msg = {"content": "## Final review\nTERMINATE\n\nProduce the final annotation."}
+        assert _is_final_terminate_msg(msg) is False
+
+    def test_final_standalone_terminate_stops(self):
+        msg = {"content": '{"ok": true}\nTERMINATE'}
+        assert _is_final_terminate_msg(msg) is True
 
     def test_empty_disagreements_and_missing(self):
         payload = json.dumps({"disagreements": [], "missing_annotations": []})
@@ -474,6 +483,16 @@ class TestDeliberationTurnBudget:
 
         assert new_budget > old_budget
         assert new_budget >= 10
+
+    def test_adjudicator_initial_budget_allows_tool_exchange(self):
+        assert MultiAgentAnnotator._adjudicator_max_turns() > 3
+
+    def test_empty_adjudicator_output_uses_generation_retry(self):
+        assert MultiAgentAnnotator._adjudicator_retry_mode("") == "generate"
+        assert MultiAgentAnnotator._adjudicator_retry_mode("   \n") == "generate"
+
+    def test_malformed_adjudicator_output_uses_repair_retry(self):
+        assert MultiAgentAnnotator._adjudicator_retry_mode("{not json") == "repair"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -801,6 +820,144 @@ class TestConstrainAdjudicatorOutput:
         )
 
         assert result.final_relations[0].relation == "HAS_PROPERTY"
+
+    def test_disputed_relation_omitted_by_adjudicator_is_removed(self):
+        annotator = AnnotatorOutput(
+            entities=[
+                EntityAnnotation(text="food insecurity", entity_type="ANTHROPOGENIC PROPERTY"),
+                EntityAnnotation(text="anxiety", entity_type="BIOTIC PROPERTY"),
+            ],
+            relations=[
+                RelationFlat(
+                    relation="IS_AFFECTING",
+                    e1_text="food insecurity",
+                    e1_type="ANTHROPOGENIC PROPERTY",
+                    e2_text="anxiety",
+                    e2_type="BIOTIC PROPERTY",
+                )
+            ],
+        )
+        critic = CriticOutput(
+            disagreements=[
+                CriticDisagreement(
+                    target="IS_AFFECTING: food insecurity -> anxiety",
+                    annotator_label="IS_AFFECTING",
+                    proposed_label="INVALID",
+                )
+            ],
+            missing_annotations=[],
+        )
+        adjudicator = AdjudicatorOutput(
+            final_entities=annotator.entities,
+            final_relations=[],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        assert result.final_relations == []
+        assert any("removed" in item for item in result.audit["allowed_changes"])
+
+    def test_relation_dispute_target_can_omit_relation_name(self):
+        annotator = AnnotatorOutput(
+            entities=[
+                EntityAnnotation(text="food insecurity", entity_type="ANTHROPOGENIC PROPERTY"),
+                EntityAnnotation(text="anxiety", entity_type="BIOTIC PROPERTY"),
+            ],
+            relations=[
+                RelationFlat(
+                    relation="IS_AFFECTING",
+                    e1_text="food insecurity",
+                    e1_type="ANTHROPOGENIC PROPERTY",
+                    e2_text="anxiety",
+                    e2_type="BIOTIC PROPERTY",
+                )
+            ],
+        )
+        critic = CriticOutput(
+            disagreements=[
+                CriticDisagreement(
+                    target="food insecurity -> anxiety",
+                    annotator_label="IS_AFFECTING",
+                    proposed_label="INVALID",
+                )
+            ],
+            missing_annotations=[],
+        )
+        adjudicator = AdjudicatorOutput(
+            final_entities=annotator.entities,
+            final_relations=[],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        assert result.final_relations == []
+        assert any("removed" in item for item in result.audit["allowed_changes"])
+
+    def test_transcript_style_disputed_relations_reduce_to_adjudicator_subset(self):
+        entities = [
+            EntityAnnotation(text="high-income countries", entity_type="ANTHROPOGENIC ENTITY"),
+            EntityAnnotation(text="high-income", entity_type="ANTHROPOGENIC PROPERTY"),
+            EntityAnnotation(text="food insecurity", entity_type="ANTHROPOGENIC PROPERTY"),
+            EntityAnnotation(text="dietary quality", entity_type="BIOTIC PROPERTY"),
+            EntityAnnotation(text="anxiety", entity_type="BIOTIC PROPERTY"),
+            EntityAnnotation(text="accessing food", entity_type="ANTHROPOGENIC PROCESS"),
+            EntityAnnotation(text="food", entity_type="BIOTIC ENTITY"),
+        ]
+        annotator = AnnotatorOutput(
+            entities=entities,
+            relations=[
+                RelationFlat(relation="LOCATED_IN", e1_text="food insecurity", e1_type="ANTHROPOGENIC PROPERTY", e2_text="high-income countries", e2_type="ANTHROPOGENIC ENTITY"),
+                RelationFlat(relation="HAS_PROPERTY", e1_text="high-income countries", e1_type="ANTHROPOGENIC ENTITY", e2_text="high-income", e2_type="ANTHROPOGENIC PROPERTY"),
+                RelationFlat(relation="IS_AFFECTING", e1_text="food insecurity", e1_type="ANTHROPOGENIC PROPERTY", e2_text="dietary quality", e2_type="BIOTIC PROPERTY"),
+                RelationFlat(relation="IS_AFFECTING", e1_text="food insecurity", e1_type="ANTHROPOGENIC PROPERTY", e2_text="anxiety", e2_type="BIOTIC PROPERTY"),
+                RelationFlat(relation="IS_AFFECTING", e1_text="accessing food", e1_type="ANTHROPOGENIC PROCESS", e2_text="anxiety", e2_type="BIOTIC PROPERTY"),
+                RelationFlat(relation="LOCATED_IN", e1_text="accessing food", e1_type="ANTHROPOGENIC PROCESS", e2_text="food", e2_type="BIOTIC ENTITY"),
+            ],
+        )
+        critic = CriticOutput(
+            disagreements=[
+                CriticDisagreement(target="high-income countries", annotator_label="ANTHROPOGENIC ENTITY", proposed_label="SPATIAL ENTITY"),
+                CriticDisagreement(target="dietary quality", annotator_label="BIOTIC PROPERTY", proposed_label="ANTHROPOGENIC PROPERTY"),
+                CriticDisagreement(target="food insecurity -> high-income countries", annotator_label="LOCATED_IN", proposed_label="INVALID"),
+                CriticDisagreement(target="food insecurity -> dietary quality", annotator_label="IS_AFFECTING", proposed_label="INVALID"),
+                CriticDisagreement(target="food insecurity -> anxiety", annotator_label="IS_AFFECTING", proposed_label="INVALID"),
+                CriticDisagreement(target="accessing food -> food", annotator_label="LOCATED_IN", proposed_label="INVALID"),
+            ],
+            missing_annotations=[],
+        )
+        adjudicator = AdjudicatorOutput(
+            final_entities=[
+                EntityAnnotation(text="high-income countries", entity_type="SPATIAL ENTITY"),
+                EntityAnnotation(text="high-income", entity_type="ANTHROPOGENIC PROPERTY"),
+                EntityAnnotation(text="food insecurity", entity_type="ANTHROPOGENIC PROPERTY"),
+                EntityAnnotation(text="dietary quality", entity_type="ANTHROPOGENIC PROPERTY"),
+                EntityAnnotation(text="anxiety", entity_type="BIOTIC PROPERTY"),
+                EntityAnnotation(text="accessing food", entity_type="ANTHROPOGENIC PROCESS"),
+                EntityAnnotation(text="food", entity_type="BIOTIC ENTITY"),
+            ],
+            final_relations=[
+                RelationFlat(relation="HAS_PROPERTY", e1_text="high-income countries", e1_type="SPATIAL ENTITY", e2_text="high-income", e2_type="ANTHROPOGENIC PROPERTY"),
+                RelationFlat(relation="IS_AFFECTING", e1_text="accessing food", e1_type="ANTHROPOGENIC PROCESS", e2_text="anxiety", e2_type="BIOTIC PROPERTY"),
+            ],
+        )
+
+        result = MultiAgentAnnotator._constrain_adjudicator_output(
+            annotator, critic, adjudicator
+        )
+
+        final_pairs = {
+            (r.relation, r.e1_text, r.e2_text)
+            for r in result.final_relations
+        }
+        assert final_pairs == {
+            ("HAS_PROPERTY", "high-income countries", "high-income"),
+            ("IS_AFFECTING", "accessing food", "anxiety"),
+        }
+        assert sum("removed" in item for item in result.audit["allowed_changes"]) == 4
 
 
 # ─────────────────────────────────────────────────────────────
