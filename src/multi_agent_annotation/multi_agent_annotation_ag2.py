@@ -168,7 +168,7 @@ MODEL_ENDPOINTS = {
     "qwen3-35B-vllm": {
         "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
         "api_key": None,
-        "model_name": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+        "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
     },
 }
 
@@ -486,8 +486,17 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 - List ambiguous spans in "uncertain_cases" rather than dropping them.
 
 ## Output
-Return a JSON object conforming exactly to this schema:
-{json.dumps(AnnotatorOutput.model_json_schema(), indent=2)}
+Return a JSON object with exactly these fields:
+{{
+  "entities": [
+    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_step": "Step 5", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
+  ],
+  "relations": [
+    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC COLLECTIVE ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.85, "reasoning": "..."}}
+  ],
+  "uncertain_cases": ["optional span text if ambiguous"],
+  "reasoning": "brief overall reasoning"
+}}
 
 Output rules:
 - Return JSON only. Do not include commentary, markdown, or <think> blocks.
@@ -543,8 +552,17 @@ Work through the annotation systematically in this order:
    the guideline step that supports it.
 
 ## Output
-Return a JSON object conforming exactly to this schema:
-{json.dumps(CriticOutput.model_json_schema(), indent=2)}
+Return a JSON object with exactly these fields:
+{{
+  "agreements": ["entity or relation label you agree with"],
+  "disagreements": [
+    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step 5", "severity": "major", "explanation": "reason"}}
+  ],
+  "missing_annotations": [
+    {{"text": "missed span", "entity_type": "BIOTIC ENTITY", "guideline_step": "Step 5", "reasoning": "reason it should be annotated"}}
+  ],
+  "reasoning": "brief overall reasoning"
+}}
 
 TERMINATION RULE: If your "disagreements" list is empty and "missing_annotations" is empty,
 you MUST end your entire response with the word TERMINATE on its own line. Do not ask follow-up
@@ -579,8 +597,19 @@ You see the Annotator's labels and the Critic's review.
 
 ## Output
 
-You have to return a JSON object conforming exactly to this schema:
-{json.dumps(AdjudicatorOutput.model_json_schema(), indent=2)}
+Return a JSON object with exactly these fields, then end your message with TERMINATE on its own line:
+{{
+  "final_entities": [
+    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+  ],
+  "final_relations": [
+    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC COLLECTIVE ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+  ],
+  "disagreement_resolutions": [
+    {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "guideline step Z says..."}}
+  ],
+  "flagged_for_human_review": ["optional span text if genuinely ambiguous"]
+}}
 
 You must return this JSON right before the end of your message, and your message must end with "TERMINATE" on its own line.
 
@@ -958,11 +987,13 @@ class MultiAgentAnnotator:
         )
 
         # ── Register tools ───────────────────────────────────
-        # Annotator: coverage-focused tools (entity schema, relation schema, guideline)
-        _register_tools_on_agents(self.annotator, self.tool_executor, ANNOTATOR_TOOL_FUNCTIONS)
-        # Critic: QA-focused tools (adds consistency_check against seed examples)
-        _register_tools_on_agents(self.critic, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
-        # Adjudicator: same QA set as the Critic
+        # In the deliberation chat (Critic ↔ Annotator), the counterpart agent
+        # acts as executor — ToolExecutor is not a participant there.
+        # Annotator proposes → Critic executes
+        _register_tools_on_agents(self.annotator, self.critic, ANNOTATOR_TOOL_FUNCTIONS)
+        # Critic proposes → Annotator executes
+        _register_tools_on_agents(self.critic, self.annotator, CRITIC_TOOL_FUNCTIONS)
+        # Adjudicator chat uses ToolExecutor as executor (dedicated proxy)
         _register_tools_on_agents(self.adjudicator, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
 
     def annotate_sentence(

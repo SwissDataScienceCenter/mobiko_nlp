@@ -33,6 +33,9 @@ except ImportError:  # pragma: no cover - optional dependency
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+print(f"Repo   root: {_REPO_ROOT}")
+
 if load_dotenv is not None:
     load_dotenv(os.getenv("MOBIKO_ENV_FILE") or _REPO_ROOT / ".env", override=False)
 
@@ -172,13 +175,13 @@ def main() -> None:
         help="Path to seed examples .py or .json file.",
     )
     parser.add_argument(
-        "--annotator-model", type=str, default="qwen3-32B-vllm",
+        "--annotator-model", type=str, default="qwen3-35B-vllm",
     )
     parser.add_argument(
-        "--critic-model", type=str, default="qwen3-32B-vllm",
+        "--critic-model", type=str, default="qwen3-35B-vllm",
     )
     parser.add_argument(
-        "--adjudicator-model", type=str, default="qwen3-32B-vllm",
+        "--adjudicator-model", type=str, default="qwen3-35B-vllm",
     )
     parser.add_argument(
         "--max-rounds", type=int, default=1,

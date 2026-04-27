@@ -42,8 +42,18 @@ Download spaCy model:
 python -m spacy download en_core_web_trf
 ```
 
-For OpenAI integration, set your API key:
+For OpenAI integration, set your API key in the environment on the machine that runs the code:
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
 ```
 
+For the remote interpreter workflow, keep secrets out of tracked files:
+```bash
+cp .env.example .env
+# fill in OPENAI_API_KEY and/or OPEN_WEB_UI_API_KEY on the remote machine
+```
+
+The code now auto-loads `.env` from the repo root when present. If you prefer to keep the secrets file elsewhere on the remote host, set:
+```bash
+export MOBIKO_ENV_FILE="/absolute/path/to/remote-secrets.env"
+```
