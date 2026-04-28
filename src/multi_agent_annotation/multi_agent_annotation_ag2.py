@@ -302,9 +302,9 @@ def load_decision_support(path: Path) -> List[Dict[str, str]]:
                         "content": "\n".join(content_parts),
                         "source": "decision_support",
                     })
-            return sections if sections else _get_embedded_guideline()
+            return sections
     except Exception:
-        return _get_embedded_guideline()
+        return []
 
 
 # Section-boundary patterns for MoBiKo label guidance draft v2
@@ -321,7 +321,7 @@ def load_guideline_from_docx(path: Path) -> List[Dict[str, str]]:
     """
     Parse MoBiKo label guidance draft v2.docx — a narrative guideline with sections.
     Each recognised heading starts a new section.
-    Falls back to the embedded guideline if python-docx is unavailable.
+    Returns an empty list if python-docx is unavailable or parsing fails.
     """
     try:
         from docx import Document
@@ -352,23 +352,10 @@ def load_guideline_from_docx(path: Path) -> List[Dict[str, str]]:
         if content:
             sections.append({"title": title, "content": "\n".join(content),
                               "source": "mobiko_v2"})
-        return sections if sections else _get_embedded_guideline()
+        return sections
     except ImportError:
-        return _get_embedded_guideline()
+        return []
 
-
-def _get_embedded_guideline() -> List[Dict[str, str]]:
-    return [
-        {"title": "General rules for ontological roles",
-         "content": "a. PROCESS: 'Is this something that happens?' b. PROPERTY: 'Is this something that something has?' c. Adjectival process nouns → default ABIOTIC PROPERTY."},
-        {"title": "Step 1 — Abstract/theoretical", "content": "Scientific/mathematical concept → CONCEPT"},
-        {"title": "Step 2 — Temporal", "content": "Time unit/interval → TEMPORAL ENTITY. Temporal attribute → TEMPORAL PROPERTY."},
-        {"title": "Step 3 — Spatial", "content": "Place/spatial unit → SPATIAL ENTITY. Spatial attribute → SPATIAL PROPERTY."},
-        {"title": "Step 4 — Anthropogenic", "content": "Human-created thing → ANTHROPOGENIC ENTITY. Human activity → ANTHROPOGENIC PROCESS. Human system characteristic → ANTHROPOGENIC PROPERTY."},
-        {"title": "Step 5 — Biotic", "content": "Single organism → BIOTIC ENTITY. Group → BIOTIC COLLECTIVE ENTITY. Biological activity → BIOTIC PROCESS. Attribute → BIOTIC PROPERTY."},
-        {"title": "Step 6 — Abiotic", "content": "Physical thing → ABIOTIC ENTITY. Environmental process → ABIOTIC PROCESS. Environmental attribute → ABIOTIC PROPERTY. Aggregated system → ABIOTIC COLLECTIVE ENTITY."},
-        {"title": "Ambiguous cases", "content": "Look at the modified noun: population density → BIOTIC PROPERTY, soil density → ABIOTIC PROPERTY. Habitat → SPATIAL ENTITY, habitat quality → SPATIAL PROPERTY. Taxonomic names → BIOTIC COLLECTIVE ENTITY. Tiebreaker: choose the primary referent."},
-    ]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -382,7 +369,7 @@ _TYPE_PAIR_TO_RELATIONS: Dict[Tuple[str, str], List[str]] = {}
 _ALL_ENTITY_TYPES: set = set()
 _GUIDELINE_SECTIONS: List[Dict[str, str]] = []
 _SEED_EXAMPLES: Dict[str, List[dict]] = {}
-_GUIDELINE_SEARCH_BACKEND = "lexical"
+_GUIDELINE_SEARCH_BACKEND = "embedding" #"lexical"
 _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME = _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL
 _GUIDELINE_SECTION_EMBEDDINGS: Optional[List[List[float]]] = None
@@ -1160,7 +1147,7 @@ class MultiAgentAnnotator:
         decision_support_sections = (
             load_decision_support(ds_path)
             if ds_path and ds_path.exists()
-            else _get_embedded_guideline()
+            else []
         )
 
         # MoBiKo v2 narrative → Critic & Adjudicator system prompts (edge cases, tiebreaker)
@@ -1168,7 +1155,7 @@ class MultiAgentAnnotator:
         guidance_sections = (
             load_guideline_from_docx(gl_path)
             if gl_path and gl_path.exists()
-            else _get_embedded_guideline()
+            else []
         )
 
         # guideline_search tool searches across both documents combined
