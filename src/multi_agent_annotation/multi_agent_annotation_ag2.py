@@ -125,8 +125,13 @@ class CriticMissingAnnotation(BaseModel):
     reasoning: str = ""
 
 
+class AgreementItem(BaseModel):
+    target: str = ""
+    label: str = ""
+
+
 class CriticOutput(BaseModel):
-    agreements: List[str] = Field(default_factory=list)
+    agreements: List[AgreementItem] = Field(default_factory=list)
     disagreements: List[CriticDisagreement] = Field(default_factory=list)
     missing_annotations: List[CriticMissingAnnotation] = Field(default_factory=list)
     reasoning: str = ""
@@ -761,7 +766,7 @@ results or ask for another turn.
 ## Output
 Return a JSON object with exactly these fields:
 {{
-  "agreements": ["entity or relation label you agree with"],
+  "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
     {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step 5", "severity": "major", "explanation": "reason"}}
   ],
@@ -1786,7 +1791,7 @@ Return exactly this JSON shape:
             "Critic": """
 Return exactly this JSON shape:
 {
-  "agreements": [],
+  "agreements": [{"target": "span text", "label": "TYPE"}],
   "disagreements": [],
   "missing_annotations": [],
   "reasoning": ""
