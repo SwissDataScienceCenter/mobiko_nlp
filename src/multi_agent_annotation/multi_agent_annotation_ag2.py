@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sys
+import warnings
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, Tuple, Any
 
@@ -701,7 +702,8 @@ Return a JSON object with exactly these fields:
 }}
 
 Output rules:
-- Return JSON only. Do not include commentary, markdown, or <think> blocks.
+- Return JSON only, then end your message with TERMINATE on its own line.
+- Do not include commentary, markdown, or <think> blocks.
 - Keep every reasoning field brief and evidence-based.
 - Every uncertain_cases item must be a complete JSON string. Put any explanation inside the quotes.
 """
@@ -769,12 +771,8 @@ Return a JSON object with exactly these fields:
   "reasoning": "brief overall reasoning"
 }}
 
-TERMINATION RULE:
-- If "disagreements" is empty AND "missing_annotations" is empty: end your response with TERMINATE on its own line.
-- If either list is non-empty: do NOT write TERMINATE. The Annotator will revise and you will review again.
-
 Output rules:
-- Return JSON only. Append TERMINATE on its own line only when the termination rule requires it.
+- Return JSON only, then end your message with TERMINATE on its own line.
 - Do not restate the sentence or the full annotation.
 - Limit each disagreement to the minimal concrete correction needed.
 """
@@ -1182,9 +1180,7 @@ class MultiAgentAnnotator:
             system_message=_annotator_system_msg(annotator_guideline, entity_schema_str, relation_schema),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
-            # Annotator receives Critic messages: stop when Critic is satisfied,
-            # whether or not it remembered to write "TERMINATE".
-            is_termination_msg=_critic_is_satisfied,
+            is_termination_msg=_is_final_terminate_msg,
         )
 
         self.critic = ConversableAgent(
@@ -1212,14 +1208,23 @@ class MultiAgentAnnotator:
         )
 
         # ── Register tools ───────────────────────────────────
-        # In the deliberation chat (Critic ↔ Annotator), the counterpart agent
-        # acts as executor — ToolExecutor is not a participant there.
-        # Annotator proposes → Critic executes
-        _register_tools_on_agents(self.annotator, self.critic, ANNOTATOR_TOOL_FUNCTIONS)
-        # Critic proposes → Annotator executes
-        _register_tools_on_agents(self.critic, self.annotator, CRITIC_TOOL_FUNCTIONS)
-        # Adjudicator chat uses ToolExecutor as executor (dedicated proxy)
-        _register_tools_on_agents(self.adjudicator, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
+        # All agents use the dedicated ToolExecutor proxy so tool results come
+        # back as role="tool" messages and never appear as conversation turns
+        # attributed to the counterpart agent.
+        # Suppress the ag2 "Function X is being overridden" warning that fires
+        # when overlapping tool sets (guideline_search, schema_lookup, etc.) are
+        # registered on the same executor for different callers — all
+        # registrations point to the same function objects, so there is no real
+        # override risk.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Function '.*' is being overridden",
+                category=UserWarning,
+            )
+            _register_tools_on_agents(self.annotator, self.tool_executor, ANNOTATOR_TOOL_FUNCTIONS)
+            _register_tools_on_agents(self.critic, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
+            _register_tools_on_agents(self.adjudicator, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
 
     def annotate_sentence(
         self,
@@ -1247,45 +1252,61 @@ class MultiAgentAnnotator:
                 f"{json.dumps(pre_identified_entities, ensure_ascii=False, indent=2)}"
             )
 
-        # ── Phase 1: Annotator ↔ Critic deliberation ─────────
-        # The Critic initiates by forwarding the task to the Annotator.
-        # This way the Annotator produces its annotation exactly once (as its
-        # first reply), avoiding the duplication that arose when Phase 1a ran a
-        # separate chat and then the same annotation text was re-sent as the
-        # opening message of the deliberation.
-        #
-        # Tool calls and tool results count as AG2 turns, so max_turns includes
-        # a buffer that keeps those exchanges from consuming the review budget.
+        # ── Phase 1: per-round Annotator → Critic deliberation ──
+        # Each round runs two separate agent↔ToolExecutor chats so tool
+        # results arrive as role="tool" messages and never appear as
+        # conversation turns attributed to the counterpart agent.
         logger.info("Phase 1: Annotator ↔ Critic deliberation")
 
-        deliberation_max_turns = self._deliberation_max_turns(self.max_rounds)
+        deliberation_messages: List[Dict[str, Any]] = []
+        last_annotator_out: Optional[AnnotatorOutput] = None
+        last_critic_out: Optional[CriticOutput] = None
+        last_annotator_text = ""
+        last_critic_text = ""
 
-        chat_result = self.critic.initiate_chat(
-            recipient=self.annotator,
-            message=task_msg,
-            max_turns=deliberation_max_turns,
-        )
+        for round_idx in range(self.max_rounds):
+            # ── Annotator turn ────────────────────────────────
+            if round_idx == 0:
+                ann_msg = task_msg
+            else:
+                ann_msg = self._build_annotator_revision_msg(
+                    sentence, last_annotator_text, last_critic_text,
+                    pre_identified_entities,
+                )
+            ann_content, ann_record = self._run_agent_turn(self.annotator, ann_msg)
+            deliberation_messages.append(ann_record)
+            last_annotator_text = ann_content
 
-        # Collect messages from the deliberation (skip the initiating task_msg
-        # from the Critic — it is just a relay and adds no annotation content).
-        # Tool calls and their results are attached to the proposing message.
-        deliberation_messages = _collect_messages_with_tools(
-            chat_result.chat_history, skip_first=True
-        )
+            parsed_ann = self._parse_annotator_output(ann_content)
+            if parsed_ann is not None:
+                last_annotator_out = parsed_ann
+
+            # ── Critic turn ───────────────────────────────────
+            crit_msg = self._build_critic_review_msg(sentence, ann_content)
+            crit_content, crit_record = self._run_agent_turn(self.critic, crit_msg)
+            deliberation_messages.append(crit_record)
+            last_critic_text = crit_content
+
+            parsed_crit = self._parse_critic_output(crit_content)
+            if parsed_crit is not None:
+                last_critic_out = parsed_crit
+
+            if (
+                last_critic_out is not None
+                and not last_critic_out.disagreements
+                and not last_critic_out.missing_annotations
+            ):
+                break
+
+        record.rounds_used = round_idx + 1
         record.messages = deliberation_messages
-        # Each deliberation "round" = one Annotator turn + one Critic turn
-        record.rounds_used = len(deliberation_messages) // 2
-        last_annotator_out, last_critic_out = self._last_deliberation_outputs(
-            deliberation_messages
-        )
 
         if last_annotator_out is None:
-            raw_annotator = self._last_agent_content(deliberation_messages, "Annotator")
             repair_messages, repaired_text = self._repair_agent_json(
-                requester=self.critic,
+                requester=self.tool_executor,
                 producer=self.annotator,
                 output_kind="Annotator",
-                original_text=raw_annotator,
+                original_text=last_annotator_text,
                 sentence=sentence,
             )
             if repair_messages:
@@ -1305,12 +1326,11 @@ class MultiAgentAnnotator:
             return record
 
         if last_critic_out is None:
-            raw_critic = self._last_agent_content(deliberation_messages, "Critic")
             repair_messages, repaired_text = self._repair_agent_json(
-                requester=self.annotator,
+                requester=self.tool_executor,
                 producer=self.critic,
                 output_kind="Critic",
-                original_text=raw_critic,
+                original_text=last_critic_text,
                 sentence=sentence,
                 reference_annotation=last_annotator_out.model_dump_json(),
             )
@@ -1629,15 +1649,89 @@ class MultiAgentAnnotator:
         return ""
 
     @staticmethod
-    def _deliberation_max_turns(max_rounds: int) -> int:
+    def _agent_turn_max_turns() -> int:
+        """Max turns for a single agent↔ToolExecutor chat (tool batches + output)."""
+        return 10
+
+    @staticmethod
+    def _strip_terminate(text: str) -> str:
+        stripped = text.rstrip()
+        if stripped.endswith("TERMINATE"):
+            stripped = stripped[: -len("TERMINATE")].rstrip()
+        return stripped
+
+    @staticmethod
+    def _build_annotator_revision_msg(
+        sentence: str,
+        prev_annotation_text: str,
+        critic_feedback_text: str,
+        pre_identified_entities: Optional[List[dict]] = None,
+    ) -> str:
+        clean_ann = MultiAgentAnnotator._strip_terminate(prev_annotation_text)
+        clean_crit = MultiAgentAnnotator._strip_terminate(critic_feedback_text)
+        msg = (
+            f"Revise your annotation for this sentence to address the Critic's feedback.\n\n"
+            f'Sentence: "{sentence}"\n\n'
+            f"Your previous annotation:\n{clean_ann}\n\n"
+            f"Critic's feedback:\n{clean_crit}"
+        )
+        if pre_identified_entities:
+            msg += (
+                f"\n\nPre-identified entities (verify types, find relations):\n"
+                f"{json.dumps(pre_identified_entities, ensure_ascii=False, indent=2)}"
+            )
+        return msg
+
+    @staticmethod
+    def _build_critic_review_msg(sentence: str, annotator_text: str) -> str:
+        clean = MultiAgentAnnotator._strip_terminate(annotator_text)
+        return (
+            f"Review this annotation for the sentence below.\n\n"
+            f'Sentence: "{sentence}"\n\n'
+            f"Annotation:\n{clean}"
+        )
+
+    def _run_agent_turn(
+        self,
+        agent: ConversableAgent,
+        message: str,
+    ) -> Tuple[str, Dict[str, Any]]:
         """
-        Reserve enough AG2 turns for content replies plus tool-call/result
-        exchanges. Tool exchanges still count inside AG2, so we budget them
-        separately instead of allowing them to consume the review round.
+        Run one agent turn against ToolExecutor.
+
+        Resets both agents so each round starts with a clean history and tool
+        results arrive as role="tool" messages, not as counterpart conversation
+        turns. All tool calls from the turn are folded into a single record
+        message keyed by agent name.
+
+        Returns (last_content, record_message).
         """
-        content_turns = 1 + max_rounds * 2
-        tool_exchange_buffer = 4 + max_rounds * 6
-        return content_turns + tool_exchange_buffer
+        agent.reset()
+        self.tool_executor.reset()
+        chat = agent.initiate_chat(
+            recipient=self.tool_executor,
+            message=message,
+            max_turns=self._agent_turn_max_turns(),
+        )
+        all_msgs = _collect_messages_with_tools(chat.chat_history, skip_first=True)
+
+        agent_name = agent.name
+        last_content = ""
+        for msg in reversed(all_msgs):
+            if msg["agent"] == agent_name and msg["content"].strip():
+                last_content = msg["content"]
+                break
+
+        all_tool_calls: List[Dict[str, Any]] = []
+        for msg in all_msgs:
+            if msg["agent"] == agent_name:
+                all_tool_calls.extend(msg.get("tool_calls", []))
+
+        return last_content, {
+            "agent": agent_name,
+            "content": last_content,
+            "tool_calls": all_tool_calls,
+        }
 
     @staticmethod
     def _adjudicator_max_turns() -> int:

@@ -576,12 +576,9 @@ class TestTryParseJson:
 
 
 class TestDeliberationTurnBudget:
-    def test_turn_budget_includes_tool_exchange_buffer(self):
-        old_budget = 1 * 2 + 1
-        new_budget = MultiAgentAnnotator._deliberation_max_turns(1)
-
-        assert new_budget > old_budget
-        assert new_budget >= 10
+    def test_agent_turn_budget_allows_tool_exchange(self):
+        budget = MultiAgentAnnotator._agent_turn_max_turns()
+        assert budget >= 6  # at least 2 tool batches (2 turns each) + final output
 
     def test_adjudicator_initial_budget_allows_tool_exchange(self):
         assert MultiAgentAnnotator._adjudicator_max_turns() > 3
