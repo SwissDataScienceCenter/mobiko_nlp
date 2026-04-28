@@ -158,6 +158,8 @@ class ConstrainedAdjudication(BaseModel):
     audit: Dict[str, Any] = Field(default_factory=dict)
 
 
+LOW_CONFIDENCE_THRESHOLD = 0.7
+
 ANNOTATOR_REQUIRED_KEYS = {"entities", "relations", "uncertain_cases", "reasoning"}
 CRITIC_REQUIRED_KEYS = {"agreements", "disagreements", "missing_annotations", "reasoning"}
 ADJUDICATOR_REQUIRED_KEYS = {
@@ -737,7 +739,9 @@ Disagreement is expected and productive — correctness matters more than consen
 - list_entity_types  : confirm entity type names
 
 ## Review Process
-Work through the annotation systematically in this order:
+Start by checking any items the Annotator flagged as low-confidence (< {LOW_CONFIDENCE_THRESHOLD}) \
+— these are the most likely to contain errors and deserve the closest scrutiny. \
+Then work through the remaining annotation systematically in this order:
 
 1. **Guideline violations** — for each entity label, call guideline_search with the span text \
    and its proposed type. Check whether the guideline’s step-by-step decision tree supports \
@@ -1690,11 +1694,31 @@ class MultiAgentAnnotator:
     @staticmethod
     def _build_critic_review_msg(sentence: str, annotator_text: str) -> str:
         clean = MultiAgentAnnotator._strip_terminate(annotator_text)
-        return (
+        msg = (
             f"Review this annotation for the sentence below.\n\n"
             f'Sentence: "{sentence}"\n\n'
             f"Annotation:\n{clean}"
         )
+        parsed = MultiAgentAnnotator._parse_annotator_output(clean)
+        if parsed:
+            low_conf: List[str] = []
+            for e in parsed.entities:
+                if e.confidence is not None and e.confidence < LOW_CONFIDENCE_THRESHOLD:
+                    low_conf.append(
+                        f'  - entity "{e.text}" ({e.entity_type}, conf={e.confidence:.2f})'
+                    )
+            for r in parsed.relations:
+                if r.confidence is not None and r.confidence < LOW_CONFIDENCE_THRESHOLD:
+                    low_conf.append(
+                        f'  - relation "{r.e1_text} {r.relation} {r.e2_text}"'
+                        f" (conf={r.confidence:.2f})"
+                    )
+            if low_conf:
+                msg += (
+                    f"\n\nLow-confidence items (< {LOW_CONFIDENCE_THRESHOLD}) — check these first:\n"
+                    + "\n".join(low_conf)
+                )
+        return msg
 
     def _run_agent_turn(
         self,
@@ -1938,6 +1962,21 @@ Previous output to repair:
 
         for case in annotator.uncertain_cases:
             add_flag(case, "annotator_uncertain_case")
+
+        for entity in annotator.entities:
+            if entity.confidence is not None and entity.confidence < LOW_CONFIDENCE_THRESHOLD:
+                add_flag(
+                    f'"{entity.text}" ({entity.entity_type},'
+                    f" confidence={entity.confidence:.2f})",
+                    "low_confidence",
+                )
+        for rel in annotator.relations:
+            if rel.confidence is not None and rel.confidence < LOW_CONFIDENCE_THRESHOLD:
+                add_flag(
+                    f'"{rel.e1_text} {rel.relation} {rel.e2_text}"'
+                    f" (confidence={rel.confidence:.2f})",
+                    "low_confidence",
+                )
 
         if adjudicator is not None:
             for flag in adjudicator.flagged_for_human_review:
