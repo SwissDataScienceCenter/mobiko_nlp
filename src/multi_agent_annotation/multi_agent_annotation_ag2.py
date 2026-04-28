@@ -2305,6 +2305,23 @@ Previous output to repair:
                     "(not in final Critic missing annotations)"
                 )
 
+        # Drop disputed entities the Adjudicator chose not to re-include.
+        # This handles span-split corrections (e.g. "warmer lakes" → "lakes")
+        # where the Adjudicator replaces the compound span with a different-text
+        # entity instead of relabelling the same span.
+        adj_entity_keys = {
+            MultiAgentAnnotator._normalize_annotation_text(e.text)
+            for e in adjudicator.final_entities
+        }
+        for disputed_key in list(disagreement_targets):
+            if disputed_key in final_entities_by_text and disputed_key not in adj_entity_keys:
+                entity = final_entities_by_text.pop(disputed_key)
+                entity_order = [k for k in entity_order if k != disputed_key]
+                audit["allowed_changes"].append(
+                    f'entity "{entity.text}" removed '
+                    "(disputed, Adjudicator replaced with different span)"
+                )
+
         final_entities = [final_entities_by_text[key] for key in entity_order]
         final_entity_type_by_text = {
             MultiAgentAnnotator._normalize_annotation_text(e.text): e.entity_type
@@ -2384,6 +2401,15 @@ Previous output to repair:
                     )
                 continue
 
+            e1_key = MultiAgentAnnotator._normalize_annotation_text(synced_adj_relation.e1_text)
+            e2_key = MultiAgentAnnotator._normalize_annotation_text(synced_adj_relation.e2_text)
+            # Allow relations produced from span-splitting: both endpoints must be
+            # valid final entities and at least one must come from critic missing_annotations.
+            split_span_relation = (
+                e1_key in final_entity_type_by_text
+                and e2_key in final_entity_type_by_text
+                and (e1_key in missing_by_text or e2_key in missing_by_text)
+            )
             if any(
                 MultiAgentAnnotator._disagreement_matches_relation(d, synced_adj_relation)
                 for d in critic.disagreements
@@ -2395,6 +2421,15 @@ Previous output to repair:
                     f"{synced_adj_relation.relation} "
                     f'{synced_adj_relation.e2_text}" added '
                     "(final Critic disagreement)"
+                )
+            elif split_span_relation:
+                final_relations_by_slot[slot] = synced_adj_relation
+                relation_order.append(slot)
+                audit["allowed_changes"].append(
+                    f'relation "{synced_adj_relation.e1_text} '
+                    f"{synced_adj_relation.relation} "
+                    f'{synced_adj_relation.e2_text}" added '
+                    "(split-span relation from Critic missing annotations)"
                 )
             else:
                 audit["rejected_changes"].append(
