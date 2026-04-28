@@ -1429,6 +1429,17 @@ class MultiAgentAnnotator:
         record.adjudication_status = constrained.status
         record.adjudication_audit = constrained.audit
 
+        # ── Post-process: flag relations between overlapping spans ─
+        overlap_flags = self._find_overlap_relation_flags(
+            record.final_entities, record.final_relations
+        )
+        if overlap_flags:
+            seen_flags = {f.lower() for f in record.flagged_for_human_review}
+            for flag in overlap_flags:
+                if flag.lower() not in seen_flags:
+                    record.flagged_for_human_review.append(flag)
+                    seen_flags.add(flag.lower())
+
         # ── Compute agreement ─────────────────────────────────
         # Use the last round only (earlier disputes may have been resolved).
         # Denominator = Annotator's proposed items (entities + relations).
@@ -1935,6 +1946,47 @@ Previous output to repair:
             "no guideline citation",
         }
         return ref not in placeholder_refs
+
+    @staticmethod
+    @staticmethod
+    def _find_overlap_relation_flags(
+        final_entities: List[EntityAnnotation],
+        final_relations: List[RelationAnnotation],
+    ) -> List[str]:
+        """
+        Return flag strings for every relation whose two endpoints have
+        overlapping or nested character spans.
+
+        Uses character offsets when both entities have them; falls back to
+        text-containment (one span text is a substring of the other) when
+        offsets are absent.
+        """
+        def _overlaps(a: EntityAnnotation, b: EntityAnnotation) -> bool:
+            if all(x is not None for x in (a.start, a.end, b.start, b.end)):
+                return a.start < b.end and b.start < a.end  # type: ignore[operator]
+            ta = a.text.lower().strip()
+            tb = b.text.lower().strip()
+            return ta != tb and (ta in tb or tb in ta)
+
+        overlapping: set[tuple[str, str]] = set()
+        for i, e1 in enumerate(final_entities):
+            for e2 in final_entities[i + 1:]:
+                if _overlaps(e1, e2):
+                    key = (
+                        min(e1.text.lower(), e2.text.lower()),
+                        max(e1.text.lower(), e2.text.lower()),
+                    )
+                    overlapping.add(key)
+
+        flags = []
+        for rel in final_relations:
+            t1, t2 = rel.e1.text.lower(), rel.e2.text.lower()
+            if (min(t1, t2), max(t1, t2)) in overlapping:
+                flags.append(
+                    f'Relation between overlapping spans: '
+                    f'"{rel.e1.text}" -{rel.relation}-> "{rel.e2.text}"'
+                )
+        return flags
 
     @staticmethod
     def _human_review_flags(
