@@ -76,6 +76,7 @@ class DeliberationRecord(BaseModel):
     rounds_used: int = 0
     adjudication_status: Optional[str] = None
     adjudication_audit: Dict[str, Any] = Field(default_factory=dict)
+    token_usage: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -201,6 +202,13 @@ MODEL_ENDPOINTS = {
         "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
     },
 }
+
+
+# Asymmetric model allocation: Annotator/Critic handle high-volume grunt work
+# on the cheaper local Qwen model; Adjudicator does the hard cross-transcript
+# reasoning and benefits from a stronger model.
+# Override at run-time without code changes: ADJUDICATOR_MODEL=gpt4o python ...
+_DEFAULT_ADJUDICATOR_MODEL: str = os.getenv("ADJUDICATOR_MODEL", "qwen3-32B-vllm")
 
 
 def build_llm_config(model_key: str, temperature: float = 0.3) -> LLMConfig:
@@ -1102,8 +1110,14 @@ class MultiAgentAnnotator:
 
     Parameters
     ----------
-    annotator_model, critic_model, adjudicator_model : str
-        Keys into MODEL_ENDPOINTS.
+    annotator_model, critic_model : str
+        Keys into MODEL_ENDPOINTS.  High-volume agents — a fast, cheaper
+        model (e.g. "qwen3-35B-vllm") is appropriate here.
+    adjudicator_model : str
+        Key into MODEL_ENDPOINTS.  This agent does the hardest reasoning
+        (cross-transcript adjudication + tiebreakers), so a stronger model
+        like "gpt4o" is recommended.  Defaults to ``_DEFAULT_ADJUDICATOR_MODEL``
+        which can be overridden with the ``ADJUDICATOR_MODEL`` env var.
     schema_path : Path
         Relation schema file.
     decision_support_path : Path
@@ -1124,7 +1138,7 @@ class MultiAgentAnnotator:
         self,
         annotator_model: str = "qwen3-32B-vllm",
         critic_model: str = "qwen3-32B-vllm",
-        adjudicator_model: str = "qwen3-32B-vllm",
+        adjudicator_model: str = _DEFAULT_ADJUDICATOR_MODEL,
         schema_path: Optional[Path] = None,
         decision_support_path: Optional[Path] = None,
         guideline_path: Optional[Path] = None,
@@ -1182,6 +1196,11 @@ class MultiAgentAnnotator:
         annotator_llm = build_llm_config(annotator_model, temperature=0.2)
         critic_llm = build_llm_config(critic_model, temperature=0.3)
         adjudicator_llm = build_llm_config(adjudicator_model, temperature=0.1)
+        logger.info(
+            f"Models — annotator: {annotator_model} | "
+            f"critic: {critic_model} | "
+            f"adjudicator: {adjudicator_model}"
+        )
 
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
@@ -1272,6 +1291,8 @@ class MultiAgentAnnotator:
         last_critic_out: Optional[CriticOutput] = None
         last_annotator_text = ""
         last_critic_text = ""
+        annotator_tokens: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        critic_tokens: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         for round_idx in range(self.max_rounds):
             # ── Annotator turn ────────────────────────────────
@@ -1285,6 +1306,8 @@ class MultiAgentAnnotator:
             ann_content, ann_record = self._run_agent_turn(self.annotator, ann_msg)
             deliberation_messages.append(ann_record)
             last_annotator_text = ann_content
+            for k in annotator_tokens:
+                annotator_tokens[k] += ann_record["token_usage"].get(k, 0)
 
             parsed_ann = self._parse_annotator_output(ann_content)
             if parsed_ann is not None:
@@ -1295,6 +1318,8 @@ class MultiAgentAnnotator:
             crit_content, crit_record = self._run_agent_turn(self.critic, crit_msg)
             deliberation_messages.append(crit_record)
             last_critic_text = crit_content
+            for k in critic_tokens:
+                critic_tokens[k] += crit_record["token_usage"].get(k, 0)
 
             parsed_crit = self._parse_critic_output(crit_content)
             if parsed_crit is not None:
@@ -1361,6 +1386,7 @@ class MultiAgentAnnotator:
             message=adjudicator_msg,
             max_turns=self._adjudicator_max_turns(),
         )
+        adjudicator_tokens = self._sum_usage(getattr(adj_result, "cost", {}))
 
         # Extract final output from adjudicator's last message
         adj_output = self._extract_last_json_with_keys(
@@ -1485,10 +1511,27 @@ class MultiAgentAnnotator:
         else:
             record.agreement_score = None
 
+        total_tokens = {
+            k: annotator_tokens[k] + critic_tokens[k] + adjudicator_tokens.get(k, 0)
+            for k in annotator_tokens
+        }
+        record.token_usage = {
+            "annotator": annotator_tokens,
+            "critic": critic_tokens,
+            "adjudicator": adjudicator_tokens,
+            "total": total_tokens,
+        }
         logger.info(
             f"Done: {len(record.final_entities)} entities, "
             f"{len(record.final_relations)} relations, "
-            f"agreement={record.agreement_score if record.agreement_score is None else f'{record.agreement_score:.2f}'}"
+            f"agreement={record.agreement_score if record.agreement_score is None else f'{record.agreement_score:.2f}'} | "
+            f"tokens — annotator: {annotator_tokens['total_tokens']} "
+            f"(prompt {annotator_tokens['prompt_tokens']} + completion {annotator_tokens['completion_tokens']}), "
+            f"critic: {critic_tokens['total_tokens']} "
+            f"(prompt {critic_tokens['prompt_tokens']} + completion {critic_tokens['completion_tokens']}), "
+            f"adjudicator: {adjudicator_tokens.get('total_tokens', 0)} "
+            f"(prompt {adjudicator_tokens.get('prompt_tokens', 0)} + completion {adjudicator_tokens.get('completion_tokens', 0)}), "
+            f"total: {total_tokens['total_tokens']}"
         )
         return record
 
@@ -1731,6 +1774,18 @@ class MultiAgentAnnotator:
                 )
         return msg
 
+    @staticmethod
+    def _sum_usage(cost: Dict[str, Any]) -> Dict[str, int]:
+        """Sum prompt/completion tokens from an ag2 CostDict."""
+        block = (cost or {}).get("usage_including_cached_inference", {})
+        prompt = sum(v.get("prompt_tokens", 0) for v in block.values() if isinstance(v, dict))
+        completion = sum(v.get("completion_tokens", 0) for v in block.values() if isinstance(v, dict))
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
+
     def _run_agent_turn(
         self,
         agent: ConversableAgent,
@@ -1744,7 +1799,8 @@ class MultiAgentAnnotator:
         turns. All tool calls from the turn are folded into a single record
         message keyed by agent name.
 
-        Returns (last_content, record_message).
+        Returns (last_content, record_message).  record_message includes a
+        ``token_usage`` key with prompt/completion/total counts for the turn.
         """
         agent.reset()
         self.tool_executor.reset()
@@ -1771,6 +1827,7 @@ class MultiAgentAnnotator:
             "agent": agent_name,
             "content": last_content,
             "tool_calls": all_tool_calls,
+            "token_usage": self._sum_usage(getattr(chat, "cost", {})),
         }
 
     @staticmethod

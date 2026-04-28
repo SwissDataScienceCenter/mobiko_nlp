@@ -58,7 +58,8 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
 
 # ── Demo sentences ─────────────────────────────
 DEMO_SENTENCES = [
-    "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
+    "While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest)."
+    # "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
     # "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
     # "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
 ]
@@ -186,7 +187,10 @@ def main() -> None:
         "--critic-model", type=str, default="qwen3-35B-vllm",
     )
     parser.add_argument(
-        "--adjudicator-model", type=str, default="qwen3-35B-vllm",
+        "--adjudicator-model", type=str,
+        default=os.getenv("ADJUDICATOR_MODEL", "qwen3-35B-vllm"),
+        help="Model key for the Adjudicator (recommend 'gpt4o' for stronger reasoning; "
+             "override with ADJUDICATOR_MODEL env var).",
     )
     parser.add_argument(
         "--max-rounds", type=int, default=1,
