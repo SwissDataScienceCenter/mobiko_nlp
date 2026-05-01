@@ -40,6 +40,7 @@ if load_dotenv is not None:
     load_dotenv(os.getenv("MOBIKO_ENV_FILE") or _REPO_ROOT / ".env", override=False)
 
 from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIODIV_LIST
+import src.multi_agent_annotation.multi_agent_annotation_ag2 as _ann_mod
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     MultiAgentAnnotator,
     analyze_disagreements,
@@ -58,7 +59,17 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
 
 # ── Demo sentences ─────────────────────────────
 DEMO_SENTENCES = [
-    "However, the limited information on the effects of overexploitation on the current status and community composition of wildlife hinders effective conservation efforts, including the implementation of targeted patrols to reduce snaring."
+    "However, the limited information on the effects of overexploitation on the current status and community composition of wildlife hinders effective conservation efforts, including the implementation of targeted patrols to reduce snaring.",
+    # "Finally, we used a dissimilarity index to assess the level of defaunation, revealing 16% of the community had been lost, with higher levels of defaunation for threatened and larger-sized species.",
+    # "Our findings provide insights into the status, distribution, and occurrence of the ground-dwelling mammal and bird communities in the Langbian Plateau, and can help stakeholders design more effective conservation strategies to protect existing populations.",
+    # """Study site
+# We surveyed four contiguous protected areas in the core forest area of the southern Annamites: Bidoup—Nui Ba National Park, Phuoc Binh National Park, Da Nhim Protection Forest, and Dran Protection Forest (Figure 1).""",
+#     "Historically, Bidoup—Nui Ba and Phuoc Binh National Park were a part of the Thuong Da Nhim Nature Reserve established in 1986 (Eames, 1995), but in 1992 the two areas were split into two forest units and managed separately (Southern Institute of Ecology, 2017).",
+#     "Da Nhim and Dran forests were also managed under a single administration authority from 1987 (Eames, 1995), but separated into two protection forests in the late 1990s, in which timber extraction and wildlife exploitation are not completely prohibited (Law on Forestry, 2017).",
+#     "However, precipitation is unevenly distributed within the study sites due to the rain shadow effect, and this, combined with differences in soil type, contribute to two major habitat types: broadleaf evergreen forest and coniferous forest (Nguyen, 1966; Rundel, 1999).",
+#     "The eastern and western slopes of Bidoup Nui Ba National Park, and the majority of Phuoc Binh National Park, receive high levels of rainfall and are dominated by evergreen broadleaf forests.",
+#     "In total, we set up 157 stations spanning all four protected areas and both main habitat types (Table 1, Figure 1).",
+#     "The vast majority (96.6%) of insects collected from emergence traps were Diptera (flies), while 0.8% were Trichoptera (caddisflies) and Ephemeroptera (mayflies)."
     #"While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest)."
     # "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
     # "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
@@ -66,7 +77,7 @@ DEMO_SENTENCES = [
 ]
 
 
-def run_dry(schema_path: Path, seeds_path: Path) -> None:
+def run_dry(schema_path: Path, seeds_path: Path, guideline_search_backend: str = "embedding") -> None:
     """Load all resources and run tool tests without making any LLM calls."""
     print("=" * 60)
     print("  DRY-RUN MODE")
@@ -98,7 +109,8 @@ def run_dry(schema_path: Path, seeds_path: Path) -> None:
           f"(from {'file' if _DEFAULT_GUIDELINE.exists() else 'fallback'})")
 
     all_sections = decision_support_sections + guidance_sections
-    _init_tool_state(schema, all_sections, seeds, entity_types_list=SCHEMA_BIODIV_LIST)
+    _init_tool_state(schema, all_sections, seeds, entity_types_list=SCHEMA_BIODIV_LIST,
+                     guideline_search_backend=guideline_search_backend)
 
     # list_entity_types tool
     types_json = list_entity_types()
@@ -112,13 +124,36 @@ def run_dry(schema_path: Path, seeds_path: Path) -> None:
     print(f"\n[OK] schema_lookup(BIOTIC ENTITY, SPATIAL ENTITY):")
     print(f"     forward relations: {result['valid_relations_forward']}")
 
-    # guideline_search tool
-    search_result = json.loads(guideline_search("habitat spatial property"))
-    hits = search_result["results"]
-    print(
-        f"\n[OK] guideline_search('habitat spatial property') → "
-        f"{len(hits)} section(s) matched via {search_result['backend']}"
-    )
+    # guideline_search tool — verify embedding backend and result quality
+    _EMBED_QUERIES = [
+        "habitat spatial property",
+        "conservation status threatened species",
+    ]
+    dry_run_ok = True
+    for _q in _EMBED_QUERIES:
+        _res = json.loads(guideline_search(_q))
+        _backend = _res["backend"]
+        _hits = _res["results"] or []
+
+        # Check section embeddings were actually computed
+        _emb_cache = _ann_mod._GUIDELINE_SECTION_EMBEDDINGS
+        _emb_count = len(_emb_cache) if _emb_cache is not None else 0
+
+        if guideline_search_backend == "embedding" and _backend != "embedding":
+            print(f"\n[FAIL] guideline_search('{_q}') fell back to '{_backend}' "
+                  f"(expected embedding). Suggestion: {_res.get('suggestion')}")
+            dry_run_ok = False
+        elif all_sections and not _hits:
+            print(f"\n[WARN] guideline_search('{_q}') → 0 hits via {_backend} "
+                  f"({len(all_sections)} sections loaded, {_emb_count} embedded)")
+        else:
+            print(f"\n[OK] guideline_search('{_q}') → {len(_hits)} hit(s) via {_backend} "
+                  f"({_emb_count} section embeddings cached):")
+            for _h in _hits:
+                print(f"       • {_h.get('title', '(no title)')}")
+
+    if not dry_run_ok:
+        raise RuntimeError("Embedding guideline_search check failed — see [FAIL] lines above.")
 
     # consistency_check tool
     consistency_query = "species of vascular plants"
@@ -141,6 +176,9 @@ def run_live(
     adjudicator_model: str,
     max_rounds: int,
     output_path: Path,
+    precedent_store_path: Path | None = None,
+    guideline_search_backend: str = "embedding",
+    use_precedent_memory: bool = True,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -152,6 +190,9 @@ def run_live(
         max_rounds=max_rounds,
         entity_schema_str=SCHEMA_BIODIV_SHORT,
         entity_types_list=SCHEMA_BIODIV_LIST,
+        precedent_store_path=precedent_store_path,
+        guideline_search_backend=guideline_search_backend,
+        use_precedent_memory=use_precedent_memory,
     )
 
     output_path.write_text("")  # clear output file
@@ -204,13 +245,26 @@ def main() -> None:
         "--num-sentences", type=int, default=len(DEMO_SENTENCES),
         help="Number of demo sentences to annotate (default: all 5).",
     )
+    parser.add_argument(
+        "--precedent-store", type=Path, default=None,
+        help="Path to precedent store JSON file (loaded and updated across sentences).",
+    )
+    parser.add_argument(
+        "--guideline-search-backend", type=str, default="embedding",
+        choices=["lexical", "embedding"],
+        help="Backend for guideline_search tool (default: embedding).",
+    )
+    parser.add_argument(
+        "--no-precedent-memory", action="store_true",
+        help="Disable cross-sentence precedent memory (lookup_precedent tool not registered).",
+    )
     args = parser.parse_args()
 
     schema_path = args.schema.resolve()
     seeds_path  = args.seeds.resolve()
 
     if args.dry_run:
-        run_dry(schema_path, seeds_path)
+        run_dry(schema_path, seeds_path, guideline_search_backend=args.guideline_search_backend)
     else:
         sentences = DEMO_SENTENCES[: args.num_sentences]
         run_live(
@@ -222,6 +276,9 @@ def main() -> None:
             adjudicator_model=args.adjudicator_model,
             max_rounds=args.max_rounds,
             output_path=args.output,
+            precedent_store_path=args.precedent_store,
+            guideline_search_backend=args.guideline_search_backend,
+            use_precedent_memory=not args.no_precedent_memory,
         )
 
 

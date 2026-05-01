@@ -13,7 +13,7 @@ Architecture:
 All three agents share registered tools:
     - schema_lookup      : validate (entity_type, entity_type) → allowed relations
     - guideline_search   : retrieve relevant sections from the labelling guideline
-    - consistency_check  : look up how similar spans were labelled in seed examples
+    - lookup_precedent   : look up adjudicated decisions from earlier sentences this batch
     - list_entity_types  : list all valid entity types from the schema
 """
 
@@ -77,6 +77,9 @@ class DeliberationRecord(BaseModel):
     adjudication_status: Optional[str] = None
     adjudication_audit: Dict[str, Any] = Field(default_factory=dict)
     token_usage: Dict[str, Any] = Field(default_factory=dict)
+    # Memory: which precedents the Annotator applied, which new ones were added
+    precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
+    precedents_added: List[str] = Field(default_factory=list)     # new entries added to store
 
 
 # ─────────────────────────────────────────────────────────────
@@ -157,6 +160,28 @@ class ConstrainedAdjudication(BaseModel):
     flagged_for_human_review: List[str] = Field(default_factory=list)
     status: str = "constrained"
     audit: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PrecedentEntry(BaseModel):
+    """A single adjudicated entity-type decision stored for cross-sentence reuse."""
+    span_text: str                          # normalized span text
+    entity_type: str                        # decided entity type
+    rationale: str = ""                     # guideline rule / adjudicator reasoning
+    confidence: float = 1.0
+    source_sentence: str = ""              # sentence it came from (for traceability)
+    times_applied: int = 0                 # incremented when the Annotator reuses it
+    status: str = "authoritative"          # "authoritative" | "provisional"
+
+
+class RelationPrecedent(BaseModel):
+    """A single adjudicated relation-type decision stored for cross-sentence reuse."""
+    e1_type: str
+    relation: str
+    e2_type: str
+    rationale: str = ""
+    confidence: float = 1.0
+    source_sentence: str = ""
+    times_applied: int = 0
 
 
 LOW_CONFIDENCE_THRESHOLD = 0.7
@@ -369,10 +394,12 @@ _TYPE_PAIR_TO_RELATIONS: Dict[Tuple[str, str], List[str]] = {}
 _ALL_ENTITY_TYPES: set = set()
 _GUIDELINE_SECTIONS: List[Dict[str, str]] = []
 _SEED_EXAMPLES: Dict[str, List[dict]] = {}
-_GUIDELINE_SEARCH_BACKEND = "embedding" #"lexical"
+_PRECEDENT_STORE: Optional["PrecedentStore"] = None   # set per MultiAgentAnnotator instance
+_GUIDELINE_SEARCH_BACKEND = "embedding"  # module-level default; override via arg or GUIDELINE_SEARCH_BACKEND env var
 _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME = _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL
 _GUIDELINE_SECTION_EMBEDDINGS: Optional[List[List[float]]] = None
+_GUIDELINE_SECTIONS_HASH: Optional[str] = None  # hash of sections text; used to skip re-embedding
 _GUIDELINE_EMBEDDING_MODEL = None
 _GUIDELINE_EMBEDDING_MODEL_LOADED_NAME: Optional[str] = None
 _GUIDELINE_EMBEDDING_ERROR: Optional[str] = None
@@ -395,15 +422,24 @@ _FALLBACK_ENTITY_TYPES = [
 ]
 
 
+def _guideline_sections_hash(sections: List[Dict[str, str]]) -> str:
+    import hashlib
+    blob = json.dumps(sections, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(blob.encode()).hexdigest()
+
+
 def _init_tool_state(schema, guideline_sections, seed_examples,
                      entity_types_list: Optional[list] = None,
                      guideline_search_backend: Optional[str] = None,
-                     guideline_search_embedding_model: Optional[str] = None):
+                     guideline_search_embedding_model: Optional[str] = None,
+                     precedent_store: Optional["PrecedentStore"] = None):
     """Populate module-level state used by tool functions."""
     global _SCHEMA, _TYPE_PAIR_TO_RELATIONS, _ALL_ENTITY_TYPES
-    global _GUIDELINE_SECTIONS, _SEED_EXAMPLES
+    global _GUIDELINE_SECTIONS, _SEED_EXAMPLES, _PRECEDENT_STORE
     global _GUIDELINE_SEARCH_BACKEND, _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
-    global _GUIDELINE_SECTION_EMBEDDINGS, _GUIDELINE_EMBEDDING_ERROR
+    global _GUIDELINE_SECTION_EMBEDDINGS, _GUIDELINE_SECTIONS_HASH, _GUIDELINE_EMBEDDING_ERROR
+
+    _PRECEDENT_STORE = precedent_store
 
     _SCHEMA = schema
     _GUIDELINE_SECTIONS = guideline_sections
@@ -411,21 +447,33 @@ def _init_tool_state(schema, guideline_sections, seed_examples,
     _GUIDELINE_SEARCH_BACKEND = (
         guideline_search_backend
         or os.getenv("GUIDELINE_SEARCH_BACKEND")
-        or "lexical"
+        or _GUIDELINE_SEARCH_BACKEND  # preserve module-level default ("embedding")
     ).strip().lower()
     if _GUIDELINE_SEARCH_BACKEND not in {"lexical", "embedding"}:
         logger.warning(
-            "Unknown GUIDELINE_SEARCH_BACKEND=%r; falling back to lexical",
+            "Unknown GUIDELINE_SEARCH_BACKEND=%r; falling back to embedding",
             _GUIDELINE_SEARCH_BACKEND,
         )
-        _GUIDELINE_SEARCH_BACKEND = "lexical"
-    _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME = (
+        _GUIDELINE_SEARCH_BACKEND = "embedding"
+    new_embedding_model = (
         guideline_search_embedding_model
         or os.getenv("GUIDELINE_SEARCH_EMBEDDING_MODEL")
         or _DEFAULT_GUIDELINE_SEARCH_EMBEDDING_MODEL
     )
-    _GUIDELINE_SECTION_EMBEDDINGS = None
-    _GUIDELINE_EMBEDDING_ERROR = None
+    new_sections_hash = _guideline_sections_hash(guideline_sections)
+    if (
+        new_embedding_model != _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
+        or new_sections_hash != _GUIDELINE_SECTIONS_HASH
+    ):
+        _GUIDELINE_SECTION_EMBEDDINGS = None
+        _GUIDELINE_EMBEDDING_ERROR = None
+        _GUIDELINE_SECTIONS_HASH = new_sections_hash
+    _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME = new_embedding_model
+
+    # Pre-load model + section embeddings now so the first guideline_search call
+    # doesn't stall mid-annotation with a cold-start download/encode.
+    if _GUIDELINE_SEARCH_BACKEND == "embedding":
+        _ensure_guideline_section_embeddings()
 
     _TYPE_PAIR_TO_RELATIONS.clear()
     _ALL_ENTITY_TYPES.clear()
@@ -563,6 +611,7 @@ def _get_guideline_embedding_model():
     from sentence_transformers import SentenceTransformer
 
     _GUIDELINE_EMBEDDING_MODEL = SentenceTransformer(_GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME)
+    logger.info("Loaded embedding model: %s", _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME)
     _GUIDELINE_EMBEDDING_MODEL_LOADED_NAME = _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
     return _GUIDELINE_EMBEDDING_MODEL
 
@@ -649,6 +698,39 @@ def list_entity_types() -> str:
     return json.dumps(sorted(_ALL_ENTITY_TYPES))
 
 
+def lookup_precedent(
+    span_text: Annotated[str, "Entity span to look up, e.g. 'elevation' or 'species richness'"],
+) -> str:
+    """
+    Look up whether this entity span (or a similar one) has been annotated
+    and adjudicated in an earlier sentence this session.
+
+    Returns a list of established precedents: span text, entity type,
+    rationale, and how many times it has been applied.
+    If no precedent exists, returns an empty list.
+
+    Use this BEFORE assigning a type to a span you are uncertain about,
+    or to verify consistency with earlier decisions.
+    """
+    if _PRECEDENT_STORE is None:
+        return json.dumps([])
+    matches = _PRECEDENT_STORE.lookup(span_text)
+    return json.dumps(
+        [
+            {
+                "span_text": m.span_text,
+                "entity_type": m.entity_type,
+                "rationale": m.rationale,
+                "confidence": m.confidence,
+                "times_applied": m.times_applied,
+                "status": m.status,
+            }
+            for m in matches
+        ],
+        ensure_ascii=False,
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # Agent system prompts
 # ─────────────────────────────────────────────────────────────
@@ -681,12 +763,15 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
 2. For each candidate span, call list_entity_types to confirm the type exists, then assign the best type \
    using Steps 1-6 (domain + ontological role) from the guideline.
-3. For every pair of annotated entities, call schema_lookup to find valid relations. \
-   Annotate ALL valid triplets (e1, relation, e2).
-4. Call guideline_search when a classification is ambiguous.
+3. Call guideline_search when a classification is ambiguous.
+4. For EVERY pair of annotated entities whose relation you want to include, you MUST call schema_lookup \
+   first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. \
+   Include only relations that schema_lookup confirmed as valid.
 
 ## Coverage Rules
 - Prefer more entities over fewer: if a span could plausibly be an entity, include it.
+- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing \
+  it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
 - Propose ALL relations schema_lookup returns as valid for a given entity-type pair.
 - List ambiguous spans in "uncertain_cases" rather than dropping them.
 
@@ -730,7 +815,7 @@ Disagreement is expected and productive — correctness matters more than consen
 ## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
 - schema_lookup      : verify that a relation is valid for a given entity-type pair
-- consistency_check  : compare a span against seed examples to detect labelling inconsistencies
+- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch
 - list_entity_types  : confirm entity type names
 
 ## Review Process
@@ -749,8 +834,9 @@ Then work through the remaining annotation systematically in this order:
    - BIOTIC PROCESS vs ANTHROPOGENIC PROCESS (organism-driven vs human-driven activity)
    For each suspected confusion, call guideline_search to cite the relevant rule.
 
-3. **Edge cases** — spans that sit on a categorical boundary. Use consistency_check to see \
-   how similar spans were labelled in seed examples. If the seed label differs, flag it.
+3. **Established precedents** — for any span you are about to dispute, call lookup_precedent \
+   first. If an authoritative precedent exists from an earlier sentence this batch, do NOT \
+   re-open that decision unless the guideline clearly contradicts it.
 
 4. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the \
    relation is valid for that entity-type pair. Flag invalid or missing relations.
@@ -843,13 +929,14 @@ ANNOTATOR_TOOL_FUNCTIONS = [
     (list_entity_types, "List all valid entity types from the schema."),
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
+    (lookup_precedent, "Look up how a span was annotated and adjudicated in earlier sentences."),
 ]
 
 # Tools focused on verifying and quality-checking annotations
 CRITIC_TOOL_FUNCTIONS = [
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
-    (consistency_check, "Find how similar spans were labelled in seed examples."),
+    (lookup_precedent, "Look up how a span was adjudicated in earlier sentences this batch."),
     (list_entity_types, "List all valid entity types from the schema."),
 ]
 
@@ -1008,7 +1095,7 @@ def _critic_is_satisfied(msg: dict) -> bool:
 
 _THIS_DIR = Path(__file__).resolve().parent
 _DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision_support.csv"
-_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo label guidance draft v2.docx"
+_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo label guidance draft v3.docx"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1091,6 +1178,274 @@ def _diff_annotator_rounds(
     return " | ".join(changes)
 
 
+# ─────────────────────────────────────────────────────────────
+# Precedent Store — cross-sentence annotation memory
+# ─────────────────────────────────────────────────────────────
+
+class PrecedentStore:
+    """
+    Stores adjudicated entity-type and relation-type decisions made in
+    earlier sentences of the current batch, so the Annotator can apply
+    them consistently instead of re-deliberating the same spans.
+
+    Design principles
+    -----------------
+    * Only *authoritative* decisions are injected into agent context:
+      those where the Critic did not dispute the label AND the Adjudicator
+      had high confidence (≥ LOW_CONFIDENCE_THRESHOLD).
+    * Low-confidence or critically-disputed decisions enter a *provisional*
+      pool that is excluded from automatic reuse but is visible in logs.
+    * The store is batch-scoped: it is reset between independent batches
+      but persists across sentences within a single annotate_batch() call.
+    * Error propagation is mitigated by the provisional pool and by
+      tracking `times_applied` — a type that appears as an authoritative
+      precedent but is consistently re-challenged by the Critic should
+      be moved to provisional by the caller.
+    """
+
+    _STOP: set = {
+        "a", "an", "and", "are", "as", "at", "by", "for", "from",
+        "in", "into", "is", "it", "its", "of", "on", "or", "the", "to", "with",
+    }
+
+    def __init__(self) -> None:
+        self.entity_entries: List[PrecedentEntry] = []
+        self.relation_entries: List[RelationPrecedent] = []
+        self.provisional: List[PrecedentEntry] = []
+
+    # ── Helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _norm(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    @classmethod
+    def _tokens(cls, text: str) -> List[str]:
+        return [t for t in re.findall(r"\w+", text.lower()) if t not in cls._STOP]
+
+    @classmethod
+    def _overlap(cls, a: str, b: str) -> float:
+        ta, tb = set(cls._tokens(a)), set(cls._tokens(b))
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / max(len(ta), len(tb))
+
+    # ── Writing ───────────────────────────────────────────────
+
+    def add_entity(
+        self,
+        span_text: str,
+        entity_type: str,
+        rationale: str,
+        confidence: float,
+        source_sentence: str,
+    ) -> str:
+        """
+        Add or update an entity precedent.
+        Returns "authoritative", "provisional", or "updated" (if already existed).
+        """
+        norm = self._norm(span_text)
+
+        # Update if the same span already exists
+        for entry in self.entity_entries:
+            if self._norm(entry.span_text) == norm:
+                if entity_type == entry.entity_type:
+                    entry.times_applied += 1
+                    return "updated"
+                else:
+                    # Conflict: same span, different type — move to provisional
+                    self.provisional.append(PrecedentEntry(
+                        span_text=span_text,
+                        entity_type=entity_type,
+                        rationale=f"CONFLICT with existing {entry.entity_type}. {rationale}",
+                        confidence=confidence,
+                        source_sentence=source_sentence,
+                        status="provisional",
+                    ))
+                    return "provisional"
+
+        # New entry
+        entry = PrecedentEntry(
+            span_text=norm,
+            entity_type=entity_type,
+            rationale=rationale,
+            confidence=confidence,
+            source_sentence=source_sentence[:80],
+            status="authoritative" if confidence >= LOW_CONFIDENCE_THRESHOLD else "provisional",
+        )
+        if entry.status == "authoritative":
+            self.entity_entries.append(entry)
+        else:
+            self.provisional.append(entry)
+        return entry.status
+
+    def add_relation(
+        self,
+        e1_type: str,
+        relation: str,
+        e2_type: str,
+        rationale: str,
+        confidence: float,
+        source_sentence: str,
+    ) -> None:
+        """Add a relation-type precedent (keyed on type triple, not span text)."""
+        key = (e1_type.upper(), relation.upper(), e2_type.upper())
+        for entry in self.relation_entries:
+            if (entry.e1_type, entry.relation, entry.e2_type) == key:
+                entry.times_applied += 1
+                return
+        self.relation_entries.append(RelationPrecedent(
+            e1_type=key[0], relation=key[1], e2_type=key[2],
+            rationale=rationale,
+            confidence=confidence,
+            source_sentence=source_sentence[:80],
+        ))
+
+    def add_from_adjudication(
+        self,
+        constrained: "ConstrainedAdjudication",
+        source_sentence: str,
+    ) -> List[str]:
+        """
+        Extract authoritative decisions from a ConstrainedAdjudication and
+        populate the store.  Returns list of span_texts newly added as
+        authoritative (excludes provisional and updated entries).
+        """
+        added: List[str] = []
+        for ent in constrained.final_entities:
+            # Always attempt to add — add_entity routes to provisional if
+            # confidence is below threshold or there is a conflict.
+            # Flagged items (genuinely ambiguous) are skipped.
+            if ent.text in constrained.flagged_for_human_review:
+                continue
+            status = self.add_entity(
+                span_text=ent.text,
+                entity_type=ent.entity_type,
+                rationale=ent.reasoning or "",
+                confidence=ent.confidence if ent.confidence is not None else 1.0,
+                source_sentence=source_sentence,
+            )
+            if status == "authoritative":
+                added.append(ent.text)
+        for rel in constrained.final_relations:
+            if rel.confidence is None or rel.confidence >= LOW_CONFIDENCE_THRESHOLD:
+                self.add_relation(
+                    e1_type=rel.e1_type,
+                    relation=rel.relation,
+                    e2_type=rel.e2_type,
+                    rationale=rel.reasoning or "",
+                    confidence=rel.confidence or 1.0,
+                    source_sentence=source_sentence,
+                )
+        return added
+
+    # ── Reading ───────────────────────────────────────────────
+
+    def lookup(self, span_text: str, threshold: float = 0.6) -> List[PrecedentEntry]:
+        """
+        Return authoritative precedents whose span_text overlaps with
+        the query above `threshold`.  Sorted by overlap descending.
+        """
+        scored: List[Tuple[float, PrecedentEntry]] = []
+        for entry in self.entity_entries:
+            score = self._overlap(span_text, entry.span_text)
+            if score >= threshold:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: -x[0])
+        return [e for _, e in scored[:5]]
+
+    def to_context_block(self, max_entries: int = 20) -> str:
+        """
+        Produce a compact string for injection into the Annotator's
+        task message.  Shows the most-applied authoritative precedents.
+
+        Returns an empty string if the store has no entries yet.
+        """
+        if not self.entity_entries:
+            return ""
+
+        # Most frequently applied first, then by insertion order
+        sorted_entries = sorted(
+            self.entity_entries, key=lambda e: -e.times_applied
+        )[:max_entries]
+
+        lines = ["## Established Precedents (apply these consistently across sentences)",
+                 "These decisions were adjudicated in earlier sentences this batch. "
+                 "Apply them directly without re-deliberating — use lookup_precedent "
+                 "if you need to verify a specific span.\n"]
+
+        for e in sorted_entries:
+            freq = f" (×{e.times_applied})" if e.times_applied > 0 else ""
+            rationale = f"  ← {e.rationale}" if e.rationale else ""
+            lines.append(f'- "{e.span_text}" → {e.entity_type}{freq}{rationale}')
+
+        if self.relation_entries:
+            lines.append("\nEstablished relation precedents:")
+            for r in self.relation_entries[:10]:
+                freq = f" (×{r.times_applied})" if r.times_applied > 0 else ""
+                lines.append(f"- ({r.e1_type}, {r.relation}, {r.e2_type}){freq}")
+
+        return "\n".join(lines)
+
+    def stats(self) -> Dict[str, Any]:
+        """Return a summary dict for logging."""
+        return {
+            "authoritative_entities": len(self.entity_entries),
+            "provisional_entities": len(self.provisional),
+            "relation_triples": len(self.relation_entries),
+            "total_applications": sum(e.times_applied for e in self.entity_entries),
+        }
+
+    # ── Persistence ───────────────────────────────────────────
+
+    def save(self, path: Path) -> None:
+        """
+        Atomically write the store to a JSON file.
+
+        Uses write-to-temp-then-rename so a crash mid-write never corrupts
+        the existing file.  The stored format is a plain dict so it is
+        human-readable and easy to inspect or edit manually.
+        """
+        data = {
+            "entity_entries":    [e.model_dump() for e in self.entity_entries],
+            "relation_entries":  [r.model_dump() for r in self.relation_entries],
+            "provisional":       [e.model_dump() for e in self.provisional],
+        }
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)          # atomic on POSIX; best-effort on Windows
+        logger.debug("Precedent store saved → %s  (%d authoritative, %d provisional)",
+                     path, len(self.entity_entries), len(self.provisional))
+
+    @classmethod
+    def load(cls, path: Path) -> "PrecedentStore":
+        """
+        Load a store from a JSON file previously written by :meth:`save`.
+
+        Returns an empty store if the file does not exist, so callers can
+        always do ``store = PrecedentStore.load(path)`` unconditionally.
+        """
+        path = Path(path)
+        store = cls()
+        if not path.exists():
+            logger.info("No precedent store found at %s — starting fresh.", path)
+            return store
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            store.entity_entries   = [PrecedentEntry(**e)    for e in data.get("entity_entries",   [])]
+            store.relation_entries = [RelationPrecedent(**r) for r in data.get("relation_entries", [])]
+            store.provisional      = [PrecedentEntry(**e)    for e in data.get("provisional",      [])]
+            logger.info(
+                "Precedent store loaded from %s — %d authoritative, %d provisional, %d relations.",
+                path, len(store.entity_entries), len(store.provisional), len(store.relation_entries),
+            )
+        except Exception as exc:
+            logger.warning("Could not load precedent store from %s: %s — starting fresh.", path, exc)
+        return store
+
+
 class MultiAgentAnnotator:
     """
     AG2-based multi-agent annotation system.
@@ -1114,7 +1469,7 @@ class MultiAgentAnnotator:
         MoBiKo labelling guideline .docx (narrative, for Critic & Adjudicator).
         Defaults to the copy in src/multi_agent_annotation/.
     seeds_path : Path
-        Seed examples for consistency checking.
+        Seed examples (used by the Annotator for initial annotation context).
     max_rounds : int
         Max Annotator↔Critic turns before adjudication.
     guideline_search_backend : str
@@ -1135,8 +1490,12 @@ class MultiAgentAnnotator:
         entity_types_list: Optional[list] = None,
         guideline_search_backend: Optional[str] = None,
         guideline_search_embedding_model: Optional[str] = None,
+        precedent_store_path: Optional[Path] = None,
+        use_precedent_memory: bool = True,
     ):
         self.max_rounds = max_rounds
+        self.use_precedent_memory = use_precedent_memory
+        self.precedent_store_path = Path(precedent_store_path) if precedent_store_path else None
 
         # ── Load resources ───────────────────────────────────
         relation_schema = load_schema(schema_path) if schema_path else {}
@@ -1160,10 +1519,23 @@ class MultiAgentAnnotator:
 
         # guideline_search tool searches across both documents combined
         all_sections = decision_support_sections + guidance_sections
+
+        # ── Precedent store (persistent memory across batches) ──
+        if use_precedent_memory:
+            self.precedent_store: Optional[PrecedentStore] = (
+                PrecedentStore.load(self.precedent_store_path)
+                if self.precedent_store_path
+                else PrecedentStore()
+            )
+        else:
+            self.precedent_store = None
+            logger.info("Precedent memory disabled.")
+
         _init_tool_state(relation_schema, all_sections, seeds,
                          entity_types_list=entity_types_list or _FALLBACK_ENTITY_TYPES,
                          guideline_search_backend=guideline_search_backend,
-                         guideline_search_embedding_model=guideline_search_embedding_model)
+                         guideline_search_embedding_model=guideline_search_embedding_model,
+                         precedent_store=self.precedent_store)
 
         logger.info(
             f"Loaded decision support: {len(decision_support_sections)} sections | "
@@ -1215,31 +1587,32 @@ class MultiAgentAnnotator:
         )
 
         # A tool executor proxy (no LLM, just runs tool calls)
-        self.tool_executor = ConversableAgent(
-            name="ToolExecutor",
-            llm_config=False,
-            human_input_mode="NEVER",
-            is_termination_msg=_is_final_terminate_msg,
-        )
+        # Each agent gets its own executor so tool registrations never share
+        # state across agents — shared executors caused AG2 to corrupt its
+        # function_map when the same function name was registered for multiple
+        # callers, producing content=None messages and a ValueError on send.
+        def _make_executor(name: str) -> ConversableAgent:
+            return ConversableAgent(
+                name=name,
+                llm_config=False,
+                human_input_mode="NEVER",
+                is_termination_msg=_is_final_terminate_msg,
+            )
+
+        self.annotator_executor  = _make_executor("AnnotatorExecutor")
+        self.critic_executor     = _make_executor("CriticExecutor")
+        self.adj_executor        = _make_executor("AdjudicatorExecutor")
 
         # ── Register tools ───────────────────────────────────
-        # All agents use the dedicated ToolExecutor proxy so tool results come
-        # back as role="tool" messages and never appear as conversation turns
-        # attributed to the counterpart agent.
-        # Suppress the ag2 "Function X is being overridden" warning that fires
-        # when overlapping tool sets (guideline_search, schema_lookup, etc.) are
-        # registered on the same executor for different callers — all
-        # registrations point to the same function objects, so there is no real
-        # override risk.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Function '.*' is being overridden",
-                category=UserWarning,
-            )
-            _register_tools_on_agents(self.annotator, self.tool_executor, ANNOTATOR_TOOL_FUNCTIONS)
-            _register_tools_on_agents(self.critic, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
-            _register_tools_on_agents(self.adjudicator, self.tool_executor, CRITIC_TOOL_FUNCTIONS)
+        if use_precedent_memory:
+            annotator_tools = ANNOTATOR_TOOL_FUNCTIONS
+            critic_tools = CRITIC_TOOL_FUNCTIONS
+        else:
+            annotator_tools = [t for t in ANNOTATOR_TOOL_FUNCTIONS if t[0] is not lookup_precedent]
+            critic_tools = [t for t in CRITIC_TOOL_FUNCTIONS if t[0] is not lookup_precedent]
+        _register_tools_on_agents(self.annotator,  self.annotator_executor, annotator_tools)
+        _register_tools_on_agents(self.critic,     self.critic_executor,    critic_tools)
+        _register_tools_on_agents(self.adjudicator, self.adj_executor,      critic_tools)
 
     def annotate_sentence(
         self,
@@ -1267,6 +1640,14 @@ class MultiAgentAnnotator:
                 f"{json.dumps(pre_identified_entities, ensure_ascii=False, indent=2)}"
             )
 
+        # Inject precedent context if the store has entries from earlier sentences
+        precedent_block = (
+            self.precedent_store.to_context_block()
+            if self.precedent_store is not None else ""
+        )
+        if precedent_block:
+            task_msg += f"\n\n{precedent_block}"
+
         # ── Phase 1: per-round Annotator → Critic deliberation ──
         # Each round runs two separate agent↔ToolExecutor chats so tool
         # results arrive as role="tool" messages and never appear as
@@ -1290,7 +1671,7 @@ class MultiAgentAnnotator:
                     sentence, last_annotator_text, last_critic_text,
                     pre_identified_entities,
                 )
-            ann_content, ann_record = self._run_agent_turn(self.annotator, ann_msg)
+            ann_content, ann_record = self._run_agent_turn(self.annotator, self.annotator_executor, ann_msg)
             deliberation_messages.append(ann_record)
             last_annotator_text = ann_content
             for k in annotator_tokens:
@@ -1302,7 +1683,7 @@ class MultiAgentAnnotator:
 
             # ── Critic turn ───────────────────────────────────
             crit_msg = self._build_critic_review_msg(sentence, ann_content)
-            crit_content, crit_record = self._run_agent_turn(self.critic, crit_msg)
+            crit_content, crit_record = self._run_agent_turn(self.critic, self.critic_executor, crit_msg)
             deliberation_messages.append(crit_record)
             last_critic_text = crit_content
             for k in critic_tokens:
@@ -1324,7 +1705,7 @@ class MultiAgentAnnotator:
 
         if last_annotator_out is None:
             repair_messages, repaired_text = self._repair_agent_json(
-                requester=self.tool_executor,
+                requester=self.annotator_executor,
                 producer=self.annotator,
                 output_kind="Annotator",
                 original_text=last_annotator_text,
@@ -1348,7 +1729,7 @@ class MultiAgentAnnotator:
 
         if last_critic_out is None:
             repair_messages, repaired_text = self._repair_agent_json(
-                requester=self.tool_executor,
+                requester=self.critic_executor,
                 producer=self.critic,
                 output_kind="Critic",
                 original_text=last_critic_text,
@@ -1368,8 +1749,10 @@ class MultiAgentAnnotator:
             sentence, deliberation_messages
         )
 
+        self.adjudicator.reset()
+        self.adj_executor.reset()
         adj_result = self.adjudicator.initiate_chat(
-            recipient=self.tool_executor,
+            recipient=self.adj_executor,
             message=adjudicator_msg,
             max_turns=self._adjudicator_max_turns(),
         )
@@ -1413,7 +1796,7 @@ class MultiAgentAnnotator:
                             logger.warning(f"Retried AdjudicatorOutput validation error: {e}")
             else:
                 repair_messages, repaired_text = self._repair_agent_json(
-                    requester=self.tool_executor,
+                    requester=self.adj_executor,
                     producer=self.adjudicator,
                     output_kind="Adjudicator",
                     original_text=raw_adjudicator,
@@ -1441,6 +1824,31 @@ class MultiAgentAnnotator:
         record.flagged_for_human_review = constrained.flagged_for_human_review
         record.adjudication_status = constrained.status
         record.adjudication_audit = constrained.audit
+
+        # ── Update precedent store from this sentence ─────────
+        if self.precedent_store is not None and constrained.status not in ("annotator_parse_failed",):
+            added_spans = self.precedent_store.add_from_adjudication(
+                constrained, source_sentence=sentence
+            )
+            record.precedents_added = added_spans
+            store_stats = self.precedent_store.stats()
+            logger.info(
+                f"Precedent store: {store_stats['authoritative_entities']} authoritative, "
+                f"{store_stats['provisional_entities']} provisional, "
+                f"{store_stats['total_applications']} total applications"
+            )
+            if self.precedent_store_path:
+                self.precedent_store.save(self.precedent_store_path)
+
+        # Track which precedents the Annotator applied in this sentence
+        if self.precedent_store is not None and precedent_block and last_annotator_out:
+            for entry in self.precedent_store.entity_entries:
+                for ent in last_annotator_out.entities:
+                    if self.precedent_store._overlap(ent.text, entry.span_text) >= 0.6:
+                        if ent.entity_type == entry.entity_type:
+                            if entry.span_text not in record.precedents_applied:
+                                record.precedents_applied.append(entry.span_text)
+                                entry.times_applied += 1
 
         # ── Post-process: flag relations between overlapping spans ─
         overlap_flags = self._find_overlap_relation_flags(
@@ -1536,11 +1944,14 @@ class MultiAgentAnnotator:
             logger.info(f"\n{'#'*60}\n  Sentence {i+1}/{len(sentences)}\n{'#'*60}")
             logger.info(f"  {sent[:100]}...")
 
-            # Clear agent chat histories between sentences
+            # Clear agent chat histories between sentences but preserve
+            # the precedent store — it accumulates decisions across the batch.
             self.annotator.reset()
             self.critic.reset()
             self.adjudicator.reset()
-            self.tool_executor.reset()
+            self.annotator_executor.reset()
+            self.critic_executor.reset()
+            self.adj_executor.reset()
 
             record = self.annotate_sentence(sent, ents)
             records.append(record)
@@ -1776,10 +2187,11 @@ class MultiAgentAnnotator:
     def _run_agent_turn(
         self,
         agent: ConversableAgent,
+        executor: ConversableAgent,
         message: str,
     ) -> Tuple[str, Dict[str, Any]]:
         """
-        Run one agent turn against ToolExecutor.
+        Run one agent turn against its dedicated executor.
 
         Resets both agents so each round starts with a clean history and tool
         results arrive as role="tool" messages, not as counterpart conversation
@@ -1790,9 +2202,9 @@ class MultiAgentAnnotator:
         ``token_usage`` key with prompt/completion/total counts for the turn.
         """
         agent.reset()
-        self.tool_executor.reset()
+        executor.reset()
         chat = agent.initiate_chat(
-            recipient=self.tool_executor,
+            recipient=executor,
             message=message,
             max_turns=self._agent_turn_max_turns(),
         )
@@ -1947,7 +2359,7 @@ Previous output to repair:
             sentence, adjudicator_summary
         )
         try:
-            retry_result = self.tool_executor.initiate_chat(
+            retry_result = self.adj_executor.initiate_chat(
                 recipient=self.adjudicator,
                 message=prompt,
                 max_turns=2,
@@ -1992,6 +2404,67 @@ Previous output to repair:
         return ref not in placeholder_refs
 
     @staticmethod
+    def _remove_nested_entities(
+        entities: List[EntityAnnotation],
+        relations: List[RelationFlat],
+        audit: Dict[str, Any],
+    ) -> Tuple[List[EntityAnnotation], List[RelationFlat]]:
+        """
+        Drop entities whose text is strictly contained within a longer co-annotated
+        entity span (e.g. "limited" inside "limited information").  Relations that
+        reference a dropped entity are also removed.
+
+        When offsets are available the containment check uses character positions;
+        otherwise it falls back to substring matching.
+        """
+        def _is_contained(short: EntityAnnotation, long: EntityAnnotation) -> bool:
+            ts, tl = short.text.lower().strip(), long.text.lower().strip()
+            if ts == tl:
+                return False
+            if all(x is not None for x in (short.start, short.end, long.start, long.end)):
+                return long.start <= short.start and short.end <= long.end  # type: ignore[operator]
+            return ts in tl
+
+        dropped: set[str] = set()
+        for i, e1 in enumerate(entities):
+            for e2 in entities[i + 1:]:
+                if _is_contained(e1, e2):
+                    k = MultiAgentAnnotator._normalize_annotation_text(e1.text)
+                    if k not in dropped:
+                        dropped.add(k)
+                        audit["warnings"].append(
+                            f'entity "{e1.text}" removed (nested inside "{e2.text}")'
+                        )
+                elif _is_contained(e2, e1):
+                    k = MultiAgentAnnotator._normalize_annotation_text(e2.text)
+                    if k not in dropped:
+                        dropped.add(k)
+                        audit["warnings"].append(
+                            f'entity "{e2.text}" removed (nested inside "{e1.text}")'
+                        )
+
+        if not dropped:
+            return entities, relations
+
+        clean_entities = [
+            e for e in entities
+            if MultiAgentAnnotator._normalize_annotation_text(e.text) not in dropped
+        ]
+        clean_relations = [
+            r for r in relations
+            if MultiAgentAnnotator._normalize_annotation_text(r.e1_text) not in dropped
+            and MultiAgentAnnotator._normalize_annotation_text(r.e2_text) not in dropped
+        ]
+        for r in relations:
+            e1k = MultiAgentAnnotator._normalize_annotation_text(r.e1_text)
+            e2k = MultiAgentAnnotator._normalize_annotation_text(r.e2_text)
+            if e1k in dropped or e2k in dropped:
+                audit["warnings"].append(
+                    f'relation "{r.e1_text} {r.relation} {r.e2_text}" removed '
+                    "(endpoint was a nested entity)"
+                )
+        return clean_entities, clean_relations
+
     @staticmethod
     def _find_overlap_relation_flags(
         final_entities: List[EntityAnnotation],
@@ -2435,9 +2908,18 @@ Previous output to repair:
                     "(final Critic disagreement)"
                 )
 
+        out_entities = [final_entities_by_text[key] for key in entity_order]
+        out_relations = [final_relations_by_slot[key] for key in relation_order]
+
+        # Drop entities whose span is strictly nested inside a longer co-annotated
+        # entity, and remove any relation that references a dropped entity.
+        out_entities, out_relations = MultiAgentAnnotator._remove_nested_entities(
+            out_entities, out_relations, audit
+        )
+
         return ConstrainedAdjudication(
-            final_entities=[final_entities_by_text[key] for key in entity_order],
-            final_relations=[final_relations_by_slot[key] for key in relation_order],
+            final_entities=out_entities,
+            final_relations=out_relations,
             flagged_for_human_review=human_review_flags,
             status="constrained",
             audit=audit,
@@ -2562,6 +3044,14 @@ def analyze_disagreements(records: List[DeliberationRecord]) -> Dict[str, Any]:
         "flagged_for_review": [],
         "entity_type_distribution": {},
         "relation_distribution": {},
+        "precedents": {
+            "total_applied": sum(len(r.precedents_applied) for r in records),
+            "total_added": sum(len(r.precedents_added) for r in records),
+            "per_sentence_applied": [
+                {"sentence": r.sentence[:60], "applied": r.precedents_applied}
+                for r in records if r.precedents_applied
+            ],
+        },
     }
     scores, rounds = [], []
     for rec in records:
@@ -2607,7 +3097,7 @@ def main():
     parser.add_argument(
         "--guideline-search-backend",
         choices=["lexical", "embedding"],
-        default=None,
+        default="embeding",
         help="Optional guideline_search backend. Defaults to GUIDELINE_SEARCH_BACKEND or lexical.",
     )
     parser.add_argument(
@@ -2615,6 +3105,16 @@ def main():
         type=str,
         default=None,
         help="SentenceTransformer model name used when --guideline-search-backend=embedding.",
+    )
+    parser.add_argument(
+        "--precedent-store",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a JSON file for the persistent precedent store. "
+            "Loaded on startup if it exists; updated after every sentence. "
+            "Omit to use a fresh in-memory store that is discarded after the run."
+        ),
     )
 
     args = parser.parse_args()
@@ -2646,6 +3146,7 @@ def main():
         max_rounds=args.max_rounds,
         guideline_search_backend=args.guideline_search_backend,
         guideline_search_embedding_model=args.guideline_search_embedding_model,
+        precedent_store_path=args.precedent_store,
     )
 
     records = annotator.annotate_batch(sentences, output_path=args.output)
