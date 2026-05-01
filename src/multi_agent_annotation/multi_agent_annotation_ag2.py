@@ -508,15 +508,18 @@ def schema_lookup(
 
 
 def guideline_search(
-    query: Annotated[str, "Keywords to search in the labelling guideline, e.g. 'habitat spatial property'"],
+    query: Annotated[str, "Descriptive phrase including the span text AND its candidate entity type, e.g. 'habitat spatial property classification' or 'information concept vs anthropogenic entity'"],
 ) -> str:
     """Search the MoBiKo labelling guideline for relevant rules and classification steps."""
     backend = _GUIDELINE_SEARCH_BACKEND
     if backend == "embedding":
         try:
             results = _guideline_search_embedding(query)
-            if results is not None:
+            if results:  # non-empty list → return embedding results
                 return _format_guideline_search_response(query, "embedding", results)
+            # Empty results (no_match or short query) → fall through to lexical
+            if results is None:
+                logger.warning("Embedding search unavailable; falling back to lexical.")
         except Exception as exc:
             logger.warning("Embedding guideline_search failed; falling back to lexical: %s", exc)
 
@@ -1935,12 +1938,44 @@ class MultiAgentAnnotator:
         sentences: List[str],
         pre_entities: Optional[List[Optional[List[dict]]]] = None,
         output_path: Optional[Path] = None,
+        resume: bool = False,
     ) -> List[DeliberationRecord]:
-        """Annotate a batch of sentences with JSONL output."""
-        records = []
+        """Annotate a batch of sentences with JSONL output.
+
+        When ``resume=True`` and ``output_path`` points to an existing file,
+        sentences whose text already appears in that file are skipped and their
+        records are prepended to the returned list.  The output file is left
+        intact; new records are appended.  When ``resume=False`` (default) the
+        output file is cleared before the first write.
+        """
+        # ── Resume: load already-completed records ────────────
+        done_sentences: set[str] = set()
+        records: List[DeliberationRecord] = []
+        if resume and output_path and Path(output_path).exists():
+            for line in Path(output_path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = DeliberationRecord.model_validate_json(line)
+                    done_sentences.add(rec.sentence)
+                    records.append(rec)
+                except Exception:
+                    pass
+            if done_sentences:
+                logger.info(
+                    "Resume: %d sentence(s) already done — skipping.", len(done_sentences)
+                )
+        elif output_path:
+            Path(output_path).write_text("", encoding="utf-8")
+
         ents_list = pre_entities or [None] * len(sentences)
 
         for i, (sent, ents) in enumerate(zip(sentences, ents_list)):
+            if sent in done_sentences:
+                logger.info(f"  [skip] Sentence {i+1}/{len(sentences)} already in output.")
+                continue
+
             logger.info(f"\n{'#'*60}\n  Sentence {i+1}/{len(sentences)}\n{'#'*60}")
             logger.info(f"  {sent[:100]}...")
 

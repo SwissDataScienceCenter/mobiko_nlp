@@ -179,6 +179,7 @@ def run_live(
     precedent_store_path: Path | None = None,
     guideline_search_backend: str = "embedding",
     use_precedent_memory: bool = True,
+    resume: bool = False,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -195,8 +196,7 @@ def run_live(
         use_precedent_memory=use_precedent_memory,
     )
 
-    output_path.write_text("")  # clear output file
-    records = annotator.annotate_batch(sentences, output_path=output_path)
+    records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume)
 
     stats = analyze_disagreements(records)
     print(f"\n{'=' * 60}")
@@ -258,6 +258,10 @@ def main() -> None:
         "--no-precedent-memory", action="store_true",
         help="Disable cross-sentence precedent memory (lookup_precedent tool not registered).",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip sentences already present in the output file and append new results.",
+    )
     args = parser.parse_args()
 
     schema_path = args.schema.resolve()
@@ -279,6 +283,7 @@ def main() -> None:
             precedent_store_path=args.precedent_store,
             guideline_search_backend=args.guideline_search_backend,
             use_precedent_memory=not args.no_precedent_memory,
+            resume=args.resume,
         )
 
 
