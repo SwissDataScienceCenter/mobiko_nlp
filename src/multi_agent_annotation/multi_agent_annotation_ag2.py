@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, Tuple, Any
@@ -79,6 +80,7 @@ class DeliberationRecord(BaseModel):
     adjudication_status: Optional[str] = None
     adjudication_audit: Dict[str, Any] = Field(default_factory=dict)
     token_usage: Dict[str, Any] = Field(default_factory=dict)
+    timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
     precedents_added: List[str] = Field(default_factory=list)     # new entries added to store
@@ -1453,6 +1455,7 @@ class MultiAgentAnnotator:
            and produces the final labels.
         """
         record = DeliberationRecord(sentence=sentence)
+        _sentence_t0 = time.perf_counter()
 
         # ── Build task message ────────────────────────────────
         task_msg = f'Annotate this sentence:\n\n"{sentence}"'
@@ -1483,6 +1486,8 @@ class MultiAgentAnnotator:
         last_critic_text = ""
         annotator_tokens: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         critic_tokens: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        round_timings: List[Dict[str, Any]] = []
+        _phase1_t0 = time.perf_counter()
 
         for round_idx in range(self.max_rounds):
             # ── Annotator turn ────────────────────────────────
@@ -1493,11 +1498,14 @@ class MultiAgentAnnotator:
                     sentence, last_annotator_text, last_critic_text,
                     pre_identified_entities,
                 )
+            logger.info("  [round %d] Annotator …", round_idx + 1)
             ann_content, ann_record = self._run_agent_turn(self.annotator, self.annotator_executor, ann_msg)
             deliberation_messages.append(ann_record)
             last_annotator_text = ann_content
             for k in annotator_tokens:
                 annotator_tokens[k] += ann_record["token_usage"].get(k, 0)
+            ann_elapsed = ann_record.get("elapsed_s", 0.0)
+            logger.info("  [round %d] Annotator done in %.1fs", round_idx + 1, ann_elapsed)
 
             parsed_ann = self._parse_annotator_output(ann_content)
             if parsed_ann is not None:
@@ -1505,11 +1513,21 @@ class MultiAgentAnnotator:
 
             # ── Critic turn ───────────────────────────────────
             crit_msg = self._build_critic_review_msg(sentence, ann_content)
+            logger.info("  [round %d] Critic …", round_idx + 1)
             crit_content, crit_record = self._run_agent_turn(self.critic, self.critic_executor, crit_msg)
             deliberation_messages.append(crit_record)
             last_critic_text = crit_content
             for k in critic_tokens:
                 critic_tokens[k] += crit_record["token_usage"].get(k, 0)
+            crit_elapsed = crit_record.get("elapsed_s", 0.0)
+            logger.info("  [round %d] Critic done in %.1fs", round_idx + 1, crit_elapsed)
+
+            round_timings.append({
+                "round": round_idx + 1,
+                "annotator_s": ann_elapsed,
+                "critic_s": crit_elapsed,
+                "round_total_s": round(ann_elapsed + crit_elapsed, 2),
+            })
 
             parsed_crit = self._parse_critic_output(crit_content)
             if parsed_crit is not None:
@@ -1522,6 +1540,7 @@ class MultiAgentAnnotator:
             ):
                 break
 
+        phase1_s = round(time.perf_counter() - _phase1_t0, 2)
         record.rounds_used = round_idx + 1
         record.messages = deliberation_messages
 
@@ -1563,7 +1582,8 @@ class MultiAgentAnnotator:
                 last_critic_out = self._parse_critic_output(repaired_text)
 
         # ── Phase 2: Adjudicator resolves ─────────────────────
-        logger.info("Phase 2: Adjudicator resolving")
+        logger.info("Phase 2: Adjudicator resolving …")
+        _phase2_t0 = time.perf_counter()
 
         # Build a condensed summary of the full deliberation trajectory:
         # final annotation + final critique + per-round dispute history.
@@ -1578,6 +1598,8 @@ class MultiAgentAnnotator:
             message=adjudicator_msg,
             max_turns=self._adjudicator_max_turns(),
         )
+        phase2_s = round(time.perf_counter() - _phase2_t0, 2)
+        logger.info("  Adjudicator done in %.1fs", phase2_s)
         adjudicator_tokens = self._sum_usage(getattr(adj_result, "cost", {}))
 
         # Extract final output from adjudicator's last message
@@ -1738,8 +1760,18 @@ class MultiAgentAnnotator:
             "adjudicator": adjudicator_tokens,
             "total": total_tokens,
         }
+
+        sentence_s = round(time.perf_counter() - _sentence_t0, 2)
+        record.timing = {
+            "total_s": sentence_s,
+            "phase1_s": phase1_s,
+            "phase2_s": phase2_s,
+            "rounds": round_timings,
+        }
+
         logger.info(
-            f"Done: {len(record.final_entities)} entities, "
+            f"Done in {sentence_s:.1f}s (phase1={phase1_s:.1f}s, phase2={phase2_s:.1f}s) | "
+            f"{len(record.final_entities)} entities, "
             f"{len(record.final_relations)} relations, "
             f"agreement={record.agreement_score if record.agreement_score is None else f'{record.agreement_score:.2f}'} | "
             f"tokens — annotator: {annotator_tokens['total_tokens']} "
@@ -1790,6 +1822,8 @@ class MultiAgentAnnotator:
             Path(output_path).write_text("", encoding="utf-8")
 
         ents_list = pre_entities or [None] * len(sentences)
+        _batch_t0 = time.perf_counter()
+        sentence_timings: List[Dict[str, Any]] = []
 
         for i, (sent, ents) in enumerate(zip(sentences, ents_list)):
             if sent in done_sentences:
@@ -1801,6 +1835,7 @@ class MultiAgentAnnotator:
 
             record = None
             last_exc: Optional[Exception] = None
+            _sent_t0 = time.perf_counter()
             for attempt in range(1, max_retries + 1):
                 # Clear agent chat histories before each attempt; preserve the
                 # precedent store so decisions from earlier sentences carry over.
@@ -1823,18 +1858,49 @@ class MultiAgentAnnotator:
                     if attempt < max_retries:
                         logger.info("Retrying…")
 
+            sent_elapsed = round(time.perf_counter() - _sent_t0, 2)
+
             if record is None:
                 logger.error(
                     "Sentence %d/%d skipped after %d failed attempt(s) — "
                     "it will be retried when you resume. Last error: %s",
                     i + 1, len(sentences), max_retries, last_exc,
                 )
+                sentence_timings.append({
+                    "index": i + 1,
+                    "preview": sent[:60],
+                    "elapsed_s": sent_elapsed,
+                    "status": "failed",
+                })
                 continue  # not written to output, so --resume will retry it
 
+            sentence_timings.append({
+                "index": i + 1,
+                "preview": sent[:60],
+                "elapsed_s": sent_elapsed,
+                "status": "ok",
+            })
             records.append(record)
 
             if output_path:
                 self._append_jsonl(record, output_path)
+
+        # ── Batch timing summary ──────────────────────────────
+        batch_elapsed = round(time.perf_counter() - _batch_t0, 2)
+        if sentence_timings:
+            logger.info("\n%s\n  TIMING SUMMARY\n%s", "=" * 60, "=" * 60)
+            for st in sentence_timings:
+                status_tag = "" if st["status"] == "ok" else "  [FAILED]"
+                logger.info(
+                    "  [%d/%d] %s…  %.1fs%s",
+                    st["index"], len(sentences), st["preview"], st["elapsed_s"], status_tag,
+                )
+            ok_times = [st["elapsed_s"] for st in sentence_timings if st["status"] == "ok"]
+            if ok_times:
+                logger.info(
+                    "  avg: %.1fs | min: %.1fs | max: %.1fs | total batch: %.1fs",
+                    sum(ok_times) / len(ok_times), min(ok_times), max(ok_times), batch_elapsed,
+                )
 
         return records
 
@@ -2080,11 +2146,13 @@ class MultiAgentAnnotator:
         """
         agent.reset()
         executor.reset()
+        _t0 = time.perf_counter()
         chat = agent.initiate_chat(
             recipient=executor,
             message=message,
             max_turns=self._agent_turn_max_turns(),
         )
+        elapsed_s = time.perf_counter() - _t0
         all_msgs = _collect_messages_with_tools(chat.chat_history, skip_first=True)
 
         agent_name = agent.name
@@ -2104,6 +2172,7 @@ class MultiAgentAnnotator:
             "content": last_content,
             "tool_calls": all_tool_calls,
             "token_usage": self._sum_usage(getattr(chat, "cost", {})),
+            "elapsed_s": round(elapsed_s, 2),
         }
 
     @staticmethod
