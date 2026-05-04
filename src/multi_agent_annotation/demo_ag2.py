@@ -60,20 +60,20 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
 # ── Demo sentences ─────────────────────────────
 DEMO_SENTENCES = [
     "However, the limited information on the effects of overexploitation on the current status and community composition of wildlife hinders effective conservation efforts, including the implementation of targeted patrols to reduce snaring.",
-    # "Finally, we used a dissimilarity index to assess the level of defaunation, revealing 16% of the community had been lost, with higher levels of defaunation for threatened and larger-sized species.",
-    # "Our findings provide insights into the status, distribution, and occurrence of the ground-dwelling mammal and bird communities in the Langbian Plateau, and can help stakeholders design more effective conservation strategies to protect existing populations.",
-    # """Study site
-# We surveyed four contiguous protected areas in the core forest area of the southern Annamites: Bidoup—Nui Ba National Park, Phuoc Binh National Park, Da Nhim Protection Forest, and Dran Protection Forest (Figure 1).""",
-#     "Historically, Bidoup—Nui Ba and Phuoc Binh National Park were a part of the Thuong Da Nhim Nature Reserve established in 1986 (Eames, 1995), but in 1992 the two areas were split into two forest units and managed separately (Southern Institute of Ecology, 2017).",
-#     "Da Nhim and Dran forests were also managed under a single administration authority from 1987 (Eames, 1995), but separated into two protection forests in the late 1990s, in which timber extraction and wildlife exploitation are not completely prohibited (Law on Forestry, 2017).",
-#     "However, precipitation is unevenly distributed within the study sites due to the rain shadow effect, and this, combined with differences in soil type, contribute to two major habitat types: broadleaf evergreen forest and coniferous forest (Nguyen, 1966; Rundel, 1999).",
-#     "The eastern and western slopes of Bidoup Nui Ba National Park, and the majority of Phuoc Binh National Park, receive high levels of rainfall and are dominated by evergreen broadleaf forests.",
-#     "In total, we set up 157 stations spanning all four protected areas and both main habitat types (Table 1, Figure 1).",
-#     "The vast majority (96.6%) of insects collected from emergence traps were Diptera (flies), while 0.8% were Trichoptera (caddisflies) and Ephemeroptera (mayflies)."
-    #"While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest)."
-    # "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
-    # "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
-    # "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
+    "Finally, we used a dissimilarity index to assess the level of defaunation, revealing 16% of the community had been lost, with higher levels of defaunation for threatened and larger-sized species.",
+    "Our findings provide insights into the status, distribution, and occurrence of the ground-dwelling mammal and bird communities in the Langbian Plateau, and can help stakeholders design more effective conservation strategies to protect existing populations.",
+    """Study site
+We surveyed four contiguous protected areas in the core forest area of the southern Annamites: Bidoup—Nui Ba National Park, Phuoc Binh National Park, Da Nhim Protection Forest, and Dran Protection Forest (Figure 1).""",
+    "Historically, Bidoup—Nui Ba and Phuoc Binh National Park were a part of the Thuong Da Nhim Nature Reserve established in 1986 (Eames, 1995), but in 1992 the two areas were split into two forest units and managed separately (Southern Institute of Ecology, 2017).",
+    "Da Nhim and Dran forests were also managed under a single administration authority from 1987 (Eames, 1995), but separated into two protection forests in the late 1990s, in which timber extraction and wildlife exploitation are not completely prohibited (Law on Forestry, 2017).",
+    "However, precipitation is unevenly distributed within the study sites due to the rain shadow effect, and this, combined with differences in soil type, contribute to two major habitat types: broadleaf evergreen forest and coniferous forest (Nguyen, 1966; Rundel, 1999).",
+    "The eastern and western slopes of Bidoup Nui Ba National Park, and the majority of Phuoc Binh National Park, receive high levels of rainfall and are dominated by evergreen broadleaf forests.",
+    "In total, we set up 157 stations spanning all four protected areas and both main habitat types (Table 1, Figure 1).",
+    "The vast majority (96.6%) of insects collected from emergence traps were Diptera (flies), while 0.8% were Trichoptera (caddisflies) and Ephemeroptera (mayflies)."
+    "While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest)."
+    "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
+    "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
+    "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
 ]
 
 
@@ -180,6 +180,8 @@ def run_live(
     guideline_search_backend: str = "embedding",
     use_precedent_memory: bool = True,
     resume: bool = False,
+    max_retries: int = 2,
+    request_timeout: int = 600,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -194,9 +196,10 @@ def run_live(
         precedent_store_path=precedent_store_path,
         guideline_search_backend=guideline_search_backend,
         use_precedent_memory=use_precedent_memory,
+        request_timeout=request_timeout,
     )
 
-    records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume)
+    records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume, max_retries=max_retries)
 
     stats = analyze_disagreements(records)
     print(f"\n{'=' * 60}")
@@ -262,6 +265,17 @@ def main() -> None:
         "--resume", action="store_true",
         help="Skip sentences already present in the output file and append new results.",
     )
+    parser.add_argument(
+        "--max-retries", type=int, default=2,
+        help="Number of times to retry a sentence that raises an exception before skipping it "
+             "(default: 2). Skipped sentences are not written to the output so --resume will "
+             "retry them on the next run.",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=600,
+        help="Per-request HTTP timeout in seconds for all model API calls (default: 600). "
+             "Increase this if you see 504 Gateway Timeout errors.",
+    )
     args = parser.parse_args()
 
     schema_path = args.schema.resolve()
@@ -284,6 +298,8 @@ def main() -> None:
             guideline_search_backend=args.guideline_search_backend,
             use_precedent_memory=not args.no_precedent_memory,
             resume=args.resume,
+            max_retries=args.max_retries,
+            request_timeout=args.timeout,
         )
 
 
