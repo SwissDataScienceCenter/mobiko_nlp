@@ -37,6 +37,18 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from eval_utils import (
+    bootstrap_ci,
+    two_sample_bootstrap_p,
+    fmt_ci,
+    fmt_p,
+)
+
+SCHEMA_V1_TO_V2: Dict[str, str] = {
+    "BIOTIC COLLECTIVE ENTITY":  "BIOTIC ENTITY",
+    "ABIOTIC COLLECTIVE ENTITY": "ABIOTIC ENTITY",
+}
+
 
 # ─────────────────────────────────────────────────────────────
 # Data loading
@@ -81,8 +93,12 @@ def load_human_annotations(path: Path) -> Dict[str, Dict[str, dict]]:
         obj = json.loads(line)
         sent = obj["sentence"].strip()
         annotator = obj.get("annotator", "default")
+        entities = [
+            {**e, "entity_type": _normalize_label(e.get("entity_type", e.get("type", "")))}
+            for e in obj.get("entities", [])
+        ]
         data[sent][annotator] = {
-            "entities": obj.get("entities", []),
+            "entities": entities,
             "relations": obj.get("relations", []),
         }
     return dict(data)
@@ -94,7 +110,7 @@ def _load_native_json_annotations(doc: dict, annotator: str) -> Dict[str, Dict[s
     for sent_obj in doc.get("sentences", []):
         sent = sent_obj["text"].strip()
         entities = [
-            {"text": span["text"], "entity_type": span["type"]}
+            {"text": span["text"], "entity_type": _normalize_label(span["type"])}
             for span in sent_obj.get("spans", [])
         ]
         data[sent] = {annotator: {"entities": entities, "relations": []}}
@@ -115,6 +131,12 @@ def load_all_human_annotations(paths: List[Path]) -> Dict[str, Dict[str, dict]]:
 
 def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _normalize_label(label: str) -> str:
+    """Map V1 schema labels to V2 equivalents for human annotations."""
+    upper = label.strip().upper()
+    return SCHEMA_V1_TO_V2.get(upper, upper)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -250,8 +272,9 @@ def _prf(tp: int, fp: int, fn: int) -> Dict[str, Any]:
 def compute_per_type_entity_metrics(
     pred_entities: List[dict],
     gold_entities: List[dict],
+    match_mode: str = "exact",
 ) -> Dict[str, Dict[str, Any]]:
-    """Exact-match P/R/F1 broken down by entity type."""
+    """P/R/F1 broken down by entity type, respecting match_mode."""
     all_types: Set[str] = set()
     pred_by_type: Dict[str, list] = defaultdict(list)
     gold_by_type: Dict[str, list] = defaultdict(list)
@@ -268,7 +291,7 @@ def compute_per_type_entity_metrics(
     results = {}
     for t in sorted(all_types):
         results[t] = compute_entity_metrics(
-            pred_by_type.get(t, []), gold_by_type.get(t, [])
+            pred_by_type.get(t, []), gold_by_type.get(t, []), match_mode=match_mode
         )
     return results
 
@@ -324,6 +347,7 @@ def evaluate_agent_vs_humans(
     for rec in agent_records:
         sent = rec["sentence"].strip()
         if sent not in human_data:
+            print(sent)
             continue
 
         annotators = human_data[sent]
@@ -353,7 +377,7 @@ def evaluate_agent_vs_humans(
 
             # Per-type accumulation
             type_metrics = compute_per_type_entity_metrics(
-                agent_ents, ann_data["entities"]
+                agent_ents, ann_data["entities"], match_mode=match_mode
             )
             for etype, m in type_metrics.items():
                 per_type_agent[etype].append(m["f1"])
@@ -379,7 +403,7 @@ def evaluate_agent_vs_humans(
                 })
 
                 type_metrics = compute_per_type_entity_metrics(
-                    a_data["entities"], b_data["entities"]
+                    a_data["entities"], b_data["entities"], match_mode=match_mode
                 )
                 for etype, m in type_metrics.items():
                     per_type_human[etype].append(m["f1"])
@@ -389,6 +413,19 @@ def evaluate_agent_vs_humans(
         vals = [s[key] for s in scores if s[key] is not None]
         return sum(vals) / len(vals) if vals else 0.0
 
+    avh_ef1 = [s["entity_f1"] for s in agent_vs_human_scores]
+    avh_rf1 = [s["relation_f1"] for s in agent_vs_human_scores]
+    ih_ef1  = [s["entity_f1"] for s in inter_human_scores]
+    ih_rf1  = [s["relation_f1"] for s in inter_human_scores]
+
+    avh_ef1_ci = bootstrap_ci(avh_ef1)
+    avh_rf1_ci = bootstrap_ci(avh_rf1)
+    ih_ef1_ci  = bootstrap_ci(ih_ef1)
+    ih_rf1_ci  = bootstrap_ci(ih_rf1)
+
+    entity_f1_p = two_sample_bootstrap_p(avh_ef1, ih_ef1)
+    relation_f1_p = two_sample_bootstrap_p(avh_rf1, ih_rf1)
+
     return {
         "n_sentences": len(agent_records),
         "n_matched": len({s["sentence"] for s in agent_vs_human_scores}),
@@ -397,12 +434,21 @@ def evaluate_agent_vs_humans(
             "mean_entity_precision": _avg(agent_vs_human_scores, "entity_precision"),
             "mean_entity_recall": _avg(agent_vs_human_scores, "entity_recall"),
             "mean_relation_f1": _avg(agent_vs_human_scores, "relation_f1"),
+            "entity_f1_ci95": list(avh_ef1_ci),
+            "relation_f1_ci95": list(avh_rf1_ci),
             "per_sentence": agent_vs_human_scores,
         },
         "inter_human": {
             "mean_entity_f1": _avg(inter_human_scores, "entity_f1"),
             "mean_relation_f1": _avg(inter_human_scores, "relation_f1"),
+            "entity_f1_ci95": list(ih_ef1_ci),
+            "relation_f1_ci95": list(ih_rf1_ci),
             "per_pair": inter_human_scores,
+        },
+        "significance": {
+            "entity_f1_p_value": entity_f1_p,
+            "relation_f1_p_value": relation_f1_p,
+            "note": "Two-sided permutation test: H0 = agent and inter-human F1 are equal.",
         },
         "per_type_agent_f1": {
             t: sum(v) / len(v) if v else 0.0
@@ -445,16 +491,23 @@ def main():
 
     avh = results["agent_vs_human"]
     ih = results["inter_human"]
-    print(f"\n  Agent vs Human (mean):")
+    sig = results["significance"]
+    print(f"\n  Agent vs Human (mean ± 95 % bootstrap CI):")
     print(f"    Entity P/R/F1:  {avh['mean_entity_precision']:.3f} / "
-          f"{avh['mean_entity_recall']:.3f} / {avh['mean_entity_f1']:.3f}")
-    print(f"    Relation F1:    {avh['mean_relation_f1']:.3f}")
-    print(f"\n  Inter-Human (mean):")
-    print(f"    Entity F1:      {ih['mean_entity_f1']:.3f}")
-    print(f"    Relation F1:    {ih['mean_relation_f1']:.3f}")
+          f"{avh['mean_entity_recall']:.3f} / {avh['mean_entity_f1']:.3f} "
+          f"  CI {fmt_ci(*avh['entity_f1_ci95'])}")
+    print(f"    Relation F1:    {avh['mean_relation_f1']:.3f} "
+          f"  CI {fmt_ci(*avh['relation_f1_ci95'])}")
+    print(f"\n  Inter-Human (mean ± 95 % bootstrap CI):")
+    print(f"    Entity F1:      {ih['mean_entity_f1']:.3f} "
+          f"  CI {fmt_ci(*ih['entity_f1_ci95'])}")
+    print(f"    Relation F1:    {ih['mean_relation_f1']:.3f} "
+          f"  CI {fmt_ci(*ih['relation_f1_ci95'])}")
 
     gap = avh["mean_entity_f1"] - ih["mean_entity_f1"]
     print(f"\n  Gap (agent − human): {gap:+.3f} entity F1")
+    print(f"    Significance (entity F1):   p = {fmt_p(sig['entity_f1_p_value'])}")
+    print(f"    Significance (relation F1): p = {fmt_p(sig['relation_f1_p_value'])}")
 
     print(f"\n  Per-type entity F1 (agent | human):")
     all_types = sorted(set(results["per_type_agent_f1"]) | set(results["per_type_human_f1"]))
@@ -473,6 +526,7 @@ def main():
         summary["inter_human_summary"] = {
             k: v for k, v in ih.items() if k != "per_pair"
         }
+        summary["significance"] = results["significance"]
         with args.output.open("w") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
