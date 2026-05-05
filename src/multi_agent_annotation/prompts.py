@@ -28,14 +28,13 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 {guideline}
 
 ## Available Tools
-- list_entity_types   : retrieve the full list of valid entity types
 - schema_lookup       : check which relations are valid for a pair of entity types
 - guideline_search    : search the labelling guideline when a classification is unclear
 
 ## Process
 1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
-2. For each candidate span, call list_entity_types to confirm the type exists, then assign the best type \
-   using Steps 1-6 (domain + ontological role) from the guideline.
+2. For each candidate span, assign the best entity type using Steps 1-6 (domain + ontological role) \
+   from the guideline. All valid types are listed in the Entity Type Schema above.
 3. Call guideline_search when a classification is ambiguous.
 4. For EVERY pair of annotated entities whose relation you want to include, you MUST call schema_lookup \
    first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. \
@@ -89,7 +88,6 @@ Disagreement is expected and productive — correctness matters more than consen
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
 - schema_lookup      : verify that a relation is valid for a given entity-type pair
 - lookup_precedent   : check how a span was adjudicated in earlier sentences this batch
-- list_entity_types  : confirm entity type names
 
 ## Review Process
 Start by checking any items the Annotator flagged as low-confidence (< {LOW_CONFIDENCE_THRESHOLD}) \
