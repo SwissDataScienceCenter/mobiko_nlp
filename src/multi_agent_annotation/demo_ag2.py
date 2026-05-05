@@ -43,6 +43,7 @@ from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIOD
 import src.multi_agent_annotation.multi_agent_annotation_ag2 as _ann_mod
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     MultiAgentAnnotator,
+    DeliberationRecord,
     analyze_disagreements,
     load_schema,
     load_seeds,
@@ -51,6 +52,7 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     _init_tool_state,
     _DEFAULT_DECISION_SUPPORT,
     _DEFAULT_GUIDELINE,
+    _fill_char_offsets,
     schema_lookup,
     guideline_search,
     consistency_check,
@@ -62,19 +64,48 @@ DEMO_SENTENCES = [
     "However, the limited information on the effects of overexploitation on the current status and community composition of wildlife hinders effective conservation efforts, including the implementation of targeted patrols to reduce snaring.",
     "Finally, we used a dissimilarity index to assess the level of defaunation, revealing 16% of the community had been lost, with higher levels of defaunation for threatened and larger-sized species.",
     "Our findings provide insights into the status, distribution, and occurrence of the ground-dwelling mammal and bird communities in the Langbian Plateau, and can help stakeholders design more effective conservation strategies to protect existing populations.",
-    """Study site
+    """[methods]
+2.1 Study site
 We surveyed four contiguous protected areas in the core forest area of the southern Annamites: Bidoup—Nui Ba National Park, Phuoc Binh National Park, Da Nhim Protection Forest, and Dran Protection Forest (Figure 1).""",
     "Historically, Bidoup—Nui Ba and Phuoc Binh National Park were a part of the Thuong Da Nhim Nature Reserve established in 1986 (Eames, 1995), but in 1992 the two areas were split into two forest units and managed separately (Southern Institute of Ecology, 2017).",
     "Da Nhim and Dran forests were also managed under a single administration authority from 1987 (Eames, 1995), but separated into two protection forests in the late 1990s, in which timber extraction and wildlife exploitation are not completely prohibited (Law on Forestry, 2017).",
     "However, precipitation is unevenly distributed within the study sites due to the rain shadow effect, and this, combined with differences in soil type, contribute to two major habitat types: broadleaf evergreen forest and coniferous forest (Nguyen, 1966; Rundel, 1999).",
     "The eastern and western slopes of Bidoup Nui Ba National Park, and the majority of Phuoc Binh National Park, receive high levels of rainfall and are dominated by evergreen broadleaf forests.",
     "In total, we set up 157 stations spanning all four protected areas and both main habitat types (Table 1, Figure 1).",
-    "The vast majority (96.6%) of insects collected from emergence traps were Diptera (flies), while 0.8% were Trichoptera (caddisflies) and Ephemeroptera (mayflies)."
-    "While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest)."
+    "The vast majority (96.6%) of insects collected from emergence traps were Diptera (flies), while 0.8% were Trichoptera (caddisflies) and Ephemeroptera (mayflies).",
+    "While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest).",
     "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
     "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
     "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
 ]
+
+
+def run_fix_offsets(output_path: Path) -> None:
+    """Load an existing JSONL, fill any null start/end offsets, rewrite in place."""
+    if not output_path.exists():
+        print(f"[ERROR] File not found: {output_path}")
+        sys.exit(1)
+
+    records = []
+    for line in output_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                records.append(DeliberationRecord.model_validate_json(line))
+            except Exception as e:
+                print(f"[WARN] Skipping malformed line: {e}")
+
+    n_fixed = 0
+    for rec in records:
+        if _fill_char_offsets(rec.sentence, rec.final_entities, rec.final_relations):
+            n_fixed += 1
+
+    with output_path.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(rec.model_dump_json() + "\n")
+
+    print(f"Processed {len(records)} record(s); filled offsets in {n_fixed}.")
+    print(f"Written to: {output_path}")
 
 
 def run_dry(schema_path: Path, seeds_path: Path, guideline_search_backend: str = "embedding") -> None:
@@ -218,6 +249,11 @@ def main() -> None:
         help="Load resources and run tool tests without LLM calls.",
     )
     parser.add_argument(
+        "--fix-offsets", action="store_true",
+        help="Fill null start/end positions in an existing output JSONL and exit. "
+             "Requires --output to point to the file to fix.",
+    )
+    parser.add_argument(
         "--schema", type=Path,
         help="Path to relation schema .py or .json file.",
     )
@@ -277,6 +313,10 @@ def main() -> None:
              "Increase this if you see 504 Gateway Timeout errors.",
     )
     args = parser.parse_args()
+
+    if args.fix_offsets:
+        run_fix_offsets(args.output)
+        return
 
     schema_path = args.schema.resolve()
     seeds_path  = args.seeds.resolve()

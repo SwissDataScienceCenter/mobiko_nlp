@@ -749,7 +749,6 @@ def lookup_precedent(
 
 # Tools focused on proposing comprehensive annotations (entity + relation coverage)
 ANNOTATOR_TOOL_FUNCTIONS = [
-    (list_entity_types, "List all valid entity types from the schema."),
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
     (lookup_precedent, "Look up how a span was annotated and adjudicated in earlier sentences."),
@@ -760,7 +759,6 @@ CRITIC_TOOL_FUNCTIONS = [
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
     (lookup_precedent, "Look up how a span was adjudicated in earlier sentences this batch."),
-    (list_entity_types, "List all valid entity types from the schema."),
 ]
 
 
@@ -1269,6 +1267,153 @@ class PrecedentStore:
         return store
 
 
+# ─────────────────────────────────────────────────────────────
+# Character offset resolution
+# ─────────────────────────────────────────────────────────────
+
+def _fill_char_offsets(
+    sentence: str,
+    entities: List[EntityAnnotation],
+    relations: List[RelationAnnotation],
+) -> bool:
+    """
+    Fill start/end character offsets in-place for entities that are missing them.
+
+    Uses a three-pass strategy:
+      1. Trivial: entity text appears exactly once → assign directly.
+      2. Relation-guided: for entities with multiple occurrences, use the
+         position of an already-resolved relation partner to pick the nearest
+         occurrence.  Iterates until stable.
+      3. Fallback: any remaining unresolved entity gets its first occurrence.
+
+    Entity texts that cannot be located in the sentence are left with
+    start/end = None and a debug log message is emitted.
+
+    Also syncs the resolved positions into e1/e2 inside each RelationAnnotation.
+
+    Returns True if at least one offset was filled.
+    """
+    if not entities:
+        return False
+
+    sent_lower = re.sub(r"\s+", " ", sentence.lower())
+
+    def _norm(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+    def _key(ent: EntityAnnotation) -> Tuple[str, str]:
+        return (_norm(ent.text), ent.entity_type.strip().upper())
+
+    # Step 1: collect all occurrences of each entity text in the sentence
+    # Map normalised span text → list of (start, end) in the *original* sentence
+    occurrence_map: Dict[str, List[Tuple[int, int]]] = {}
+    for ent in entities:
+        span_norm = _norm(ent.text)
+        if span_norm in occurrence_map:
+            continue
+        original_span = (ent.text or "").strip()
+        matches = []
+        for m in re.finditer(re.escape(span_norm), sent_lower):
+            matches.append((m.start(), m.start() + len(original_span)))
+        occurrence_map[span_norm] = matches
+
+    changed = False
+
+    def _assign(ent: EntityAnnotation, start: int, end: int) -> None:
+        nonlocal changed
+        ent.start = start
+        ent.end = end
+        changed = True
+
+    # Step 2: trivially resolved (exactly one occurrence)
+    for ent in entities:
+        if ent.start is not None:
+            continue
+        occ = occurrence_map.get(_norm(ent.text), [])
+        if len(occ) == 1:
+            _assign(ent, occ[0][0], occ[0][1])
+        elif not occ:
+            logger.debug("Could not locate span %r in sentence", ent.text)
+
+    # Step 3: relation-guided disambiguation, iterate until stable
+    def _midpoint(ent: EntityAnnotation) -> Optional[float]:
+        if ent.start is not None and ent.end is not None:
+            return (ent.start + ent.end) / 2.0
+        return None
+
+    for _ in range(len(entities)):  # at most len(entities) passes
+        progress = False
+        for ent in entities:
+            if ent.start is not None:
+                continue
+            occ = occurrence_map.get(_norm(ent.text), [])
+            if len(occ) <= 1:
+                continue
+
+            # Find relations that reference this entity
+            best_start: Optional[int] = None
+            best_end: Optional[int] = None
+            best_dist = float("inf")
+            ent_key = _key(ent)
+
+            for rel in relations:
+                partner: Optional[EntityAnnotation] = None
+                if _key(rel.e1) == ent_key:
+                    partner = rel.e2
+                elif _key(rel.e2) == ent_key:
+                    partner = rel.e1
+
+                if partner is None:
+                    continue
+                partner_mid = _midpoint(partner)
+                if partner_mid is None:
+                    continue
+
+                # Find the occurrence closest to the resolved partner
+                for (s, e) in occ:
+                    dist = abs((s + e) / 2.0 - partner_mid)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_start, best_end = s, e
+
+            if best_start is not None:
+                _assign(ent, best_start, best_end)
+                progress = True
+
+        if not progress:
+            break
+
+    # Step 4: fallback — first occurrence for anything still unresolved
+    for ent in entities:
+        if ent.start is not None:
+            continue
+        occ = occurrence_map.get(_norm(ent.text), [])
+        if occ:
+            _assign(ent, occ[0][0], occ[0][1])
+
+    # Step 5: sync offsets into relation e1/e2
+    # Build a lookup: (norm_text, norm_type) → lowest-start EntityAnnotation
+    resolved: Dict[Tuple[str, str], EntityAnnotation] = {}
+    for ent in entities:
+        if ent.start is None:
+            continue
+        k = _key(ent)
+        if k not in resolved or ent.start < resolved[k].start:
+            resolved[k] = ent
+
+    for rel in relations:
+        for slot in (rel.e1, rel.e2):
+            if slot.start is not None:
+                continue
+            anchor = resolved.get(_key(slot))
+            if anchor is not None:
+                slot.start = anchor.start
+                slot.end = anchor.end
+                changed = True
+
+    return changed
+
+
 class MultiAgentAnnotator:
     """
     AG2-based multi-agent annotation system.
@@ -1665,6 +1810,7 @@ class MultiAgentAnnotator:
         record.final_relations = [
             r.to_relation_annotation() for r in constrained.final_relations
         ]
+        _fill_char_offsets(sentence, record.final_entities, record.final_relations)
         record.flagged_for_human_review = constrained.flagged_for_human_review
         record.adjudication_status = constrained.status
         record.adjudication_audit = constrained.audit
@@ -1818,6 +1964,19 @@ class MultiAgentAnnotator:
                 logger.info(
                     "Resume: %d sentence(s) already done — skipping.", len(done_sentences)
                 )
+            # Retroactively fill any null offsets in already-completed records
+            n_fixed = sum(
+                1 for rec in records
+                if _fill_char_offsets(rec.sentence, rec.final_entities, rec.final_relations)
+            )
+            if n_fixed and output_path:
+                logger.info(
+                    "Resume: filled missing offsets in %d record(s) — rewriting output file.",
+                    n_fixed,
+                )
+                with Path(output_path).open("w", encoding="utf-8") as _f:
+                    for rec in records:
+                        _f.write(rec.model_dump_json() + "\n")
         elif output_path:
             Path(output_path).write_text("", encoding="utf-8")
 
