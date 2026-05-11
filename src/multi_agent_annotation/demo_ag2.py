@@ -75,7 +75,6 @@ We surveyed four contiguous protected areas in the core forest area of the south
     "The vast majority (96.6%) of insects collected from emergence traps were Diptera (flies), while 0.8% were Trichoptera (caddisflies) and Ephemeroptera (mayflies).",
     "While our work confirms prior findings that predator presence drives strong reductions in insect emergence, we find that the effects of predation are significantly weaker in warmer lakes (2% reduction in warmest lakes studied vs. 75% reduction in coldest).",
     "In high-income countries, food insecurity is more commonly characterised by chronic compromises in dietary quality and anxiety associated with accessing food.",
-    "Accordingly, the species might have niche segregation, as they are species specific, showing annual and inter-annual variability in total consumption of the different prey species.",
     "The Hainan gibbon, Nomascus hainanus (Thomas), is the world’s rarest ape and one of world’s most endangered mammal species (Bryant et al. 2015; Geissmann and Bleisch 2008; Stone 2011; Zhou et al. 2005)",
 ]
 
@@ -213,6 +212,7 @@ def run_live(
     resume: bool = False,
     max_retries: int = 2,
     request_timeout: int = 600,
+    strict_critic: bool = False,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -228,6 +228,7 @@ def run_live(
         guideline_search_backend=guideline_search_backend,
         use_precedent_memory=use_precedent_memory,
         request_timeout=request_timeout,
+        strict_critic=strict_critic,
     )
 
     records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume, max_retries=max_retries)
@@ -298,6 +299,12 @@ def main() -> None:
         help="Disable cross-sentence precedent memory (lookup_precedent tool not registered).",
     )
     parser.add_argument(
+        "--strict-critic", action="store_true",
+        help="Use the strict Critic mode: more aggressive challenge posture, "
+             "missing spans checked first, low-confidence items forced into disagreements, "
+             "and temperature=0.5 (vs default 0.3). Default Critic mode is unchanged.",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="Skip sentences already present in the output file and append new results.",
     )
@@ -340,6 +347,7 @@ def main() -> None:
             resume=args.resume,
             max_retries=args.max_retries,
             request_timeout=args.timeout,
+            strict_critic=args.strict_critic,
         )
 
 

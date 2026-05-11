@@ -33,7 +33,7 @@ from typing import Annotated, Dict, List, Optional, Tuple, Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from prompts import _annotator_system_msg, _critic_system_msg, _adjudicator_system_msg, _build_guideline_summary, LOW_CONFIDENCE_THRESHOLD
+from prompts import _annotator_system_msg, _critic_system_msg, _critic_system_msg_strict, _adjudicator_system_msg, _build_guideline_summary, LOW_CONFIDENCE_THRESHOLD
 
 from autogen import (
     ConversableAgent,
@@ -1461,6 +1461,7 @@ class MultiAgentAnnotator:
         precedent_store_path: Optional[Path] = None,
         use_precedent_memory: bool = True,
         request_timeout: int = 600,
+        strict_critic: bool = False,
     ):
         self.max_rounds = max_rounds
         self.use_precedent_memory = use_precedent_memory
@@ -1522,11 +1523,13 @@ class MultiAgentAnnotator:
 
         # ── Build LLM configs ────────────────────────────────
         annotator_llm = build_llm_config(annotator_model, temperature=0.2, timeout=request_timeout)
-        critic_llm = build_llm_config(critic_model, temperature=0.3, timeout=request_timeout)
+        critic_temperature = 0.5 if strict_critic else 0.3
+        critic_llm = build_llm_config(critic_model, temperature=critic_temperature, timeout=request_timeout)
         adjudicator_llm = build_llm_config(adjudicator_model, temperature=0.1, timeout=request_timeout)
+        critic_mode_label = "strict" if strict_critic else "default"
         logger.info(
             f"Models — annotator: {annotator_model} | "
-            f"critic: {critic_model} | "
+            f"critic: {critic_model} (mode={critic_mode_label}, t={critic_temperature}) | "
             f"adjudicator: {adjudicator_model}"
         )
 
@@ -1539,9 +1542,10 @@ class MultiAgentAnnotator:
             is_termination_msg=_is_final_terminate_msg,
         )
 
+        _critic_prompt_fn = _critic_system_msg_strict if strict_critic else _critic_system_msg
         self.critic = ConversableAgent(
             name="Critic",
-            system_message=_critic_system_msg(critic_guideline, entity_schema_str, relation_schema),
+            system_message=_critic_prompt_fn(critic_guideline, entity_schema_str, relation_schema),
             llm_config=critic_llm,
             human_input_mode="NEVER",
             is_termination_msg=_is_final_terminate_msg,
