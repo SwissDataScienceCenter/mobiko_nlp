@@ -5,6 +5,7 @@ import os, datetime, tempfile, re
 import io
 import streamlit.components.v1 as components
 import streamlit as st
+from relation_annotation_page import render_relation_page
 
 # ---------- Persist options defaults ----------
 
@@ -604,7 +605,13 @@ MAX_SNAPSHOTS = 50
 st.set_page_config(page_title="BioNER Annotation", layout="wide")
 st.title("BioNER Annotation")
 
-# --- Minimal input (single JSONL uploader) ---
+mode = st.sidebar.radio("Annotation mode", ["NER", "Relations"], index=0)
+
+if mode == "Relations":
+    render_relation_page()
+    st.stop()
+
+# --- NER: Minimal input (single JSONL uploader) ---
 st.markdown("### Input")
 
 pred_up = st.file_uploader("Upload JSONL for annotation (required)", type=["jsonl"])

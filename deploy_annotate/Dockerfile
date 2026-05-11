@@ -35,6 +35,8 @@ COPY requirements.txt /app/
 RUN python -m pip install --no-cache-dir -r /app/requirements.txt
 
 COPY streamlit_app_annotate.py /app/
+COPY relation_annotation_page.py /app/
+
 
 RUN rm -f /etc/nginx/conf.d/default.conf
 
