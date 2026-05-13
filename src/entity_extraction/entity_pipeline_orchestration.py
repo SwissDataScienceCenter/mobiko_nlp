@@ -573,27 +573,32 @@ def main():
                             llm_results = call_llm_batch_two_path(llm, args.model_type, args.few_shot,
                                                                   candidate_results,
                                                                   lock_over_iou=args.lock_iou_thr,
-                                                                  decoding=dec, gaz_lock=args.gaz_locked)
+                                                                  decoding=dec, gaz_lock=args.gaz_locked,
+                                                                  max_workers=args.max_workers)
                         elif cond == "C1":
                             llm_results = run_C1_vanilla(llm, args.model_type, args.few_shot,
                                                          candidate_results, T=args.passes,
                                                          lock_over_iou=args.lock_iou_thr,
-                                                         gaz_lock=args.gaz_locked)
+                                                         gaz_lock=args.gaz_locked,
+                                                         max_workers=args.max_workers)
                         elif cond == "C2":
                             llm_results = run_C2_diverse(llm, args.model_type, args.few_shot,
                                                          candidate_results, T=args.passes,
                                                          lock_over_iou=args.lock_iou_thr,
-                                                         gaz_lock=args.gaz_locked)
+                                                         gaz_lock=args.gaz_locked,
+                                                         max_workers=args.max_workers)
                         elif cond == "C3":
                             llm_results = run_C3_critique_revise(llm, args.model_type, args.few_shot,
                                                                  candidate_results, T=args.passes,
                                                                  lock_over_iou=args.lock_iou_thr,
-                                                                 gaz_lock=args.gaz_locked)
+                                                                 gaz_lock=args.gaz_locked,
+                                                                 max_workers=args.max_workers)
                         elif cond == "C4":
                             llm_results = run_C4_self_consistency(llm, args.model_type, args.few_shot,
                                                                   candidate_results, K=args.samples_k,
                                                                   lock_over_iou=args.lock_iou_thr,
-                                                                  gaz_lock=args.gaz_locked)
+                                                                  gaz_lock=args.gaz_locked,
+                                                                  max_workers=args.max_workers)
                         else:
                             raise ValueError(f"Unknown --llm_condition {cond}")
 

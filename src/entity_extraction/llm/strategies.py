@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 import regex as re
 from collections import Counter
@@ -143,53 +144,30 @@ def call_llm_batch(
         few_shot: bool,
         requests: List[Dict],
         decoding: Optional[Dict[str, Any]] = None,
+        max_workers: int = 4,
 ) -> List[Dict]:
-    """Process multiple LLM requests efficiently."""
-    results = []
-
+    """Process multiple LLM requests in parallel (I/O-bound, thread-safe)."""
     decoding = decoding or {}
     temperature = float(decoding.get("temperature", 0.7))
     top_p = float(decoding.get("top_p", 0.95))
     presence_penalty = float(decoding.get("presence_penalty", 0.0))
 
-
-    # Configure model-specific parameters
     if model_type in ["qwen3-32B", "gpt4o", "qwen3-32B-vllm", "qwen3-35B-vllm"]:
         max_tokens = 1024
     else:
         max_tokens = 500
 
-
-    for req in requests:
+    def _process_one(req: Dict) -> Dict:
         sentence = req["sentence"]
         candidates = req.get("candidates")
-
 
         if candidates is None:
             system_prompt = NO_CHUNK_CANDIDATE_SYSTEM_PROMPT
             user_payload = {"sentence": sentence}
         else:
-            # # Determine whether candidates include NER-proposed types
-            # has_types = any("type" in c and c["type"] for c in candidates)
-            # if has_types:
-            #     # NER-aware path: include proposed_type
-            #     system_prompt = NER_AWARE_SYSTEM_PROMPT
-            #     cand_objs = []
-            #     for c in candidates:
-            #         obj = {
-            #             "text": c["text"].strip(),
-            #             "start_char": c["start_char"],
-            #             "end_char": c["end_char"],
-            #             "proposed_type": c.get("type", None)
-            #         }
-            #         cand_objs.append(obj)
-            #     user_payload = {"sentence": sentence, "candidates": cand_objs}
-            # else:
             if few_shot:
-                system_prompt = SYSTEM_PROMPT_FEW_SHOT # try new schema
-                # system_prompt = SYSTEM_PROMPT_FEW_SHOT_NEW
+                system_prompt = SYSTEM_PROMPT_FEW_SHOT
             else:
-                # Legacy chunks path: no types proposed
                 system_prompt = DEFAULT_SYSTEM_PROMPT_NEW
             cand_objs = [
                 {"text": c["text"].strip(), "start_char": c["start_char"], "end_char": c["end_char"]}
@@ -197,8 +175,6 @@ def call_llm_batch(
             ]
             user_payload = {"sentence": sentence, "candidates": cand_objs}
 
-
-        # Modify system prompt for Qwen 32B
         if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
 
@@ -206,38 +182,33 @@ def call_llm_batch(
 
         try:
             print(f'Sending LLM request for sentence: {sentence[:50]}... with {len(candidates) if candidates else 0} candidates')
-
-            # if candidates and len(candidates) >= 10:
-            #     print(full_prompt)
             content = client.call(
                 messages=[{"role": "user", "content": full_prompt}],
                 temperature=temperature,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
-                timeout=800
-
+                timeout=800,
             )
             print('LLM response received.')
-            # print(content)
             llm_result = safe_json_from_llm(content, kind="extract")
-
-            # Fix indices for all span categories
             for category in ["accepted", "missing", "rejected"]:
                 if category in llm_result:
                     llm_result[category] = fix_span_indices(
                         llm_result[category], sentence, candidates)
-
-            results.append(llm_result)
-
+            return llm_result
         except Exception as e:
             print(f"Error calling LLM for sentence: {sentence[:50]}...: {e}")
-            results.append({
+            return {
                 "accepted": [], "rejected": [], "missing": [],
                 "notes": f"llm_error: {repr(e)}"
-            })
+            }
 
-    return results
+    if max_workers <= 1 or len(requests) <= 1:
+        return [_process_one(req) for req in requests]
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(requests))) as executor:
+        return list(executor.map(_process_one, requests))
 
 
 def call_llm_batch_two_path(
@@ -248,6 +219,7 @@ def call_llm_batch_two_path(
     lock_over_iou: float = 0.5,
     decoding: Optional[Dict[str, Any]] = None,
     gaz_lock: bool = False,
+    max_workers: int = 4,
 ) -> List[Dict]:
     """
     Two-path inference:
@@ -307,7 +279,7 @@ def call_llm_batch_two_path(
         per_req_locked.append({"locked": lock_accepteds, "locked_spans": locked_spans})
 
     # Call your existing batch function
-    llm_outs = call_llm_batch(client, model_type, few_shot, filtered_reqs, decoding)
+    llm_outs = call_llm_batch(client, model_type, few_shot, filtered_reqs, decoding, max_workers=max_workers)
 
     # Merge locked + llm_out, gaz wins on overlaps
     merged_outs: List[Dict] = []
@@ -359,66 +331,73 @@ def call_llm_batch_two_path(
     return merged_outs
 
 
-def call_llm_batch_revision(client, model_type, requests, temperature=0.3):
-    results = []
-    for req in requests:
-        system_prompt = """You are revising an earlier extraction.
+def call_llm_batch_revision(client, model_type, requests, temperature=0.3, max_workers: int = 4):
+    _system_prompt_base = """You are revising an earlier extraction.
         Return STRICT JSON:
         {"missing": ["type": ...,  "concept_text": ..., "uncertain": ..., "text": ...], "notes": "short rationale ≤160 chars"}
             Rules:
             - Consider the previous output AND the running notes.
             - DO NOT DELETE earlier accepted spans.
             - Only propose NEW or CORRECTED spans (no duplicates).
-            - Prefer precise boundaries; don't re-state identical spans.    
+            - Prefer precise boundaries; don't re-state identical spans.
             - Use the same TYPE schema as before.
             - If uncertain about a span, set "uncertain": true and explain briefly in notes.
             - "concept_text" is a canonical form of the entity text, it does not have to be in the sentence verbatim but should be clearly linked to the surface text.
             """
+
+    def _process_one(req: Dict) -> Dict:
+        system_prompt = _system_prompt_base
         payload = {"sentence": req["sentence"], "previous": req["prev_json"],
-                   "prev_notes": req.get("prev_notes", "")  # short running notes
-}
+                   "prev_notes": req.get("prev_notes", "")}
         if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
-
         content = client.call(
             messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
             temperature=temperature,
             max_tokens=512,
             timeout=360,
         )
-        obj = safe_json_from_llm(content, kind="extract")  # or kind="revision"
+        obj = safe_json_from_llm(content, kind="extract")
         obj["missing"] = fix_span_indices(obj.get("missing", []), req["sentence"])
-        results.append(obj)
-    return results
+        return obj
+
+    if max_workers <= 1 or len(requests) <= 1:
+        return [_process_one(req) for req in requests]
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(requests))) as executor:
+        return list(executor.map(_process_one, requests))
 
 
-def call_llm_batch_consolidate(client, model_type, requests):
-    results = []
-    for req in requests:
-        system_prompt = """Consolidate proposed spans.
+def call_llm_batch_consolidate(client, model_type, requests, max_workers: int = 4):
+    _system_prompt_base = """Consolidate proposed spans.
             Return STRICT JSON:
             {"accepted":[{"text":"...", "type":"...", "start_char":int, "end_char":int, "concept_text: ..., "uncertain": ...}], "rejected":[...], "missing":[], "notes":"optional"}
             Rules:
             - Merge overlapping duplicates; keep one with best boundaries.
             """
+
+    def _process_one(req: Dict) -> Dict:
+        system_prompt = _system_prompt_base
         payload = {"sentence": req["sentence"], "proposals": req["proposals"]}
         if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
-
         content = client.call(
             messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
             temperature=0.0,
             max_tokens=768,
-            timeout=360
+            timeout=360,
         )
-
         obj = json.loads(content)
-
         for k in ("accepted", "rejected"):
             obj[k] = fix_span_indices(obj.get(k, []), req["sentence"])
         obj["missing"] = []
-        results.append(obj)
-    return results
+        return obj
+
+    if max_workers <= 1 or len(requests) <= 1:
+        return [_process_one(req) for req in requests]
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(requests))) as executor:
+        return list(executor.map(_process_one, requests))
 
 
 def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
@@ -478,46 +457,40 @@ def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
 # === ADD: Multi-pass runners ===
 
 def run_C1_vanilla(client, model_type, few_shot, candidate_results, T: int = 3,
-        lock_over_iou: float = 0.5, gaz_lock: bool = False) -> List[Dict]:
+        lock_over_iou: float = 0.5, gaz_lock: bool = False, max_workers: int = 4) -> List[Dict]:
     """
     Vanilla multi-pass:
       P1: standard two-path call
       P2..T: 'revision' (missing-only) then consolidate
     """
-    # P1
     dec = _decoding_profile(1, "C1")
     p1 = call_llm_batch_two_path(client, model_type, few_shot,
-                                 candidate_results, lock_over_iou=lock_over_iou, decoding=dec, gaz_lock=gaz_lock)
+                                 candidate_results, lock_over_iou=lock_over_iou, decoding=dec,
+                                 gaz_lock=gaz_lock, max_workers=max_workers)
 
     if T == 1:
         return p1
 
-    # Build revision requests from P1
-    rev_reqs = []
-    for req, out in zip(candidate_results, p1):
-        rev_reqs.append({"sentence": req["sentence"], "prev_json": out})
+    rev_reqs = [{"sentence": req["sentence"], "prev_json": out}
+                for req, out in zip(candidate_results, p1)]
+    p2 = call_llm_batch_revision(client, model_type, rev_reqs, temperature=0.7, max_workers=max_workers)
 
-    p2 = call_llm_batch_revision(client, model_type, rev_reqs, temperature=0.7)
-
-    # Merge P1 accepted + P2 missing
     merged_after_p2 = []
     for o1, o2, req in zip(p1, p2, candidate_results):
         merged = merge_spans(o1.get("accepted", []), o2.get("missing", []), iou_thr=0.5)
         merged_after_p2.append({"sentence": req["sentence"], "accepted": merged})
 
-    # Consolidate (optional final pass if T>=3)
     if T >= 3:
         cons_requests = [{"sentence": m["sentence"], "proposals": m["accepted"]} for m in merged_after_p2]
-        p3 = call_llm_batch_consolidate(client, model_type, cons_requests)
+        p3 = call_llm_batch_consolidate(client, model_type, cons_requests, max_workers=max_workers)
         return p3
     else:
-        # fabricate consolidate-like structure
         return [{"accepted": m["accepted"], "rejected": [], "missing": [], "notes": "C1-P2"} for m in merged_after_p2]
 
 
 def run_C2_diverse(
     client, model_type, few_shot, candidate_results, T: int = 3,
-        lock_over_iou=0.5, gaz_lock: bool = True) -> List[Dict]:
+        lock_over_iou=0.5, gaz_lock: bool = True, max_workers: int = 4) -> List[Dict]:
     """
     Diversity-forced multi-pass: each pass uses a different decoding profile,
     aggregate with NMS-style consensus by type.
@@ -528,7 +501,7 @@ def run_C2_diverse(
         dec = _decoding_profile(t, "C2")
         out = call_llm_batch_two_path(client, model_type, few_shot,
                                       candidate_results, lock_over_iou=lock_over_iou,
-                                      decoding=dec, gaz_lock=gaz_lock)
+                                      decoding=dec, gaz_lock=gaz_lock, max_workers=max_workers)
         for i, o in enumerate(out):
             pass_accepteds_per_sent[i].append(o.get("accepted", []))
 
@@ -541,13 +514,12 @@ def run_C2_diverse(
 
 
 def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: int = 3,
-                           lock_over_iou: float = 0.5, gaz_lock: bool = True) -> List[Dict]:
-    # P1: normal two-path extraction (already returns {"accepted": [...], "notes": "..."} via safe_json_from_llm)
+                           lock_over_iou: float = 0.5, gaz_lock: bool = True, max_workers: int = 4) -> List[Dict]:
     dec = _decoding_profile(1, "C3")
     p = call_llm_batch_two_path(client, model_type, few_shot,
-                                candidate_results, lock_over_iou=lock_over_iou, decoding=dec, gaz_lock=gaz_lock)
+                                candidate_results, lock_over_iou=lock_over_iou, decoding=dec,
+                                gaz_lock=gaz_lock, max_workers=max_workers)
 
-    # Keep rolling state per sentence
     state = []
     for i, base in enumerate(p):
         state.append({
@@ -556,7 +528,6 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
             "notes": (base.get("notes") or "").strip()
         })
 
-    # P2..T-1: critique→revise with notes
     for t in range(2, max(2, T)):
         rev_reqs = []
         for s in state:
@@ -564,33 +535,24 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
             rev_reqs.append({
                 "sentence": s["sentence"],
                 "prev_json": prev_json,
-                "prev_notes": s["notes"]  # <<<<<< pass the rolling notes
+                "prev_notes": s["notes"],
             })
 
-        rev = call_llm_batch_revision(client, model_type, rev_reqs, temperature=0.9)
+        rev = call_llm_batch_revision(client, model_type, rev_reqs, temperature=0.9, max_workers=max_workers)
 
-        # union spans and append new notes
         for i, r in enumerate(rev):
             new_missing = r.get("missing", [])
             state[i]["accepted"] = merge_spans(state[i]["accepted"], new_missing, iou_thr=lock_over_iou)
             note_add = (r.get("notes") or "").strip()
             if note_add:
-                # keep notes compact but cumulative
                 if state[i]["notes"]:
                     state[i]["notes"] = (state[i]["notes"] + " | " + note_add)[:240]
                 else:
                     state[i]["notes"] = note_add[:240]
 
-    # Final consolidate pass can also see notes if you want (optional)
-    cons_requests = []
-    for s in state:
-        cons_requests.append({
-            "sentence": s["sentence"],
-            "proposals": s["accepted"],
-            # Optional: include notes so the consolidator can resolve conflicts
-            "prev_notes": s["notes"]
-        })
-    final = call_llm_batch_consolidate(client, model_type, cons_requests)
+    cons_requests = [{"sentence": s["sentence"], "proposals": s["accepted"], "prev_notes": s["notes"]}
+                     for s in state]
+    final = call_llm_batch_consolidate(client, model_type, cons_requests, max_workers=max_workers)
 
     # Preserve rolled notes into the final objects (for logging/analysis)
     for i, obj in enumerate(final):
@@ -605,13 +567,13 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
 
 
 def run_C4_self_consistency(
-    client, model_type, few_shot, candidate_results, K: int = 5, lock_over_iou = 0.5, gaz_lock: bool = True
+    client, model_type, few_shot, candidate_results, K: int = 5, lock_over_iou = 0.5,
+    gaz_lock: bool = True, max_workers: int = 4,
 ) -> List[Dict]:
     """
     Self-consistency in one pass: sample K independent outputs, then consensus merge.
     """
     samples_per_sent = [[] for _ in candidate_results]
-    # Use a small diverse grid across K
     grid = [
         dict(temperature=0.3, top_p=0.90, presence_penalty=0.0),
         dict(temperature=0.6, top_p=0.95, presence_penalty=0.7),
@@ -620,7 +582,8 @@ def run_C4_self_consistency(
     for k in range(K):
         dec = grid[k % len(grid)]
         out = call_llm_batch_two_path(client, model_type, few_shot,
-                                      candidate_results, lock_over_iou=0.5, decoding=dec, gaz_lock=gaz_lock)
+                                      candidate_results, lock_over_iou=0.5, decoding=dec,
+                                      gaz_lock=gaz_lock, max_workers=max_workers)
         for i, o in enumerate(out):
             samples_per_sent[i].append(o.get("accepted", []))
 
