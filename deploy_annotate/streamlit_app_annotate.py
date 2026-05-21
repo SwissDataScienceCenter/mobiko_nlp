@@ -202,30 +202,15 @@ def _maybe_autosave():
     if not st.session_state.get("autosave", True):
         return
 
-    # Validate & repair all sentences before export
-    any_mismatch = False
-    repaired = {}
-    for (doc, idx2), spans in st.session_state.aug_gold.items():
-        text_here = extract_text(gold.get((doc,idx2), []) or model.get((doc,idx2), []))
-        fixed, mism = enforce_text_consistency(spans, text_here, repair=True)
-        if mism:
-            any_mismatch = True
-        repaired[(doc, idx2)] = fixed
-    if any_mismatch:
-        st.info("Some spans had mismatched 'text' vs indices; corrected before save.")
-    st.session_state.aug_gold.update(repaired)
-
+    st.session_state.export_dirty = True
     payload = export_augmented_jsonl()
 
     run_path, latest_path = _current_paths()
     if not run_path or not latest_path:
         return
 
-    # 1) Write to this session's RUN_PATH
     _atomic_write(payload, run_path)
-    # 2) Update the rolling latest pointer
     _atomic_write(payload, latest_path)
-    # 3) Prune old snapshots
     _prune_snapshots(os.path.dirname(run_path))
 
 
@@ -609,6 +594,17 @@ if "run_id" not in st.session_state:
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     st.session_state.run_id = f"{ts}-{uuid.uuid4().hex[:6]}"
 
+if "export_dirty" not in st.session_state:
+    st.session_state.export_dirty = True
+
+
+def _cached_export() -> str:
+    """Return serialised JSONL, regenerating only when aug_gold has changed."""
+    if st.session_state.get("export_dirty", True):
+        st.session_state.export_cache = export_augmented_jsonl()
+        st.session_state.export_dirty = False
+    return st.session_state.export_cache
+
 
 MAX_SNAPSHOTS = 50
 
@@ -642,6 +638,9 @@ merge_thr = 0.8
 
 if pred_up is not None:
     if st.session_state.get("upload_name") != pred_up.name:
+        # Evict stale model cache for the previous file
+        old_cache = f"_model_{st.session_state.get('upload_name', '')}"
+        st.session_state.pop(old_cache, None)
         st.session_state.upload_name = pred_up.name
         upload_dir = os.path.join(SAVE_DIR, _safe_dirname(pred_up.name))
         st.session_state.upload_dir = upload_dir
@@ -652,7 +651,10 @@ if pred_up is not None:
 def _load_sets():
     model = None
     if pred_up is not None:
-        model = load_jsonl_grouped(pred_up)
+        cache_key = f"_model_{pred_up.name}"
+        if cache_key not in st.session_state:
+            st.session_state[cache_key] = load_jsonl_grouped(pred_up)
+        model = st.session_state[cache_key]
     gold = {}
     return gold, model
 
@@ -1040,7 +1042,7 @@ if run_path and latest_path:
 else:
     st.caption("Autosave: waiting for an uploaded JSONL file.")
 
-aug_jsonl = export_augmented_jsonl()
+aug_jsonl = _cached_export()
 
 st.download_button(
     f"Download augmented_gold ({st.session_state.run_id}).jsonl",
