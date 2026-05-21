@@ -16,14 +16,12 @@ CUSTOM = "(custom)"
 
 
 SCHEMA_TYPES_SHORT_TO_TEST = [
-    "ABIOTIC COLLECTIVE ENTITY",
     "ABIOTIC ENTITY",
     "ABIOTIC PROCESS",
     "ABIOTIC PROPERTY",
     "ANTHROPOGENIC ENTITY",
     "ANTHROPOGENIC PROCESS",
     "ANTHROPOGENIC PROPERTY",
-    "BIOTIC COLLECTIVE ENTITY",
     "BIOTIC ENTITY",
     "BIOTIC PROCESS",
     "BIOTIC PROPERTY",
@@ -31,7 +29,9 @@ SCHEMA_TYPES_SHORT_TO_TEST = [
     "SPATIAL ENTITY",
     "SPATIAL PROPERTY",
     "TEMPORAL ENTITY",
-    "TEMPORAL PROPERTY"
+    "TEMPORAL PROPERTY",
+    "QUALITATIVE PROPERTY",
+    "QUANTITATIVE PROPERTY",
 ]
 
 
@@ -499,11 +499,15 @@ def enforce_text_consistency(spans: list[dict], text: str, *, repair: bool = Tru
     Ensure span['text'] == text[start:end].
     If repair=True, overwrite 'text' to match indices and clamp indices to text bounds.
     Returns (fixed_spans, mismatches_list) where each mismatch is {'uid', 'was', 'now', 'a', 'b'}.
+    Virtual spans (virtual=True) are passed through unchanged.
     """
     fixed = []
     mismatches = []
     n = len(text)
     for s in spans:
+        if s.get("virtual"):
+            fixed.append(s)
+            continue
         a = max(0, min(n, int(s.get("start_char", 0))))
         b = max(0, min(n, int(s.get("end_char", 0))))
         if b < a:
@@ -523,7 +527,10 @@ def dedup_exact(spans: list[dict]) -> list[dict]:
     seen = set()
     out  = []
     for s in spans:
-        key = (int(s["start_char"]), int(s["end_char"]), s.get("type",""))
+        if s.get("virtual"):
+            key = (-1, -1, s.get("type",""), s.get("text",""))
+        else:
+            key = (int(s["start_char"]), int(s["end_char"]), s.get("type",""))
         if key in seen:
             continue
         seen.add(key)
@@ -546,12 +553,15 @@ def merge_span_into_gold(gold_spans: list[dict], new_span: dict,
                          metric="dice", thr=0.8, do_merge=True, text: str | None = None) -> list[dict]:
     """Merge new_span; preserve UIDs on existing spans; if we merge INTO an existing span, keep that span's UID."""
     ns = {
-        "start_char": int(new_span["start_char"]),
-        "end_char":   int(new_span["end_char"]),
+        "start_char": int(new_span.get("start_char", -1)),
+        "end_char":   int(new_span.get("end_char", -1)),
         "type":       new_span.get("type",""),
         "uid":        new_span.get("uid") or _uid(),  # new uid if truly new
     }
-    if not do_merge:
+    if new_span.get("virtual"):
+        ns["virtual"] = True
+        ns["text"] = new_span.get("text", "")
+    if not do_merge or new_span.get("virtual"):
         return dedup_exact(ensure_uids(gold_spans + [ns]))
 
     out = []
@@ -838,42 +848,63 @@ with colA:
         if lab == CUSTOM:
             lab = st.text_input("Custom label", value="", key=f"{keyroot}_add_lab_custom")
 
-        q_key = f"{keyroot}_add_q_{st.session_state[ver_key]}"
-        q = st.text_input("Exact text to add (case-sensitive substring)", key=q_key)
-        matches = _find_occurrences(text, q) if q else []
-        if matches:
-            pick = st.selectbox(
-                "Choose occurrence (shows local context)",
-                options=list(range(len(matches))),
-                format_func=lambda k: matches[k]["preview"],
-                key=f"{keyroot}_add_pick"
+        is_virtual = st.checkbox(
+            "Virtual span (text not literally in sentence)",
+            key=f"{keyroot}_add_virtual_{ver}",
+            help="Use when the entity text must be reconstructed, e.g. 'antibacterial and antifungal drugs' → add 'antibacterial drugs' as a virtual span",
+        )
+
+        if is_virtual:
+            vtext = st.text_input(
+                "Span text (virtual)",
+                key=f"{keyroot}_add_vtext_{ver}",
+                help="Type the entity text as it should be recorded; it will be stored with virtual=true and start_char/end_char=-1",
             )
-            chosen = matches[pick]
-            a, b = chosen["start"], chosen["end"]
-            st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
+            can_add = bool(lab and vtext)
+            btn = st.button("Add virtual span", type="primary", disabled=not can_add, key=f"{keyroot}_add_vbtn")
+            if btn and can_add:
+                new_span = {"start_char": -1, "end_char": -1, "type": lab, "text": vtext, "virtual": True, "uid": _uid()}
+                current = st.session_state.aug_gold[cur_key]
+                st.session_state.aug_gold[cur_key] = dedup_exact(ensure_uids(current + [new_span]))
+                _maybe_autosave()
+                st.session_state[f"{keyroot}_clear"] = True
+                force_rerun()
         else:
-            chosen = None
-            if q:
-                st.warning("No matches found in this sentence.")
+            q_key = f"{keyroot}_add_q_{st.session_state[ver_key]}"
+            q = st.text_input("Exact text to add (case-sensitive substring)", key=q_key)
+            matches = _find_occurrences(text, q) if q else []
+            if matches:
+                pick = st.selectbox(
+                    "Choose occurrence (shows local context)",
+                    options=list(range(len(matches))),
+                    format_func=lambda k: matches[k]["preview"],
+                    key=f"{keyroot}_add_pick"
+                )
+                chosen = matches[pick]
+                a, b = chosen["start"], chosen["end"]
+                st.caption(f"Will add: `[{a},{b})` → `{text[a:b]}`")
+            else:
+                chosen = None
+                if q:
+                    st.warning("No matches found in this sentence.")
 
-        can_add = (lab is not None and lab != "" and chosen is not None)
-        btn = st.button("Add manual span", type="primary", disabled=not can_add, key=f"{keyroot}_add_btn")
-        if btn and can_add:
-            new_span = {"start_char": int(chosen["start"]), "end_char": int(chosen["end"]), "type": lab}
-            st.session_state.aug_gold[cur_key] = merge_span_into_gold(
-                st.session_state.aug_gold[cur_key],
-                new_span,
-                metric=metric,
-                thr=merge_thr,
-                do_merge=merge_same_label,
-                text=text
-            )
-            st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
-            st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
-            _maybe_autosave()
-
-            st.session_state[f"{keyroot}_clear"] = True
-            force_rerun()
+            can_add = (lab is not None and lab != "" and chosen is not None)
+            btn = st.button("Add manual span", type="primary", disabled=not can_add, key=f"{keyroot}_add_btn")
+            if btn and can_add:
+                new_span = {"start_char": int(chosen["start"]), "end_char": int(chosen["end"]), "type": lab}
+                st.session_state.aug_gold[cur_key] = merge_span_into_gold(
+                    st.session_state.aug_gold[cur_key],
+                    new_span,
+                    metric=metric,
+                    thr=merge_thr,
+                    do_merge=merge_same_label,
+                    text=text
+                )
+                st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
+                st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
+                _maybe_autosave()
+                st.session_state[f"{keyroot}_clear"] = True
+                force_rerun()
 
 
 with colP:
@@ -941,9 +972,13 @@ with colG:
         a, b = int(g["start_char"]), int(g["end_char"])
         lbl   = g.get("type","")
         uid   = g.get("uid")  # stable identity
+        is_virtual = g.get("virtual", False)
 
         with st.container(border=True):
-            st.write(f"`{text[a:b]}`  [{a},{b})")
+            if is_virtual:
+                st.write(f"`{g.get('text','')}` *(virtual)*")
+            else:
+                st.write(f"`{text[a:b]}`  [{a},{b})")
             c1, c2, c3, c4 = st.columns([2,2,2,2])
             with c1:
                 opts = label_options  # CUSTOM guaranteed at end
@@ -956,19 +991,28 @@ with colG:
                     key=f"g_lab_{uid}",
                 )
                 if new_lbl == CUSTOM:
-                    new_lbl = st.text_input(f"Custom g#{j}", value=lbl, key=f"g_custom_{uid}")  # << uid
+                    new_lbl = st.text_input(f"Custom g#{j}", value=lbl, key=f"g_custom_{uid}")
             with c2:
-                new_a = st.number_input(f"Start g#{j}", value=a, step=1, key=f"g_a_{uid}")  # << uid
+                if is_virtual:
+                    new_vtext = st.text_input(f"Text g#{j}", value=g.get("text",""), key=f"g_vtext_{uid}")
+                else:
+                    new_a = st.number_input(f"Start g#{j}", value=a, step=1, key=f"g_a_{uid}")
             with c3:
-                new_b = st.number_input(f"End g#{j}", value=b, step=1, key=f"g_b_{uid}")    # << uid
+                if not is_virtual:
+                    new_b = st.number_input(f"End g#{j}", value=b, step=1, key=f"g_b_{uid}")
+                else:
+                    st.caption("virtual")
             with c4:
                 st.write("")
-                b_update = st.button("Update", key=f"g_upd_{uid}")   # << uid
-                b_delete = st.button("Delete", key=f"g_del_{uid}")   # << uid
+                b_update = st.button("Update", key=f"g_upd_{uid}")
+                b_delete = st.button("Delete", key=f"g_del_{uid}")
 
             if b_update:
-                updated = {"start_char": int(new_a), "end_char": int(new_b), "type": new_lbl, "uid": uid}
-                updated = set_span_text(updated, text)  # ← ensure "text" matches the indices
+                if is_virtual:
+                    updated = {"start_char": -1, "end_char": -1, "type": new_lbl, "text": new_vtext, "virtual": True, "uid": uid}
+                else:
+                    updated = {"start_char": int(new_a), "end_char": int(new_b), "type": new_lbl, "uid": uid}
+                    updated = set_span_text(updated, text)
                 st.session_state.aug_gold[cur_key][j] = updated
                 st.session_state.aug_gold[cur_key] = dedup_exact(st.session_state.aug_gold[cur_key])
                 st.session_state.aug_gold[cur_key] = ensure_uids(st.session_state.aug_gold[cur_key])
