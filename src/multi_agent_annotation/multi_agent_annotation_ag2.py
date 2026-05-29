@@ -350,10 +350,38 @@ _MOBIKO_V2_SECTION_STARTS = (
 )
 
 
+def load_guideline_from_md(path: Path) -> List[Dict[str, str]]:
+    """
+    Parse a Markdown guideline file into sections split on ATX headings (# / ##).
+    Returns an empty list if the file cannot be read.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    sections: List[Dict[str, str]] = []
+    title, content = "Introduction", []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip()
+            if content:
+                sections.append({"title": title, "content": "\n".join(content),
+                                 "source": "mobiko_v3"})
+            title, content = heading, []
+        else:
+            if stripped or content:  # skip leading blank lines before first content
+                content.append(stripped)
+    if content:
+        sections.append({"title": title, "content": "\n".join(content),
+                         "source": "mobiko_v3"})
+    return sections
+
+
 def load_guideline_from_docx(path: Path) -> List[Dict[str, str]]:
     """
-    Parse MoBiKo label guidance draft v2.docx — a narrative guideline with sections.
-    Each recognised heading starts a new section.
+    Parse a .docx guideline into sections (fallback when no .md is available).
     Returns an empty list if python-docx is unavailable or parsing fails.
     """
     try:
@@ -1445,7 +1473,8 @@ class MultiAgentAnnotator:
         Decision support .docx (table-based decision guide for the Annotator).
         Defaults to the copy in src/multi_agent_annotation/.
     guideline_path : Path
-        MoBiKo labelling guideline .docx (narrative, for Critic & Adjudicator).
+        MoBiKo labelling guideline (narrative, for Critic & Adjudicator).
+        Accepts .md (preferred) or .docx (fallback).
         Defaults to the copy in src/multi_agent_annotation/.
     seeds_path : Path
         Seed examples (used by the Annotator for initial annotation context).
@@ -1490,13 +1519,16 @@ class MultiAgentAnnotator:
             else []
         )
 
-        # MoBiKo v2 narrative → Critic & Adjudicator system prompts (edge cases, tiebreaker)
+        # Narrative guideline → Critic & Adjudicator system prompts (edge cases, tiebreaker)
+        # Prefers .md; falls back to .docx if the resolved path has a .docx suffix.
         gl_path = guideline_path or _DEFAULT_GUIDELINE
-        guidance_sections = (
-            load_guideline_from_docx(gl_path)
-            if gl_path and gl_path.exists()
-            else []
-        )
+        if gl_path and gl_path.exists():
+            if gl_path.suffix.lower() == ".docx":
+                guidance_sections = load_guideline_from_docx(gl_path)
+            else:
+                guidance_sections = load_guideline_from_md(gl_path)
+        else:
+            guidance_sections = []
 
         # guideline_search tool searches across both documents combined
         all_sections = decision_support_sections + guidance_sections
