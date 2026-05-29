@@ -16,3 +16,4 @@ scispacy
 requests
 pronto
 nltk
+matplotlib

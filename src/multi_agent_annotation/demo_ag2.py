@@ -275,10 +275,10 @@ def main() -> None:
              "override with ADJUDICATOR_MODEL env var).",
     )
     parser.add_argument(
-        "--max-rounds", type=int, default=1,
+        "--max-rounds", type=int, default=2,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("./data/auto_annotated/datademo_ag2_results.jsonl"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_ag2_results_strict2.jsonl"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(

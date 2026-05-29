@@ -344,9 +344,9 @@ def load_decision_support(path: Path) -> List[Dict[str, str]]:
 _MOBIKO_V2_SECTION_STARTS = (
     re.compile(r"^Step \d"),
     re.compile(r"^[IVX]+\."),
-    re.compile(r"^(Step 1: identifying spans|Step 2: Labelling spans|General rules|Handling difficult|Typical difficult|Rule|Needs further"
+    re.compile(r"^(Preliminary Comments|Step 1: identifying spans|Step 2: Labelling spans|General rules|Handling difficult|Typical difficult|Rule|Needs further"
                r"|Species and Taxonomic|Ecological Attributes|Human research activities|System-Level|Polysemic terms|Polysemic Terms"
-               r"|Typical Difficult Cases|Rule for Tiebreaker)", re.IGNORECASE),
+               r"|Typical Difficult Cases|Rule for Tiebreaker|General Tiebreaker Rule)", re.IGNORECASE),
 )
 
 
@@ -822,13 +822,24 @@ def _pair_tool_results(
     """
     Walk an AG2 chat_history and build a mapping
     tool_call_id → result_content for every tool-result message.
+
+    AG2 ≥ 0.11 wraps all results in a ``tool_responses`` list on the outer
+    role="tool" message; ``tool_call_id`` is never present at the top level.
+    We iterate both formats so older and newer AG2 versions are handled.
     """
     results: Dict[str, str] = {}
     for msg in chat_history:
-        if msg.get("role") == "tool":
-            tc_id = msg.get("tool_call_id", "")
+        if msg.get("role") != "tool":
+            continue
+        # AG2 ≥ 0.11: results are nested inside tool_responses
+        for tr in msg.get("tool_responses", []):
+            tc_id = tr.get("tool_call_id", "")
             if tc_id:
-                results[tc_id] = msg.get("content", "")
+                results[tc_id] = tr.get("content", "")
+        # Fallback: older format where tool_call_id is at the top level
+        tc_id = msg.get("tool_call_id", "")
+        if tc_id and tc_id not in results:
+            results[tc_id] = msg.get("content", "")
     return results
 
 
@@ -916,7 +927,7 @@ def _critic_is_satisfied(msg: dict) -> bool:
 
 _THIS_DIR = Path(__file__).resolve().parent
 _DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision_support.csv"
-_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo label guidance draft v3.docx"
+_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo_label_guidance_v3.md"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1453,7 +1464,7 @@ class MultiAgentAnnotator:
         decision_support_path: Optional[Path] = None,
         guideline_path: Optional[Path] = None,
         seeds_path: Optional[Path] = None,
-        max_rounds: int = 2,
+        max_rounds: int = 3,
         entity_schema_str: Optional[str] = None,
         entity_types_list: Optional[list] = None,
         guideline_search_backend: Optional[str] = None,
