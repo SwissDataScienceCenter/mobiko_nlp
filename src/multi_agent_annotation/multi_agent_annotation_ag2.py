@@ -48,6 +48,41 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
+# vLLM reasoning-parser compatibility patch
+# ─────────────────────────────────────────────────────────────
+# When vLLM serves Qwen3 with a reasoning parser enabled, it puts the thinking
+# tokens into choice.message.reasoning_content and leaves choice.message.content
+# as None.  Autogen's standard OpenAI client never reads reasoning_content, so
+# it produces a None-content message that fails autogen's send-validation.
+# This patch falls back to reasoning_content (stripped of <think> tags) when
+# content is None, keeping thinking mode active without breaking the pipeline.
+def _patch_autogen_for_reasoning_content() -> None:
+    from autogen.oai.client import OpenAIClient
+
+    _orig = OpenAIClient.message_retrieval
+
+    def _patched(self, response):
+        results = _orig(self, response)
+        patched = []
+        for item in results:
+            if isinstance(item, str) and not item:
+                # Empty string — check raw choice for reasoning_content
+                choices = getattr(response, "choices", [])
+                idx = len(patched)
+                if idx < len(choices):
+                    rc = getattr(choices[idx].message, "reasoning_content", None)
+                    if rc:
+                        item = re.sub(r"<think>.*?</think>", "", rc, flags=re.DOTALL).strip()
+            patched.append(item)
+        return patched
+
+    OpenAIClient.message_retrieval = _patched
+
+
+_patch_autogen_for_reasoning_content()
+
+
+# ─────────────────────────────────────────────────────────────
 # Data structures
 # ─────────────────────────────────────────────────────────────
 
@@ -227,8 +262,13 @@ MODEL_ENDPOINTS = {
     "qwen3-35B-vllm": {
         "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
         "api_key": None,
-        "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
     },
+    "gemma4-26B": {
+        "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
+        "api_key": None,
+        "model": "google/gemma-4-26B-A4B-it",
+    }
 }
 
 
@@ -260,16 +300,14 @@ def build_llm_config(
     if not api_key:
         raise ValueError(f"API key required for {model_key}.")
 
-    return LLMConfig(
-        {
-            "model": endpoint["model"],
-            "base_url": endpoint["base_url"],
-            "api_key": api_key,
-            "api_type": "openai",
-            "timeout": timeout,
-        },
-        temperature=temperature,
-    )
+    config: dict = {
+        "model": endpoint["model"],
+        "base_url": endpoint["base_url"],
+        "api_key": api_key,
+        "api_type": "openai",
+        "timeout": timeout,
+    }
+    return LLMConfig(config, temperature=temperature)
 
 
 # ─────────────────────────────────────────────────────────────
