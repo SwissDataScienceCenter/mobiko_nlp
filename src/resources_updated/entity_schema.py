@@ -358,6 +358,21 @@ Temporal property (A temporal descriptor or metric)
                 long-term
                 phenological timing
                 short term
+Qualitative property (A non-numeric attribute that describes a quality or category)
+        high/low
+        present/absent
+        increasing/decreasing
+        good/poor
+        big/small
+        fast/slow
+        unstable/stable
+
+Quantitative property (A measurable attribute that can be expressed as a quantity)
+        16%
+        100 meters above the sea level
+        3000 km
+        15 species
+        half of a populations
 """
 
 SCHEMA_BIODIV = """
