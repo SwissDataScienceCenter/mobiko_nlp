@@ -37,6 +37,7 @@ from eval_utils import (
     fmt_p,
     _mean,
 )
+from deliberation_history import agent_disagreed_spans, record_signals
 
 SCHEMA_V1_TO_V2: Dict[str, str] = {
     "BIOTIC COLLECTIVE ENTITY":  "BIOTIC ENTITY",
@@ -53,8 +54,10 @@ def load_agent_records(path: Path) -> List[dict]:
     with path.open("r", encoding="utf8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                records.append(json.loads(line))
+            # Skip blanks and comment/separator lines (e.g. "//")
+            if not line or not line.startswith("{"):
+                continue
+            records.append(json.loads(line))
     return records
 
 
@@ -200,88 +203,21 @@ def _try_parse_json(text: str) -> Optional[dict]:
     return last_obj
 
 
-def extract_agent_span_disagreements(
-    record: dict,
-) -> Dict[str, Dict[str, Any]]:
+def extract_agent_span_disagreements(record: dict) -> Dict[str, Dict[str, Any]]:
     """
-    Extract per-span agent disagreement from the deliberation messages.
+    Per-span agent disagreement, computed from the FULL deliberation history
+    (union of Critic `disagreements` + `missing_annotations` across ALL rounds).
 
-    A span is "agent_disagreed" if the Critic listed it in "disagreements"
-    or "missing_annotations" in its last message.
+    This is the updated, history-based signal: the deliberation loop drives
+    disputes to ~0 by the final round (the Annotator capitulates) and the stored
+    agreement_score then reports ~1.0, so any single-round view erases real
+    disagreement. Delegates to deliberation_history.agent_disagreed_spans so
+    Layer 2 and Layer 3/4 count disagreement identically.
 
     Returns {normalized_text: {"agent_disagreed": bool, "annotator_type": str,
-             "critic_type": str | None, "severity": str | None}}
+             "critic_type": str | None, "severity": str | None}}.
     """
-    messages = record.get("messages", [])
-
-    # Collect all entity spans proposed by the Annotator
-    annotator_spans: Dict[str, str] = {}  # norm_text → entity_type
-    for m in messages:
-        if m.get("agent") != "Annotator":
-            continue
-        parsed = _try_parse_json(m.get("content", ""))
-        if parsed and "entities" in parsed:
-            for ent in parsed["entities"]:
-                text = _normalize(ent.get("text", ""))
-                etype = (ent.get("entity_type") or ent.get("type", "")).strip().upper()
-                if text:
-                    annotator_spans[text] = etype
-
-    # Find the last Critic message and parse its disagreements
-    last_critic = None
-    for m in reversed(messages):
-        if m.get("agent") == "Critic":
-            last_critic = _try_parse_json(m.get("content", ""))
-            if last_critic:
-                break
-
-    disputed_spans: Dict[str, Dict[str, Any]] = {}
-
-    # Build result for all annotator spans
-    for text, ann_type in annotator_spans.items():
-        disputed_spans[text] = {
-            "agent_disagreed": False,
-            "annotator_type": ann_type,
-            "critic_type": None,
-            "severity": None,
-        }
-
-    if last_critic:
-        # Mark disagreements
-        for d in last_critic.get("disagreements", []):
-            target = _normalize(d.get("target", ""))
-            # Try to match target to an annotator span
-            matched = None
-            for span_text in annotator_spans:
-                if target in span_text or span_text in target:
-                    matched = span_text
-                    break
-            if matched is None:
-                matched = target
-
-            disputed_spans.setdefault(matched, {
-                "agent_disagreed": True,
-                "annotator_type": d.get("annotator_label", ""),
-                "critic_type": d.get("proposed_label", ""),
-                "severity": d.get("severity", ""),
-            })
-            disputed_spans[matched]["agent_disagreed"] = True
-            disputed_spans[matched]["critic_type"] = d.get("proposed_label", "")
-            disputed_spans[matched]["severity"] = d.get("severity", "")
-
-        # Mark missing annotations as disagreements (presence disagreement)
-        for miss in last_critic.get("missing_annotations", []):
-            text = _normalize(miss.get("text", ""))
-            if text:
-                disputed_spans.setdefault(text, {
-                    "agent_disagreed": True,
-                    "annotator_type": "(missing)",
-                    "critic_type": miss.get("entity_type", ""),
-                    "severity": "missing",
-                })
-                disputed_spans[text]["agent_disagreed"] = True
-
-    return disputed_spans
+    return agent_disagreed_spans(record)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -299,6 +235,7 @@ def build_contingency_table(
         (human_disagree, agent_agree)  → cell_da
         (human_disagree, agent_disagree) → cell_dd
 
+    Agent disagreement is the history-based union across all Critic rounds.
     Also returns per-span details for further analysis.
     """
     cell_aa, cell_ad, cell_da, cell_dd = 0, 0, 0, 0
@@ -383,7 +320,7 @@ def build_contingency_table(
         rng = _rnd.Random(42)
         n_sp = len(span_details)
         boot_log_ors = []
-        for _ in range(2000):
+        for _ in range(1000):
             sample = [span_details[rng.randrange(n_sp)] for _ in range(n_sp)]
             boot_log_ors.append(_or_from_spans(sample))
         boot_log_ors = [v for v in boot_log_ors if not math.isnan(v)]
@@ -427,9 +364,15 @@ def compute_sentence_level_correlation(
     """
     For each sentence, compute:
         human_disagreement_rate = fraction of spans with human disagreement
-        agent_disagreement_rate = agent agreement_score inverted (1 - score)
+        agent_disagreement_rate = fraction of agent spans disputed by the Critic
+                                  across ALL rounds (history-based union)
 
     Then compute Spearman rank correlation.
+
+    NOTE: the agent rate is derived from the deliberation history, NOT from
+    record["agreement_score"]. The stored agreement_score reflects only the
+    final round, so for multi-round runs that converge by capitulation it
+    reports ~1.0 and erases the disagreement signal.
     """
     human_rates: List[float] = []
     agent_rates: List[float] = []
@@ -451,16 +394,11 @@ def compute_sentence_level_correlation(
             sum(1 for s in human_spans.values() if s["disagreed"])
             / len(human_spans)
         )
-        # Agent disagreement: use 1 - agreement_score, or compute from critic
-        a_score = rec.get("agreement_score")
-        if a_score is not None:
-            a_disagree_rate = 1.0 - a_score
-        else:
-            # Fallback: compute from messages
-            agent_spans = extract_agent_span_disagreements(rec)
-            n_total = len(agent_spans)
-            n_disagree = sum(1 for s in agent_spans.values() if s["agent_disagreed"])
-            a_disagree_rate = n_disagree / n_total if n_total > 0 else 0.0
+        # Agent disagreement: fraction of spans disputed across ALL rounds
+        agent_spans = extract_agent_span_disagreements(rec)
+        n_total = len(agent_spans)
+        n_disagree = sum(1 for s in agent_spans.values() if s["agent_disagreed"])
+        a_disagree_rate = n_disagree / n_total if n_total > 0 else 0.0
 
         human_rates.append(h_disagree_rate)
         agent_rates.append(a_disagree_rate)
@@ -482,7 +420,7 @@ def compute_sentence_level_correlation(
         rng = _rnd.Random(42)
         n_p = len(pairs)
         boot_rhos = []
-        for _ in range(2000):
+        for _ in range(1000):
             sample = [pairs[rng.randrange(n_p)] for _ in range(n_p)]
             xs = [s[0] for s in sample]
             ys = [s[1] for s in sample]
@@ -510,6 +448,50 @@ def compute_sentence_level_correlation(
         ),
         "sentence_details": sentence_details,
     }
+
+
+def correlate_history_signals(
+    agent_records: List[dict],
+    human_data: Dict[str, Dict[str, dict]],
+) -> Dict[str, Any]:
+    """
+    Correlate per-sentence history signals — number of rounds, round-1
+    disagreement count, and total disagreements across all steps — against the
+    human disagreement rate. Answers: which deliberation signal best tracks where
+    humans disagree?
+    """
+    target: List[float] = []
+    sig_vals: Dict[str, List[float]] = defaultdict(list)
+    keys = [
+        ("rounds_used", "rounds_used"),
+        ("R1 disagreement count", "r1_disagreements"),
+        ("R1 disagreement rate", "r1_rate"),
+        ("total disagreements (all steps)", "total_disagreements_all_steps"),
+    ]
+
+    for rec in agent_records:
+        sent = rec["sentence"].strip()
+        annotators = human_data.get(sent)
+        if not annotators or len(annotators) < 2:
+            continue
+        human_spans = compute_human_span_disagreements(annotators)
+        if not human_spans:
+            continue
+        h_rate = sum(1 for s in human_spans.values() if s["disagreed"]) / len(human_spans)
+        sig = record_signals(rec)
+        target.append(h_rate)
+        for label, key in keys:
+            sig_vals[label].append(sig[key])
+
+    results = []
+    for label, _ in keys:
+        x = sig_vals[label]
+        results.append({
+            "signal": label,
+            "spearman_rho": _spearman_rho(x, target),
+            "p_value": permutation_p_rho(x, target),
+        })
+    return {"n_sentences": len(target), "correlations": results}
 
 
 def _spearman_rho(x: List[float], y: List[float]) -> Optional[float]:
@@ -558,9 +540,10 @@ def main():
 
     ct = build_contingency_table(agent_records, human_data)
     corr = compute_sentence_level_correlation(agent_records, human_data)
+    hist = correlate_history_signals(agent_records, human_data)
 
     print(f"\n{'='*60}")
-    print(f"  LAYER 2 — Disagreement Correlation")
+    print(f"  LAYER 2 — Disagreement Correlation (history-based, all rounds)")
     print(f"{'='*60}")
 
     c = ct["contingency"]
@@ -573,17 +556,32 @@ def main():
     print(f"  Odds ratio:   {ct['odds_ratio']:.2f}  (log OR: {ct['log_odds_ratio']:.2f})"
           f"  95% CI [{or_ci[0]:.2f}, {or_ci[1]:.2f}]")
     print(f"  Fisher exact: p = {fmt_p(ct['fisher_p_value'])}")
-    if ct["odds_ratio"] > 1:
-        print(f"  → Agent disagreement DOES predict human disagreement")
+    # Significance-aware verdict: require p < 0.05 AND a CI that excludes OR=1.
+    or_ci = ct.get("odds_ratio_ci95", [float("nan"), float("nan")])
+    p = ct.get("fisher_p_value")
+    ci_excludes_1 = not (or_ci[0] <= 1.0 <= or_ci[1]) if not any(map(math.isnan, or_ci)) else False
+    if ct["odds_ratio"] > 1 and p is not None and p < 0.05 and ci_excludes_1:
+        print(f"  → Agent disagreement significantly predicts human disagreement (span level)")
     else:
-        print(f"  → Agent disagreement does NOT predict human disagreement")
+        print(f"  → No significant span-level association (OR CI crosses 1 / p ≥ 0.05)")
 
     print(f"\n  Sentence-level correlation ({corr['n_sentences']} sentences):")
     rho_ci = corr.get("spearman_rho_ci95", [float("nan"), float("nan")])
+    print(f"  Agent disagreement rate vs human disagreement rate:")
     print(f"  Spearman ρ:   {corr['spearman_rho']}  "
           f"95% CI {fmt_ci(*rho_ci)}  p = {fmt_p(corr.get('spearman_p_value'))}")
     print(f"  Mean human disagreement rate: {corr['mean_human_disagreement_rate']:.3f}")
     print(f"  Mean agent disagreement rate: {corr['mean_agent_disagreement_rate']:.3f}")
+
+    print(f"\n  History signals vs human disagreement rate ({hist['n_sentences']} sentences):")
+    print(f"    {'signal':<34}{'Spearman ρ':>12}{'p':>9}")
+    for c in hist["correlations"]:
+        rho = c["spearman_rho"]
+        pp = c["p_value"]
+        star = " *" if (pp is not None and pp < 0.05) else ""
+        rho_s = f"{rho:+.3f}" if rho is not None else "   n/a"
+        pp_s = f"{pp:.4f}" if pp is not None else "  n/a"
+        print(f"    {c['signal']:<34}{rho_s:>12}{pp_s:>9}{star}")
 
     # Per-type breakdown
     print(f"\n  Per-type contingency (aa/ad/da/dd):")
@@ -603,6 +601,7 @@ def main():
             "spearman_rho": corr["spearman_rho"],
             "spearman_rho_ci95": corr.get("spearman_rho_ci95"),
             "spearman_p_value": corr.get("spearman_p_value"),
+            "history_signal_correlations": hist["correlations"],
             "per_type_contingency": ct["per_type_contingency"],
             "sentence_correlations": corr["sentence_details"],
         }
