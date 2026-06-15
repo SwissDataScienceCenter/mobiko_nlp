@@ -620,6 +620,17 @@ def main():
                         ) if (accepted or missing) else []
 
                     for idx_in_batch, (spacy_result, llm_result) in enumerate(zip(candidate_results, llm_results)):
+                        if isinstance(llm_result, dict) and llm_result.get("_failed"):
+                            # LLM call failed (e.g. empty/blank content). Leave this
+                            # sentence unprocessed (out_sents stays None) and do NOT
+                            # checkpoint it, so a later --resume run retries it instead
+                            # of an empty result leaking into the output.
+                            global_idx = pending_indices[idx_in_batch]
+                            print(
+                                f"  ! Skipping sentence {global_idx} (LLM failed, "
+                                f"will retry on --resume): {spacy_result['sentence'][:60]}..."
+                            )
+                            continue
                         _assign_tiers_to_llm(llm_result, spacy_result.get("candidates"), args.iou_thr)
                         sentence_data = {
                             "text": spacy_result["sentence"],
@@ -664,15 +675,26 @@ def main():
             # Write results
             missing = [i for i, s in enumerate(out_sents) if s is None]
             if missing:
-                raise RuntimeError(
-                    f"Missing {len(missing)} sentences for doc {doc_id}; "
-                    f"rerun with --resume to fill from checkpoints."
+                # Don't fail the whole document: write failed sentences with
+                # empty final_spans so all completed work is recorded. They are
+                # deliberately NOT checkpointed, so a later --resume run still
+                # sees them as unprocessed and retries them.
+                print(
+                    f"WARNING: {len(missing)} sentences failed for doc {doc_id} "
+                    f"(indices: {missing[:10]}{'...' if len(missing) > 10 else ''}); "
+                    f"writing them with empty final_spans. Rerun with --resume to retry."
                 )
+                for i in missing:
+                    out_sents[i] = {
+                        "text": sentences[i],
+                        "llm": {"final_spans": [], "accepted": [], "missing": [], "_failed": True},
+                    }
+            processed_ok = len(out_sents) - len(missing)
             if stats_path:
-                write_stats(stats_path, doc_id, type_counts, len(out_sents), len(sentences))
+                write_stats(stats_path, doc_id, type_counts, processed_ok, len(sentences))
             if global_stats_path:
                 global_docs[doc_id] = {
-                    "processed_sentences": len(out_sents),
+                    "processed_sentences": processed_ok,
                     "total_sentences": len(sentences),
                     "type_counts": type_counts,
                 }

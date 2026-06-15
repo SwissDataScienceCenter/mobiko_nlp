@@ -18,8 +18,19 @@ _ENV_FILE = os.getenv("MOBIKO_ENV_FILE") or _REPO_ROOT / ".env"
 if load_dotenv is not None:
     load_dotenv(_ENV_FILE, override=False)
 
-def remove_thinking_blocks(content: str) -> str:
+class EmptyLLMResponseError(RuntimeError):
+    """Raised when the model returns empty/blank content for a call.
+
+    We surface this instead of silently passing an empty string downstream so
+    the affected sentence is left unprocessed and can be retried via --resume,
+    rather than being baked into the output as a (false) "no entities" result.
+    """
+
+
+def remove_thinking_blocks(content: str | None) -> str:
     """Strip <think>...</think> and unwrap ```json fences."""
+    if not content:
+        return ""
     cleaned = _THINK_RE.sub("", content).strip()
     if cleaned.startswith("```json"):
         start = cleaned.find("```json") + 7
@@ -63,15 +74,14 @@ class ModelRegistry:
         ),
         "qwen3-35B-vllm": ModelConfig(
             base_url="https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-            # base_url="https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
-            api_key=None,  # read from env
-            model_name="Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"  # use the exact id your gateway serves
-        ),
-        "qwen3-32B-vllm": ModelConfig(
-            base_url="https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
             api_key=None,
-            model_name="Qwen/Qwen3-32B-AWQ",
+            model_name="Qwen/Qwen3.6-35B-A3B-FP8",
         ),
+        "gemma4-26B": ModelConfig(
+            base_url="https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
+            api_key=None,
+            model_name="google/gemma-4-26B-A4B-it",
+        )
     }
 
     @classmethod
@@ -142,15 +152,32 @@ class LLMClient:
             temperature=temperature,
             **kwargs
         )
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
+        if content is None:
+            # Some vLLM/Qwen reasoning models return content=None and place the
+            # text in reasoning_content, or reply with only a tool call. Fall back
+            # to reasoning_content so we don't crash / lose the output.
+            content = getattr(message, "reasoning_content", None)
         if self.model_type in ("qwen3-32B", "gpt4o", "qwen3-35B-vllm", "qwen3-32B-vllm"):
             content = remove_thinking_blocks(content)
+        else:
+            content = content or ""
+        # Account for usage before any raise: the API call happened (and may be
+        # billed) even when the returned content is empty.
         usage = response.usage
         if usage is not None:
             with self._stats_lock:
                 self._query_count += 1
                 self._prompt_tokens_total += usage.prompt_tokens or 0
                 self._completion_tokens_total += usage.completion_tokens or 0
+        if not content.strip():
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            raise EmptyLLMResponseError(
+                f"Model '{self.model_name}' returned empty content "
+                f"(finish_reason={finish_reason!r}). Sentence left unprocessed; "
+                f"rerun with --resume to retry it."
+            )
         return content
 
     def token_stats(self) -> dict:

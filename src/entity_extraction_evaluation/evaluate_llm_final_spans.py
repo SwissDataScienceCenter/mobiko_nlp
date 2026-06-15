@@ -2,7 +2,7 @@ import argparse
 import csv
 import json
 import re
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -55,16 +55,34 @@ def normalize_whitespace_one_line(text: str) -> str:
 def load_docs(path: str) -> Dict[str, Dict[str, Any]]:
     docs: Dict[str, Dict[str, Any]] = {}
     with open(path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            rec = json.loads(line)
+        content = f.read()
+
+    # Try whole-file JSON first (pretty-printed or single-object files)
+    try:
+        parsed = json.loads(content)
+        records = parsed if isinstance(parsed, list) else [parsed]
+        for rec in records:
             doc_id = rec.get("doc_id")
             if not doc_id:
-                raise ValueError(f"{path}:{line_no} missing doc_id")
+                raise ValueError(f"{path}: record missing doc_id")
             if doc_id in docs:
-                raise ValueError(f"{path}:{line_no} duplicate doc_id={doc_id!r}")
+                raise ValueError(f"{path}: duplicate doc_id={doc_id!r}")
             docs[doc_id] = rec
+        return docs
+    except json.JSONDecodeError:
+        pass
+
+    # Fall back to JSONL (one JSON object per line)
+    for line_no, line in enumerate(content.splitlines(), 1):
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        doc_id = rec.get("doc_id")
+        if not doc_id:
+            raise ValueError(f"{path}:{line_no} missing doc_id")
+        if doc_id in docs:
+            raise ValueError(f"{path}:{line_no} duplicate doc_id={doc_id!r}")
+        docs[doc_id] = rec
     return docs
 
 
@@ -251,51 +269,54 @@ def align_sentences_by_text(
     model_sents: List[Dict[str, Any]],
 ) -> Tuple[List[Tuple[int, int]], List[Dict[str, Any]]]:
     """
-    Align gold sentences to model sentences by exact text, in order.
+    Align model sentences to gold sentences by text match, regardless of order.
+
+    All gold sentences are indexed by text up front, so the two files do not
+    need to list sentences in the same order. Matching tries exact text first,
+    then falls back to whitespace-normalized text. Each gold sentence can be
+    matched at most once; duplicate texts are consumed in gold order.
     Returns:
-      - pairs: list of (gold_idx, model_idx)
-      - model_only_extras: skipped model sentences encountered during scan, plus trailing extras
+      - pairs: list of (gold_idx, model_idx), sorted by gold_idx
+      - extras: model sentences for which no gold match was found
     """
     pairs: List[Tuple[int, int]] = []
     extras: List[Dict[str, Any]] = []
-    j = 0
+
+    exact_index: Dict[str, deque] = defaultdict(deque)
+    norm_index: Dict[str, deque] = defaultdict(deque)
     for gi, gs in enumerate(gold_sents):
-        target = gs.get("text", "")
-        found = False
-        while j < len(model_sents):
-            mt = model_sents[j].get("text", "")
-            if mt == target:
-                pairs.append((gi, j))
-                j += 1
-                found = True
-                break
+        gt = gs.get("text", "")
+        exact_index[gt].append(gi)
+        norm_index[normalize_whitespace_one_line(gt)].append(gi)
+
+    used_gold: Set[int] = set()
+
+    def _take(queue: Optional[deque]) -> Optional[int]:
+        while queue:
+            cand = queue.popleft()
+            if cand not in used_gold:
+                return cand
+        return None
+
+    for mi, ms in enumerate(model_sents):
+        target = ms.get("text", "")
+        gi_match = _take(exact_index.get(target))
+        if gi_match is None:
+            gi_match = _take(norm_index.get(normalize_whitespace_one_line(target)))
+        if gi_match is None:
             extras.append(
                 {
                     "doc_id": gold_doc_id,
-                    "model_sent_idx": j,
-                    "text": mt,
-                    "reason": "model_only_extra_before_aligned_match",
+                    "model_sent_idx": mi,
+                    "text": target,
+                    "reason": "model_only_no_gold_match",
                 }
             )
-            j += 1
-        if not found:
-            snippet = normalize_whitespace_one_line(target)[:200]
-            raise ValueError(
-                f"Alignment failed for doc_id={gold_doc_id!r}, gold_sent_idx={gi}: "
-                f"could not find remaining model sentence with text={snippet!r}"
-            )
+        else:
+            used_gold.add(gi_match)
+            pairs.append((gi_match, mi))
 
-    while j < len(model_sents):
-        extras.append(
-            {
-                "doc_id": gold_doc_id,
-                "model_sent_idx": j,
-                "text": model_sents[j].get("text", ""),
-                "reason": "model_only_extra_trailing",
-            }
-        )
-        j += 1
-
+    pairs.sort()
     return pairs, extras
 
 
@@ -906,7 +927,7 @@ def evaluate(
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "evaluator": "evaluate_llm_final_spans.py",
             "matching_policy": "strict_exact_span_and_type",
-            "alignment_policy": "exact_text_in_order",
+            "alignment_policy": "exact_or_normalized_text_any_order",
             "gold_annotation_policy": "score_only_sentences_with_nonempty_gold_spans",
             "prediction_field": prediction_field,
             "candidate_sources": sorted(candidate_source_set) if candidate_source_set else [],

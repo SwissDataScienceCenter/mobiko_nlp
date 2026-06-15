@@ -153,7 +153,7 @@ def call_llm_batch(
     presence_penalty = float(decoding.get("presence_penalty", 0.0))
 
     if model_type in ["qwen3-32B", "gpt4o", "qwen3-32B-vllm", "qwen3-35B-vllm"]:
-        max_tokens = 1024
+        max_tokens = 30000
     else:
         max_tokens = 500
 
@@ -199,9 +199,13 @@ def call_llm_batch(
             return llm_result
         except Exception as e:
             print(f"Error calling LLM for sentence: {sentence[:50]}...: {e}")
+            # Mark the call as failed so the orchestrator skips this sentence
+            # (leaving it unprocessed for a later --resume) instead of writing
+            # an empty result into the output.
             return {
                 "accepted": [], "rejected": [], "missing": [],
-                "notes": f"llm_error: {repr(e)}"
+                "notes": f"llm_error: {repr(e)}",
+                "_failed": True,
             }
 
     if max_workers <= 1 or len(requests) <= 1:
@@ -292,6 +296,17 @@ def call_llm_batch_two_path(
             merged_outs.append({"accepted": locked_acc, "rejected": [], "missing": [], "notes": "llm_empty"})
             continue
 
+        if llm_res.get("_failed"):
+            # The LLM call failed (empty/blank content, timeout, etc.). Propagate
+            # the failure marker so the orchestrator skips this sentence and leaves
+            # it to be retried on --resume, instead of writing a partial result.
+            merged_outs.append({
+                "accepted": [], "rejected": [], "missing": [],
+                "notes": llm_res.get("notes", "llm_failed"),
+                "_failed": True,
+            })
+            continue
+
         merged_accepted = list(locked_acc)
         for a in llm_res.get("accepted", []):
             if not overlaps_any((int(a["start_char"]), int(a["end_char"])), locked_spans, iou_thr=lock_over_iou):
@@ -351,12 +366,16 @@ def call_llm_batch_revision(client, model_type, requests, temperature=0.3, max_w
                    "prev_notes": req.get("prev_notes", "")}
         if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
-        content = client.call(
-            messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
-            temperature=temperature,
-            max_tokens=512,
-            timeout=360,
-        )
+        try:
+            content = client.call(
+                messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
+                temperature=temperature,
+                max_tokens=30000,
+                timeout=360,
+            )
+        except Exception as e:
+            print(f"Error calling LLM (revision) for sentence: {req['sentence'][:50]}...: {e}")
+            return {"missing": [], "notes": f"llm_error: {repr(e)}", "_failed": True}
         obj = safe_json_from_llm(content, kind="extract")
         obj["missing"] = fix_span_indices(obj.get("missing", []), req["sentence"])
         return obj
@@ -381,13 +400,18 @@ def call_llm_batch_consolidate(client, model_type, requests, max_workers: int = 
         payload = {"sentence": req["sentence"], "proposals": req["proposals"]}
         if "qwen3-35B" in model_type or "qwen3-32B" in model_type:
             system_prompt = f"<no_think/>\n\n{system_prompt}"
-        content = client.call(
-            messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
-            temperature=0.0,
-            max_tokens=768,
-            timeout=360,
-        )
-        obj = json.loads(content)
+        try:
+            content = client.call(
+                messages=[{"role": "user", "content": f"{system_prompt}\n\nUser input: {json.dumps(payload, ensure_ascii=False)}"}],
+                temperature=0.0,
+                max_tokens=30000,
+                timeout=360,
+            )
+        except Exception as e:
+            print(f"Error calling LLM (consolidate) for sentence: {req['sentence'][:50]}...: {e}")
+            return {"accepted": [], "rejected": [], "missing": [],
+                    "notes": f"llm_error: {repr(e)}", "_failed": True}
+        obj = safe_json_from_llm(content, kind="consolidate")
         for k in ("accepted", "rejected"):
             obj[k] = fix_span_indices(obj.get(k, []), req["sentence"])
         obj["missing"] = []
@@ -454,6 +478,21 @@ def _ablation_accept(cands: Optional[List[Dict[str,Any]]],
     return {"accepted": [], "rejected": [], "missing": [], "notes": f"ablation:{mode}|unhandled"}
 
 
+def _is_failed(o: Any) -> bool:
+    """True if an LLM result dict was tagged as a failed call (empty/blank
+    content, timeout, etc.)."""
+    return isinstance(o, dict) and bool(o.get("_failed"))
+
+
+def _stamp_failures(results: List[Dict], failed_flags: List[bool]) -> List[Dict]:
+    """Mark per-sentence results as _failed wherever any constituent pass failed,
+    so the orchestrator skips them and they are retried on --resume."""
+    for i, flag in enumerate(failed_flags):
+        if flag and isinstance(results[i], dict):
+            results[i]["_failed"] = True
+    return results
+
+
 # === ADD: Multi-pass runners ===
 
 def run_C1_vanilla(client, model_type, few_shot, candidate_results, T: int = 3,
@@ -468,12 +507,18 @@ def run_C1_vanilla(client, model_type, few_shot, candidate_results, T: int = 3,
                                  candidate_results, lock_over_iou=lock_over_iou, decoding=dec,
                                  gaz_lock=gaz_lock, max_workers=max_workers)
 
+    # Track per-sentence failures across all passes so an empty/blank call in any
+    # pass leaves the sentence unprocessed (skipped + retried on --resume).
+    failed_flags = [_is_failed(o) for o in p1]
+
     if T == 1:
         return p1
 
     rev_reqs = [{"sentence": req["sentence"], "prev_json": out}
                 for req, out in zip(candidate_results, p1)]
     p2 = call_llm_batch_revision(client, model_type, rev_reqs, temperature=0.7, max_workers=max_workers)
+    for i, o2 in enumerate(p2):
+        failed_flags[i] = failed_flags[i] or _is_failed(o2)
 
     merged_after_p2 = []
     for o1, o2, req in zip(p1, p2, candidate_results):
@@ -483,9 +528,12 @@ def run_C1_vanilla(client, model_type, few_shot, candidate_results, T: int = 3,
     if T >= 3:
         cons_requests = [{"sentence": m["sentence"], "proposals": m["accepted"]} for m in merged_after_p2]
         p3 = call_llm_batch_consolidate(client, model_type, cons_requests, max_workers=max_workers)
-        return p3
+        for i, o3 in enumerate(p3):
+            failed_flags[i] = failed_flags[i] or _is_failed(o3)
+        return _stamp_failures(p3, failed_flags)
     else:
-        return [{"accepted": m["accepted"], "rejected": [], "missing": [], "notes": "C1-P2"} for m in merged_after_p2]
+        out = [{"accepted": m["accepted"], "rejected": [], "missing": [], "notes": "C1-P2"} for m in merged_after_p2]
+        return _stamp_failures(out, failed_flags)
 
 
 def run_C2_diverse(
@@ -496,6 +544,7 @@ def run_C2_diverse(
     aggregate with NMS-style consensus by type.
     """
     pass_accepteds_per_sent = [[] for _ in candidate_results]
+    failed_flags = [False] * len(candidate_results)
 
     for t in range(1, T+1):
         dec = _decoding_profile(t, "C2")
@@ -503,6 +552,7 @@ def run_C2_diverse(
                                       candidate_results, lock_over_iou=lock_over_iou,
                                       decoding=dec, gaz_lock=gaz_lock, max_workers=max_workers)
         for i, o in enumerate(out):
+            failed_flags[i] = failed_flags[i] or _is_failed(o)
             pass_accepteds_per_sent[i].append(o.get("accepted", []))
 
     # consensus merge per sentence
@@ -510,7 +560,7 @@ def run_C2_diverse(
     for i, req in enumerate(candidate_results):
         merged_acc = consensus_merge_by_type(pass_accepteds_per_sent[i], iou_thr=0.5)
         merged.append({"accepted": merged_acc, "rejected": [], "missing": [], "notes": f"C2-T{T}"})
-    return merged
+    return _stamp_failures(merged, failed_flags)
 
 
 def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: int = 3,
@@ -519,6 +569,8 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
     p = call_llm_batch_two_path(client, model_type, few_shot,
                                 candidate_results, lock_over_iou=lock_over_iou, decoding=dec,
                                 gaz_lock=gaz_lock, max_workers=max_workers)
+
+    failed_flags = [_is_failed(o) for o in p]
 
     state = []
     for i, base in enumerate(p):
@@ -541,6 +593,7 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
         rev = call_llm_batch_revision(client, model_type, rev_reqs, temperature=0.9, max_workers=max_workers)
 
         for i, r in enumerate(rev):
+            failed_flags[i] = failed_flags[i] or _is_failed(r)
             new_missing = r.get("missing", [])
             state[i]["accepted"] = merge_spans(state[i]["accepted"], new_missing, iou_thr=lock_over_iou)
             note_add = (r.get("notes") or "").strip()
@@ -553,6 +606,8 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
     cons_requests = [{"sentence": s["sentence"], "proposals": s["accepted"], "prev_notes": s["notes"]}
                      for s in state]
     final = call_llm_batch_consolidate(client, model_type, cons_requests, max_workers=max_workers)
+    for i, obj in enumerate(final):
+        failed_flags[i] = failed_flags[i] or _is_failed(obj)
 
     # Preserve rolled notes into the final objects (for logging/analysis)
     for i, obj in enumerate(final):
@@ -563,7 +618,7 @@ def run_C3_critique_revise(client, model_type, few_shot, candidate_results, T: i
             else:
                 obj["notes"] = state[i]["notes"][:300]
 
-    return final
+    return _stamp_failures(final, failed_flags)
 
 
 def run_C4_self_consistency(
@@ -574,6 +629,7 @@ def run_C4_self_consistency(
     Self-consistency in one pass: sample K independent outputs, then consensus merge.
     """
     samples_per_sent = [[] for _ in candidate_results]
+    failed_flags = [False] * len(candidate_results)
     grid = [
         dict(temperature=0.3, top_p=0.90, presence_penalty=0.0),
         dict(temperature=0.6, top_p=0.95, presence_penalty=0.7),
@@ -585,13 +641,14 @@ def run_C4_self_consistency(
                                       candidate_results, lock_over_iou=0.5, decoding=dec,
                                       gaz_lock=gaz_lock, max_workers=max_workers)
         for i, o in enumerate(out):
+            failed_flags[i] = failed_flags[i] or _is_failed(o)
             samples_per_sent[i].append(o.get("accepted", []))
 
     merged = []
     for i, req in enumerate(candidate_results):
         merged_acc = consensus_merge_by_type(samples_per_sent[i], iou_thr=0.5)
         merged.append({"accepted": merged_acc, "rejected": [], "missing": [], "notes": f"C4-K{K}"})
-    return merged
+    return _stamp_failures(merged, failed_flags)
 
 
 
