@@ -79,6 +79,37 @@ We surveyed four contiguous protected areas in the core forest area of the south
 ]
 
 
+def load_sentences(input_path: Path) -> list[str]:
+    """Load one sentence per non-empty line from a .txt file or directory of .txt files."""
+    if input_path.is_dir():
+        files = sorted(input_path.glob("*.txt"))
+        if not files:
+            print(f"[ERROR] No .txt files found in directory: {input_path}")
+            sys.exit(1)
+    elif input_path.is_file():
+        files = [input_path]
+    else:
+        print(f"[ERROR] Input path not found: {input_path}")
+        sys.exit(1)
+
+    sentences: list[str] = []
+    for f in files:
+        # Split ONLY on "\n" (one sentence per line). Do NOT use str.splitlines(),
+        # which also breaks on Unicode line boundaries (\v \f \x85     …)
+        # that occur inside PDF-extracted text and would over-count sentences.
+        for line in f.read_text(encoding="utf-8").split("\n"):
+            line = line.strip()
+            if line:
+                sentences.append(line)
+
+    if not sentences:
+        print(f"[ERROR] No sentences found in: {input_path}")
+        sys.exit(1)
+
+    print(f"[OK] Loaded {len(sentences)} sentence(s) from {input_path}")
+    return sentences
+
+
 def run_fix_offsets(output_path: Path) -> None:
     """Load an existing JSONL, fill any null start/end offsets, rewrite in place."""
     if not output_path.exists():
@@ -213,6 +244,7 @@ def run_live(
     max_retries: int = 2,
     request_timeout: int = 600,
     strict_critic: bool = False,
+    guideline_search_mandatory: bool = True,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -229,6 +261,7 @@ def run_live(
         use_precedent_memory=use_precedent_memory,
         request_timeout=request_timeout,
         strict_critic=strict_critic,
+        guideline_search_mandatory=guideline_search_mandatory,
     )
 
     records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume, max_retries=max_retries)
@@ -278,12 +311,23 @@ def main() -> None:
         "--max-rounds", type=int, default=2,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("./data/auto_annotated/datademo_ag2_results_strict2.jsonl"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled1.jsonl"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(
-        "--num-sentences", type=int, default=len(DEMO_SENTENCES),
-        help="Number of demo sentences to annotate (default: all 5).",
+        "--input", type=Path,
+        default=Path("./data/manually_labeled_last"),
+        help="Path to a .txt file (one sentence per line) or a directory of such files. "
+             "Defaults to data/manually_labeled_last. Pass --use-demo-sentences to ignore "
+             "this and use the built-in DEMO_SENTENCES instead.",
+    )
+    parser.add_argument(
+        "--use-demo-sentences", action="store_true",
+        help="Use the built-in DEMO_SENTENCES instead of reading from --input.",
+    )
+    parser.add_argument(
+        "--num-sentences", type=int, default=None,
+        help="Limit the number of sentences to annotate (default: all loaded).",
     )
     parser.add_argument(
         "--precedent-store", type=Path, default=None,
@@ -303,6 +347,12 @@ def main() -> None:
         help="Use the strict Critic mode: more aggressive challenge posture, "
              "missing spans checked first, low-confidence items forced into disagreements, "
              "and temperature=0.5 (vs default 0.3). Default Critic mode is unchanged.",
+    )
+    parser.add_argument(
+        "--guideline-search", choices=["mandatory", "optional"], default="mandatory",
+        help="Whether Annotator/Critic MUST call guideline_search before assigning/judging "
+             "each entity type ('mandatory', default) or only when a label is unclear "
+             "('optional'). Mandatory maximises guideline grounding but adds tool calls/latency.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -331,7 +381,12 @@ def main() -> None:
     if args.dry_run:
         run_dry(schema_path, seeds_path, guideline_search_backend=args.guideline_search_backend)
     else:
-        sentences = DEMO_SENTENCES[: args.num_sentences]
+        if args.use_demo_sentences:
+            sentences = DEMO_SENTENCES
+        else:
+            sentences = load_sentences(args.input.resolve())
+        if args.num_sentences is not None:
+            sentences = sentences[: args.num_sentences]
         run_live(
             sentences=sentences,
             schema_path=schema_path,
@@ -348,6 +403,7 @@ def main() -> None:
             max_retries=args.max_retries,
             request_timeout=args.timeout,
             strict_critic=args.strict_critic,
+            guideline_search_mandatory=(args.guideline_search == "mandatory"),
         )
 
 

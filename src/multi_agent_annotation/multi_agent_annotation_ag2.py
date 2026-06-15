@@ -92,6 +92,10 @@ class EntityAnnotation(BaseModel):
     start: Optional[int] = None
     end: Optional[int] = None
     guideline_step: Optional[str] = None
+    # Verbatim rule text from the guideline that justifies this type (set by the
+    # rule-grounding requirement in the Annotator prompt). Optional so older /
+    # malformed outputs still parse, but the prompt requires it.
+    guideline_rule: Optional[str] = None
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
 
@@ -1540,6 +1544,7 @@ class MultiAgentAnnotator:
         use_precedent_memory: bool = True,
         request_timeout: int = 600,
         strict_critic: bool = False,
+        guideline_search_mandatory: bool = True,
     ):
         self.max_rounds = max_rounds
         self.use_precedent_memory = use_precedent_memory
@@ -1593,6 +1598,12 @@ class MultiAgentAnnotator:
             f"guidance: {len(guidance_sections)} sections"
         )
 
+        # Give the two roles DIFFERENT in-prompt references so they bring distinct
+        # perspectives to the deliberation: the Annotator works from the decision
+        # table (operational per-label decision tree), the Critic/Adjudicator from
+        # the narrative guideline (edge cases, rationale). Neither is blinded to the
+        # other document — the guideline_search tool indexes both combined, so each
+        # agent can consult the other source on demand.
         annotator_guideline = _build_guideline_summary(decision_support_sections)
         critic_guideline = _build_guideline_summary(guidance_sections)
 
@@ -1613,11 +1624,17 @@ class MultiAgentAnnotator:
             f"critic: {critic_model} (mode={critic_mode_label}, t={critic_temperature}) | "
             f"adjudicator: {adjudicator_model}"
         )
+        logger.info(
+            "guideline_search: %s",
+            "mandatory" if guideline_search_mandatory else "optional",
+        )
 
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
             name="Annotator",
-            system_message=_annotator_system_msg(annotator_guideline, entity_schema_str, relation_schema),
+            system_message=_annotator_system_msg(
+                annotator_guideline, entity_schema_str, relation_schema,
+                guideline_search_mandatory=guideline_search_mandatory),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
             is_termination_msg=_is_final_terminate_msg,
@@ -1626,7 +1643,10 @@ class MultiAgentAnnotator:
         _critic_prompt_fn = _critic_system_msg_strict if strict_critic else _critic_system_msg
         self.critic = ConversableAgent(
             name="Critic",
-            system_message=_critic_prompt_fn(critic_guideline, entity_schema_str, relation_schema),
+            system_message=_critic_prompt_fn(
+                critic_guideline, entity_schema_str, relation_schema,
+                guideline_search_mandatory=guideline_search_mandatory,
+                precedent_memory=use_precedent_memory),
             llm_config=critic_llm,
             human_input_mode="NEVER",
             is_termination_msg=_is_final_terminate_msg,
@@ -1742,7 +1762,12 @@ class MultiAgentAnnotator:
                 last_annotator_out = parsed_ann
 
             # ── Critic turn ───────────────────────────────────
-            crit_msg = self._build_critic_review_msg(sentence, ann_content)
+            # On re-reviews, give the Critic its own prior verdict so it stays
+            # consistent and does not flip-flop on unchanged spans.
+            crit_msg = self._build_critic_review_msg(
+                sentence, ann_content,
+                prev_critic_text=last_critic_text if round_idx > 0 else None,
+            )
             logger.info("  [round %d] Critic …", round_idx + 1)
             crit_content, crit_record = self._run_agent_turn(self.critic, self.critic_executor, crit_msg)
             deliberation_messages.append(crit_record)
@@ -2318,10 +2343,23 @@ class MultiAgentAnnotator:
         clean_ann = MultiAgentAnnotator._strip_terminate(prev_annotation_text)
         clean_crit = MultiAgentAnnotator._strip_terminate(critic_feedback_text)
         msg = (
-            f"Revise your annotation for this sentence to address the Critic's feedback.\n\n"
+            f"Revise your annotation in light of the Critic's feedback. The Critic is a "
+            f"careful reviewer and its feedback is usually right, but not always.\n\n"
             f'Sentence: "{sentence}"\n\n'
             f"Your previous annotation:\n{clean_ann}\n\n"
-            f"Critic's feedback:\n{clean_crit}"
+            f"Critic's feedback:\n{clean_crit}\n\n"
+            f"Consider each point and decide:\n"
+            f"- Apply the corrections you agree with (fix the type, drop the span, or add "
+            f"a missing entity/relation). This should be your default.\n"
+            f"- If you have clear evidence that your original annotation was correct, you "
+            f"may keep it instead of conceding — but only when you can justify it.\n\n"
+            f"If a point is genuinely unclear, check it with guideline_search or "
+            f"schema_lookup before deciding.\n\n"
+            f"For any span you keep against the Critic's objection, its \"reasoning\" field "
+            f"must briefly cite the guideline step, schema rule, or sentence evidence that "
+            f"supports keeping it.\n\n"
+            f"Return your full revised annotation in the same JSON format as before "
+            f"(include all entities and relations, not only the changed ones)."
         )
         if pre_identified_entities:
             msg += (
@@ -2331,13 +2369,38 @@ class MultiAgentAnnotator:
         return msg
 
     @staticmethod
-    def _build_critic_review_msg(sentence: str, annotator_text: str) -> str:
+    def _build_critic_review_msg(
+        sentence: str,
+        annotator_text: str,
+        prev_critic_text: Optional[str] = None,
+    ) -> str:
         clean = MultiAgentAnnotator._strip_terminate(annotator_text)
-        msg = (
-            f"Review this annotation for the sentence below.\n\n"
-            f'Sentence: "{sentence}"\n\n'
-            f"Annotation:\n{clean}"
-        )
+        if prev_critic_text:
+            prev_clean = MultiAgentAnnotator._strip_terminate(prev_critic_text)
+            msg = (
+                f"This is a RE-REVIEW. The Annotator has revised its annotation in "
+                f"response to your previous review.\n\n"
+                f'Sentence: "{sentence}"\n\n'
+                f"Your previous review:\n{prev_clean}\n\n"
+                f"Revised annotation to review now:\n{clean}\n\n"
+                f"Stay consistent with your previous review — do not contradict your own "
+                f"earlier verdicts without cause:\n"
+                f"- Any label or relation you previously placed in \"agreements\" and that is "
+                f"UNCHANGED must be agreed again. Do not re-open settled items.\n"
+                f"- Only raise a disagreement about (a) an item that changed since your last "
+                f"review, or (b) a genuinely new error you overlooked before.\n"
+                f"- Check whether the Annotator addressed each of your previous "
+                f"disagreements; if a fix is adequate, move it to \"agreements\".\n"
+                f"- If you must reverse a previous verdict, say so explicitly in the "
+                f"\"explanation\" and justify why your earlier judgement was wrong — never "
+                f"flip silently on an unchanged span."
+            )
+        else:
+            msg = (
+                f"Review this annotation for the sentence below.\n\n"
+                f'Sentence: "{sentence}"\n\n'
+                f"Annotation:\n{clean}"
+            )
         parsed = MultiAgentAnnotator._parse_annotator_output(clean)
         if parsed:
             low_conf: List[str] = []
@@ -3283,7 +3346,7 @@ def main():
     parser.add_argument("--annotator-model", type=str, default="qwen3-32B-vllm")
     parser.add_argument("--critic-model", type=str, default="qwen3-32B-vllm")
     parser.add_argument("--adjudicator-model", type=str, default="qwen3-32B-vllm")
-    parser.add_argument("--max-rounds", type=int, default=2)
+    parser.add_argument("--max-rounds", type=int, default=1)
     parser.add_argument(
         "--guideline-search-backend",
         choices=["lexical", "embedding"],

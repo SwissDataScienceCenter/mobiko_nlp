@@ -50,21 +50,27 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 
 ## Coverage Rules
 - Prefer more entities over fewer: if a span could plausibly be an entity, include it.
-- Spans should consist in the minimum number of words. When possible, entities are therefore split. However, when entities taken together express a commonly used concept and very frequently appear together, they should not be split.
-  Good examples: [mountain biodiversity], [habitat quality], [species richness], [relict species], [biome affiliation]. A longer span has richer meaning than its separate components (1 + 1 > 2).
-- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing \
-  it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
-- Propose ALL relations schema_lookup returns as valid for a given entity-type pair.
+
+## Span boundary rule (apply top to bottom; stop at the first that decides)
+- Exclude leading determiners and demonstratives: "this species" → [species], "the frater complex" → [frater complex]. Never include "this/the/a/its/their".
+- Exclude ordinal/positional modifiers that aren't part of a fixed term: "first occurrence" → [occurrence].
+- Keep a multi-word span ONLY if it is a fixed domain term whose meaning is lost when split — [species richness], [mountain biodiversity], [habitat quality]. Test: would a biodiversity glossary list this exact phrase as one term?
+- Otherwise take the minimal head noun phrase, and split coordinations: "antibacterial and antifungal properties" → two spans: [antibacterial properties], [antifungal properties].
+- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
+
+## Other rules
 - List ambiguous spans in "uncertain_cases" rather than dropping them.
+- CONCEPT applies only to abstract scientific constructs, frameworks, or named methodologies. It is NEVER the right label for an entity whose domain (biotic/abiotic/spatial) is merely uncertain — in that case, choose the most likely domain type and mark uncertain: true.
+- Only propose a relation if both endpoint types are permitted for that relation in the schema_lookup. If unsure whether a relation is schema-valid, do not propose it.
 
 ## Output
-Return a JSON object with exactly these fields:
+Return a JSON object with exactly these fields (field values here are just examples):
 {{
   "entities": [
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
   ],
   "relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.85, "reasoning": "..."}}
+    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -153,11 +159,13 @@ Then work through the remaining annotation systematically in this order:
    - CONCEPT vs any concrete category (abstract theoretical construct vs real-world referent)
    - BIOTIC PROCESS vs ANTHROPOGENIC PROCESS (organism-driven vs human-driven activity)
    For each suspected confusion, call guideline_search to cite the relevant rule.
+   
+3. **Span extent** — for each annotated span, check its boundaries against the rule: does it include a leading determiner ("this", "the") or a non-fixed modifier that \
+should be dropped? If so, raise a disagreement proposing the trimmed span. Boundary errors are the single largest source of disagreement — scrutinise extent, not just type.
 
 {review_tail}
 
-After any tool calls return, you MUST produce the final review JSON. Do not stop after tool
-results or ask for another turn.
+After any tool calls return, you MUST produce the final review JSON. Do not stop after tool results or ask for another turn.
 
 ## Output
 Return a JSON object with exactly these fields:
@@ -254,6 +262,10 @@ Work through the annotation in this order:
 5. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the \
    relation is valid for that entity-type pair. Flag invalid or missing relations.{precedent_step}
 
+6. **CONCEPT is over-used as a fallback**. If the Annotator labelled something CONCEPT, \
+  check whether it has a concrete biotic/abiotic/spatial referent — if so, dispute \
+  the CONCEPT label and propose the domain type. Only accept CONCEPT for named abstract constructs.
+
 **Low-confidence items:** Any entity or relation the Annotator flagged with \
 confidence < {LOW_CONFIDENCE_THRESHOLD} MUST appear in your disagreements \
 or missing_annotations. Do not silently accept it.
@@ -263,8 +275,7 @@ yield at least one challenge or one missing span. If you find zero disagreements
 zero missing annotations, re-read the sentence and the Annotator's full output \
 before submitting — this outcome is unusual.
 
-After any tool calls return, you MUST produce the final review JSON. Do not stop after tool
-results or ask for another turn.
+After any tool calls return, you MUST produce the final review JSON. Do not stop after tool results or ask for another turn.
 
 ## Output
 Return a JSON object with exactly these fields:
@@ -288,7 +299,7 @@ Output rules:
 
 def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema: dict) -> str:
     return f"""\
-You are Adjudicator, the final decision-maker for biodiversity annotations.
+You are Adjudicator, the final decision-maker for biodiversity annotations. 
 You see the Annotator's labels and the Critic's review.
 
 ## Entity Type Schema
@@ -301,17 +312,13 @@ You see the Annotator's labels and the Critic's review.
 {guideline}
 
 ## Decision Rules
-1. Agreement between Annotator and Critic -> accept unchanged (high confidence).
-2. You may only change Annotator labels that appear in the Critic's final
-   "disagreements" list, or add spans that appear in "missing_annotations".
-3. If the Critic did not dispute a span or relation, keep the Annotator's
-   label exactly. Do not independently re-annotate accepted items.
-4. Disagreement -> check guideline via tools, apply tiebreaker:
-   "choose the category describing the primary referent in the sentence."
+1. Agreement between Annotator and Critic -> accept unchanged (high confidence). 
+2. You may only change Annotator labels that appear in the Critic's final "disagreements" list, or add spans that appear in "missing_annotations". 
+3. If the Critic did not dispute a span or relation, keep the Annotator's label exactly. Do not independently re-annotate accepted items.
+4. Disagreement -> check guideline via tools, apply tiebreaker: "choose the category describing the primary referent in the sentence."
 5. Genuine ambiguity -> flag for human review, pick the safer label.
 6. Always copy Annotator "uncertain_cases" into "flagged_for_human_review".
-7. If a Critic disagreement has severity "critical" and no clear
-   guideline_reference, include that target in "flagged_for_human_review".
+7. If a Critic disagreement has severity "critical" and no clear guideline_reference, include that target in "flagged_for_human_review".
 
 ## Output
 
