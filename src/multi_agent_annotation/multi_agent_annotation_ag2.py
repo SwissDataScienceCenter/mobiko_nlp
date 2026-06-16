@@ -83,6 +83,89 @@ _patch_autogen_for_reasoning_content()
 
 
 # ─────────────────────────────────────────────────────────────
+# Streaming logprob capture
+# ─────────────────────────────────────────────────────────────
+# AG2's streaming reconstruction discards per-chunk logprobs (it rebuilds the
+# response with logprobs=None), so token-probability data never reaches the
+# pipeline even when the server streams it. We keep stream=True (required for
+# this gateway) and instead tee the chunk stream: a thin wrapper around the
+# OpenAI SDK's chat.completions.create yields the exact same chunks to AG2
+# while accumulating each chunk's content-token logprobs into a per-thread
+# buffer. Nothing about AG2's behaviour changes; we just observe the data it
+# throws away. Request logprobs via build_llm_config(..., logprobs=True).
+import threading
+
+_LOGPROB_CAPTURE = threading.local()
+
+
+def _logprob_streams() -> list:
+    streams = getattr(_LOGPROB_CAPTURE, "streams", None)
+    if streams is None:
+        streams = []
+        _LOGPROB_CAPTURE.streams = streams
+    return streams
+
+
+def reset_logprob_capture() -> None:
+    """Clear the capture buffer; call before a turn whose logprobs you want."""
+    _LOGPROB_CAPTURE.streams = []
+
+
+def last_content_mean_logprob() -> Optional[float]:
+    """
+    Mean per-token logprob of the most recent streamed generation that emitted
+    content tokens (i.e. the JSON answer, not a tool-call-only turn).
+    Returns None if no content-bearing stream with logprobs was captured.
+    """
+    for s in reversed(_logprob_streams()):
+        if s["n"] > 0:
+            return s["sum"] / s["n"]
+    return None
+
+
+def _patch_openai_for_streaming_logprobs() -> None:
+    try:
+        from openai.resources.chat.completions import Completions
+    except Exception as exc:  # SDK shape changed / not installed — capture is a no-op
+        logger.warning("Streaming logprob capture disabled (openai import failed): %s", exc)
+        return
+
+    if getattr(Completions, "_mobiko_logprob_patched", False):
+        return
+
+    _orig_create = Completions.create
+
+    def _patched_create(self, *args, **kwargs):
+        resp = _orig_create(self, *args, **kwargs)
+        if not kwargs.get("stream"):
+            return resp  # non-streaming responses keep logprobs natively
+        record = {"sum": 0.0, "n": 0}
+        _logprob_streams().append(record)
+
+        def _tee():
+            for chunk in resp:
+                try:
+                    for choice in (getattr(chunk, "choices", None) or []):
+                        lp = getattr(choice, "logprobs", None)
+                        content = getattr(lp, "content", None) if lp else None
+                        for tok in (content or []):
+                            if getattr(tok, "logprob", None) is not None:
+                                record["sum"] += tok.logprob
+                                record["n"] += 1
+                except Exception:
+                    pass  # never let capture break the actual generation
+                yield chunk
+
+        return _tee()
+
+    Completions.create = _patched_create
+    Completions._mobiko_logprob_patched = True
+
+
+_patch_openai_for_streaming_logprobs()
+
+
+# ─────────────────────────────────────────────────────────────
 # Data structures
 # ─────────────────────────────────────────────────────────────
 
@@ -119,6 +202,10 @@ class DeliberationRecord(BaseModel):
     adjudication_status: Optional[str] = None
     adjudication_audit: Dict[str, Any] = Field(default_factory=dict)
     token_usage: Dict[str, Any] = Field(default_factory=dict)
+    # Mean per-token logprob of the Annotator's initial annotation generation.
+    # Confidence baseline for H1' (pre-empts the "disagreement is just LLM
+    # token uncertainty" objection). None if logprobs were unavailable.
+    annotator_mean_logprob: Optional[float] = None
     timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
@@ -287,10 +374,18 @@ def build_llm_config(
     model_key: str,
     temperature: float = 0.3,
     timeout: int = 600,
+    tool_choice: Optional[str] = None,
+    logprobs: bool = False,
 ) -> LLMConfig:
     """
     Build an AG2 LLMConfig for one of the SDSC endpoints.
     AG2 wraps OpenAI-compatible APIs natively.
+
+    tool_choice (optional): forwarded to the OpenAI-compatible API to control
+    whether the model may/must emit tool calls. One of "auto" (default server
+    behaviour — tools are optional), "required" (the model MUST emit a tool call
+    on every turn), or "none" (tools disabled). When None, the key is omitted
+    and the server default ("auto") applies.
     """
     endpoint = MODEL_ENDPOINTS.get(model_key)
     if not endpoint:
@@ -310,7 +405,12 @@ def build_llm_config(
         "api_key": api_key,
         "api_type": "openai",
         "timeout": timeout,
+        "stream": True
     }
+    if tool_choice:
+        config["tool_choice"] = tool_choice
+    if logprobs:
+        config["logprobs"] = True
     return LLMConfig(config, temperature=temperature)
 
 
@@ -1545,6 +1645,7 @@ class MultiAgentAnnotator:
         request_timeout: int = 600,
         strict_critic: bool = False,
         guideline_search_mandatory: bool = True,
+        tool_choice: Optional[str] = None,
     ):
         self.max_rounds = max_rounds
         self.use_precedent_memory = use_precedent_memory
@@ -1614,10 +1715,10 @@ class MultiAgentAnnotator:
             )
 
         # ── Build LLM configs ────────────────────────────────
-        annotator_llm = build_llm_config(annotator_model, temperature=0.2, timeout=request_timeout)
+        annotator_llm = build_llm_config(annotator_model, temperature=0.2, timeout=request_timeout, tool_choice=tool_choice, logprobs=True)
         critic_temperature = 0.5 if strict_critic else 0.3
-        critic_llm = build_llm_config(critic_model, temperature=critic_temperature, timeout=request_timeout)
-        adjudicator_llm = build_llm_config(adjudicator_model, temperature=0.1, timeout=request_timeout)
+        critic_llm = build_llm_config(critic_model, temperature=critic_temperature, timeout=request_timeout, tool_choice=tool_choice)
+        adjudicator_llm = build_llm_config(adjudicator_model, temperature=0.1, timeout=request_timeout, tool_choice=tool_choice)
         critic_mode_label = "strict" if strict_critic else "default"
         logger.info(
             f"Models — annotator: {annotator_model} | "
@@ -1627,6 +1728,10 @@ class MultiAgentAnnotator:
         logger.info(
             "guideline_search: %s",
             "mandatory" if guideline_search_mandatory else "optional",
+        )
+        logger.info(
+            "tool_choice: %s",
+            tool_choice if tool_choice else "auto (server default)",
         )
 
         # ── Create agents ────────────────────────────────────
@@ -1751,6 +1856,11 @@ class MultiAgentAnnotator:
             logger.info("  [round %d] Annotator …", round_idx + 1)
             ann_content, ann_record = self._run_agent_turn(self.annotator, self.annotator_executor, ann_msg)
             deliberation_messages.append(ann_record)
+            # Record the Annotator's confidence on its initial annotation as the
+            # H1' baseline — the first round that yields a logprob (normally
+            # round 0, before any Critic influence).
+            if record.annotator_mean_logprob is None:
+                record.annotator_mean_logprob = ann_record.get("mean_logprob")
             last_annotator_text = ann_content
             for k in annotator_tokens:
                 annotator_tokens[k] += ann_record["token_usage"].get(k, 0)
@@ -2453,6 +2563,7 @@ class MultiAgentAnnotator:
         """
         agent.reset()
         executor.reset()
+        reset_logprob_capture()
         _t0 = time.perf_counter()
         chat = agent.initiate_chat(
             recipient=executor,
@@ -2460,6 +2571,7 @@ class MultiAgentAnnotator:
             max_turns=self._agent_turn_max_turns(),
         )
         elapsed_s = time.perf_counter() - _t0
+        mean_logprob = last_content_mean_logprob()
         all_msgs = _collect_messages_with_tools(chat.chat_history, skip_first=True)
 
         agent_name = agent.name
@@ -2480,6 +2592,7 @@ class MultiAgentAnnotator:
             "tool_calls": all_tool_calls,
             "token_usage": self._sum_usage(getattr(chat, "cost", {})),
             "elapsed_s": round(elapsed_s, 2),
+            "mean_logprob": mean_logprob,
         }
 
     @staticmethod
@@ -3411,5 +3524,3 @@ def main():
     print(json.dumps(stats, indent=2, ensure_ascii=False))
 
 
-if __name__ == "__main__":
-    main()

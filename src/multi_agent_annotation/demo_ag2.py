@@ -245,6 +245,7 @@ def run_live(
     request_timeout: int = 600,
     strict_critic: bool = False,
     guideline_search_mandatory: bool = True,
+    tool_choice: str | None = None,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -262,6 +263,7 @@ def run_live(
         request_timeout=request_timeout,
         strict_critic=strict_critic,
         guideline_search_mandatory=guideline_search_mandatory,
+        tool_choice=tool_choice,
     )
 
     records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume, max_retries=max_retries)
@@ -311,7 +313,7 @@ def main() -> None:
         "--max-rounds", type=int, default=2,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled1.jsonl"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled2.jsonl"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(
@@ -349,10 +351,12 @@ def main() -> None:
              "and temperature=0.5 (vs default 0.3). Default Critic mode is unchanged.",
     )
     parser.add_argument(
-        "--guideline-search", choices=["mandatory", "optional"], default="mandatory",
+        "--guideline-search", choices=["mandatory", "optional"], default="optional",
         help="Whether Annotator/Critic MUST call guideline_search before assigning/judging "
-             "each entity type ('mandatory', default) or only when a label is unclear "
-             "('optional'). Mandatory maximises guideline grounding but adds tool calls/latency.",
+             "each entity type ('mandatory') or only when a label is unclear "
+             "('optional', default). The full guideline is already injected into the system "
+             "prompt, so 'optional' avoids redundant tool calls/latency; use 'mandatory' only "
+             "if you specifically want forced per-span guideline retrieval.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -368,6 +372,12 @@ def main() -> None:
         "--timeout", type=int, default=600,
         help="Per-request HTTP timeout in seconds for all model API calls (default: 600). "
              "Increase this if you see 504 Gateway Timeout errors.",
+    )
+    parser.add_argument(
+        "--tool-choice", choices=["auto", "required", "none"], default="auto",
+        help="Controls whether agents may/must emit tool calls. 'auto' (default) = tools "
+             "optional, the model decides; 'required' = the model MUST emit a tool call every "
+             "turn (diagnostic only — breaks final-JSON turns); 'none' = tools disabled.",
     )
     args = parser.parse_args()
 
@@ -404,6 +414,7 @@ def main() -> None:
             request_timeout=args.timeout,
             strict_critic=args.strict_critic,
             guideline_search_mandatory=(args.guideline_search == "mandatory"),
+            tool_choice=args.tool_choice,
         )
 
 
