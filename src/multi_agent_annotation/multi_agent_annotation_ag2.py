@@ -93,34 +93,48 @@ _patch_autogen_for_reasoning_content()
 # while accumulating each chunk's content-token logprobs into a per-thread
 # buffer. Nothing about AG2's behaviour changes; we just observe the data it
 # throws away. Request logprobs via build_llm_config(..., logprobs=True).
-import threading
+# Module-global (NOT thread-local): AG2 may run the streaming completion on a
+# worker thread while _run_agent_turn reads the buffer on the main thread, so a
+# thread-local would come back empty. annotate_batch is sequential, so a shared
+# global has no concurrency hazard. Mutated in place (.clear()/.append()) so the
+# same list object stays visible across threads.
+# Each captured stream stores its content tokens as (token_text, logprob) pairs,
+# so we can compute both a whole-generation mean and a per-entity, label-token
+# mean (by reconstructing the text and aligning to entity_type values).
+_LOGPROB_STREAMS: List[List[Tuple[str, float]]] = []
 
-_LOGPROB_CAPTURE = threading.local()
 
-
-def _logprob_streams() -> list:
-    streams = getattr(_LOGPROB_CAPTURE, "streams", None)
-    if streams is None:
-        streams = []
-        _LOGPROB_CAPTURE.streams = streams
-    return streams
+def _logprob_streams() -> List[List[Tuple[str, float]]]:
+    return _LOGPROB_STREAMS
 
 
 def reset_logprob_capture() -> None:
     """Clear the capture buffer; call before a turn whose logprobs you want."""
-    _LOGPROB_CAPTURE.streams = []
+    _LOGPROB_STREAMS.clear()
+
+
+def _last_content_stream() -> Optional[List[Tuple[str, float]]]:
+    """Tokens of the most recent streamed generation that emitted any tokens."""
+    for toks in reversed(_logprob_streams()):
+        if toks:
+            return toks
+    return None
 
 
 def last_content_mean_logprob() -> Optional[float]:
     """
-    Mean per-token logprob of the most recent streamed generation that emitted
-    content tokens (i.e. the JSON answer, not a tool-call-only turn).
-    Returns None if no content-bearing stream with logprobs was captured.
+    Mean per-token logprob over the most recent streamed generation that emitted
+    tokens (the JSON answer). Returns None if no logprobs were captured.
     """
-    for s in reversed(_logprob_streams()):
-        if s["n"] > 0:
-            return s["sum"] / s["n"]
-    return None
+    toks = _last_content_stream()
+    if not toks:
+        return None
+    return sum(lp for _, lp in toks) / len(toks)
+
+
+def last_content_token_logprobs() -> Optional[List[Tuple[str, float]]]:
+    """Raw (token_text, logprob) pairs of the last content-bearing generation."""
+    return _last_content_stream()
 
 
 def _patch_openai_for_streaming_logprobs() -> None:
@@ -139,8 +153,8 @@ def _patch_openai_for_streaming_logprobs() -> None:
         resp = _orig_create(self, *args, **kwargs)
         if not kwargs.get("stream"):
             return resp  # non-streaming responses keep logprobs natively
-        record = {"sum": 0.0, "n": 0}
-        _logprob_streams().append(record)
+        tokens: List[Tuple[str, float]] = []
+        _logprob_streams().append(tokens)
 
         def _tee():
             for chunk in resp:
@@ -150,8 +164,7 @@ def _patch_openai_for_streaming_logprobs() -> None:
                         content = getattr(lp, "content", None) if lp else None
                         for tok in (content or []):
                             if getattr(tok, "logprob", None) is not None:
-                                record["sum"] += tok.logprob
-                                record["n"] += 1
+                                tokens.append((getattr(tok, "token", "") or "", tok.logprob))
                 except Exception:
                     pass  # never let capture break the actual generation
                 yield chunk
@@ -183,6 +196,54 @@ class EntityAnnotation(BaseModel):
     reasoning: Optional[str] = None
 
 
+_ENTITY_TYPE_VALUE_RE = re.compile(r'"entity_type"\s*:\s*"([^"]*)"')
+
+
+def _per_entity_type_logprobs(
+    tokens: List[Tuple[str, float]],
+    entities: List["EntityAnnotation"],
+) -> List[Dict[str, Any]]:
+    """
+    Align streamed output tokens to each entity's entity_type VALUE and return,
+    per entity (in JSON order), the mean logprob over the tokens forming that
+    value — a label-token-only confidence signal, sharper than the whole-output
+    mean for the H1' baseline.
+
+    The i-th ``"entity_type": "..."`` occurrence in the generated JSON is matched
+    to the i-th entity (the parser preserves array order). Returns a list of
+    ``{"text", "entity_type", "type_mean_logprob"}``; ``type_mean_logprob`` is
+    None for any entity whose value tokens could not be located.
+    """
+    if not tokens or not entities:
+        return []
+    # Reconstruct the generated text while recording each token's char span.
+    spans: List[Tuple[int, int, float]] = []
+    pos = 0
+    parts: List[str] = []
+    for tok_text, lp in tokens:
+        start = pos
+        pos += len(tok_text)
+        parts.append(tok_text)
+        spans.append((start, pos, lp))
+    full = "".join(parts)
+
+    matches = list(_ENTITY_TYPE_VALUE_RE.finditer(full))
+    out: List[Dict[str, Any]] = []
+    for i, ent in enumerate(entities):
+        mean_lp: Optional[float] = None
+        if i < len(matches):
+            vstart, vend = matches[i].start(1), matches[i].end(1)
+            lps = [lp for (s, e, lp) in spans if e > vstart and s < vend]
+            if lps:
+                mean_lp = sum(lps) / len(lps)
+        out.append({
+            "text": ent.text,
+            "entity_type": ent.entity_type,
+            "type_mean_logprob": mean_lp,
+        })
+    return out
+
+
 class RelationAnnotation(BaseModel):
     relation: str
     e1: EntityAnnotation
@@ -206,6 +267,10 @@ class DeliberationRecord(BaseModel):
     # Confidence baseline for H1' (pre-empts the "disagreement is just LLM
     # token uncertainty" objection). None if logprobs were unavailable.
     annotator_mean_logprob: Optional[float] = None
+    # Per-entity label-token confidence for the initial annotation: one entry per
+    # entity (JSON order) — {"text", "entity_type", "type_mean_logprob"}. Sharper
+    # than the whole-output mean because it isolates the entity_type value tokens.
+    annotator_entity_logprobs: List[Dict[str, Any]] = Field(default_factory=list)
     timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
@@ -1871,6 +1936,16 @@ class MultiAgentAnnotator:
             if parsed_ann is not None:
                 last_annotator_out = parsed_ann
 
+            # Per-entity label-token confidence for the INITIAL annotation.
+            # The capture buffer still holds this turn's tokens (the Critic turn
+            # below resets it), so align them to the parsed entities now.
+            if not record.annotator_entity_logprobs and parsed_ann is not None:
+                _toks = last_content_token_logprobs()
+                if _toks:
+                    record.annotator_entity_logprobs = _per_entity_type_logprobs(
+                        _toks, parsed_ann.entities
+                    )
+
             # ── Critic turn ───────────────────────────────────
             # On re-reviews, give the Critic its own prior verdict so it stays
             # consistent and does not flip-flop on unchanged spans.
@@ -2572,6 +2647,12 @@ class MultiAgentAnnotator:
         )
         elapsed_s = time.perf_counter() - _t0
         mean_logprob = last_content_mean_logprob()
+        logger.info(
+            "  [%s] mean_logprob=%s (captured %d stream(s))",
+            agent.name,
+            f"{mean_logprob:.4f}" if mean_logprob is not None else "None",
+            len(_logprob_streams()),
+        )
         all_msgs = _collect_messages_with_tools(chat.chat_history, skip_first=True)
 
         agent_name = agent.name
