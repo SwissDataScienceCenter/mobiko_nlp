@@ -160,7 +160,7 @@ EXAMPLES:
     ],
     "rejected": [],
     "missing": [
-        {{"mention_text": "numerous", "type": "BIOTIC PROPERTY", "start_char": 48, "end_char": 64, "concept_text": "numerous", "concept_note": None, "reason": "Missing property of species", "uncertain": false}}
+        {{"mention_text": "numerous", "type": "QUALITATIVE PROPERTY", "start_char": 48, "end_char": 64, "concept_text": "numerous", "concept_note": None, "reason": "Missing property of species", "uncertain": false}}
         ],
     "notes": "ABIOTIC PROPERTY vs ABIOTIC PROCESS: chose PROCESS for Deforestation"
 }}}}
@@ -183,7 +183,8 @@ EXAMPLES:
         {{"mention_text": "Habitat loss", "type": "ABIOTIC PROCESS", "start_char": 0, "end_char": 12, "concept_text": "habitat loss", "concept_note": "habitat loss and habitat fragmentation are two entities", "note": None, "uncertain": false}},
         {{"mention_text": "dispersion", "type": "BIOTIC PROPERTY", "start_char": 88, "end_char": 98, "concept_text": "dispersion", "concept_note": None, "reason": "Missing property related to carnivores", "uncertain": false}},
         {{"mention_text": "population viability", "type": "BIOTIC PROPERTY", "start_char": 103, "end_char": 123, "concept_text": "population viability", "concept_note": None, "reason": "Missing property related to carnivores", "uncertain": false}},
-        {{"mention_text": "reduced available habitat", "type": "ABIOTIC ENTITY", "start_char": 143, "end_char": 168, "concept_text": "reduced available habitat", "concept_note": None, "reason": "Missing entity related to carnivores", "uncertain": false}},
+        {{"mention_text": "reduced", "type": "ABIOTIC PROPERTY", "start_char": 143, "end_char": 151, "concept_text": "reduced", "concept_note": None, "uncertain": false}},
+        {{"mention_text": "available habitat", "type": "ABIOTIC ENTITY", "start_char": 151, "end_char": 168, "concept_text": "reduced available habitat", "concept_note": None, "reason": "Missing entity related to carnivores", "uncertain": false}},
         {{"mention_text": "anthropogenic elements", "type": "ANTHROPOGENIC ENTITY", "start_char": 173, "end_char": 195, "concept_text": "anthropogenic elements", "concept_note": None, "reason": "Missing entity related to human impact on carnivores", "uncertain": false}},
     ],
     "notes": ""
@@ -202,11 +203,11 @@ EXAMPLES:
     "accepted": [
       {{"mention_text": "nature conservation", "type": "ANTHROPOGENIC PROCESS", "start_char": 22, "end_char": 41, "concept_text": "nature conservation", "concept_note": "Canonical already", "note": "Institutional / management activity; treat as anthropogenic process.", "uncertain": false}},
       {{"mention_text": "new PAs", "type": "ANTHROPOGENIC ENTITY", "start_char": 64, "end_char": 70, "concept_text": "protected areas", "concept_note": "Abbreviation expansion: PAs → protected areas", "note": "PAs likely means protected areas; keep mention as-is, normalize concept.", "uncertain": true}},
-      {{"mention_text": "a man-altered landscape", "type": "ANTHROPOGENIC ENTITY", "start_char": 120, "end_char": 142, "concept_text": "human-altered landscape", "concept_note": "Normalize wording", "note: None, "uncertain": false}}
+      {{"mention_text": "man-altered landscape", "type": "ANTHROPOGENIC ENTITY", "start_char": 120, "end_char": 142, "concept_text": "human-altered landscape", "concept_note": "Normalize wording", "note: None, "uncertain": false}}
     ],
     "rejected": [
       {{"text": "isolated islands of nature", "reason": "metaphorical phrasing; unclear mapping to a single concrete entity type without additional context"}},
-      {{"text": "the midst", "reason": "generic phrase; not an entity"}}
+      {{"text": "midst", "reason": "generic phrase; not an entity"}}
     ],
     "missing": [],
     "notes": "Example demonstrates: (1) extractive mentions with offsets; (2) optional canonical concept mapping (abbreviation expansion, normalization)."
