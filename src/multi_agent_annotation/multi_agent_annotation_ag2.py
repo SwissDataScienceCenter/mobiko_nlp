@@ -29,7 +29,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional, Tuple, Any
+from typing import Annotated, Dict, List, NamedTuple, Optional, Tuple, Any
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -92,19 +92,52 @@ _patch_autogen_for_reasoning_content()
 # OpenAI SDK's chat.completions.create yields the exact same chunks to AG2
 # while accumulating each chunk's content-token logprobs into a per-thread
 # buffer. Nothing about AG2's behaviour changes; we just observe the data it
-# throws away. Request logprobs via build_llm_config(..., logprobs=True).
+# throws away. Request logprobs via build_llm_config(..., logprobs=True,
+# top_logprobs=N) — top_logprobs adds the per-position candidate distribution
+# needed for predictive ENTROPY (the chosen-token logprob saturates to ~0 under
+# constrained/tool_choice decoding, so it carries little uncertainty; entropy
+# over the candidate types does).
 # Module-global (NOT thread-local): AG2 may run the streaming completion on a
 # worker thread while _run_agent_turn reads the buffer on the main thread, so a
 # thread-local would come back empty. annotate_batch is sequential, so a shared
 # global has no concurrency hazard. Mutated in place (.clear()/.append()) so the
 # same list object stays visible across threads.
-# Each captured stream stores its content tokens as (token_text, logprob) pairs,
-# so we can compute both a whole-generation mean and a per-entity, label-token
-# mean (by reconstructing the text and aligning to entity_type values).
-_LOGPROB_STREAMS: List[List[Tuple[str, float]]] = []
+# Each captured stream stores its content tokens as TokenLP(token, logprob, top)
+# entries, so we can compute a whole-generation mean logprob/entropy and a
+# per-entity, label-token mean/entropy (aligning to entity_type values).
 
 
-def _logprob_streams() -> List[List[Tuple[str, float]]]:
+class TokenLP(NamedTuple):
+    """One streamed content token: the chosen text + its logprob, plus the top-k
+    candidate (token, logprob) distribution at that position. ``top`` is empty
+    when the server did not return top_logprobs."""
+    token: str
+    logprob: float
+    top: List[Tuple[str, float]]
+
+
+def _token_entropy(top: List[Tuple[str, float]]) -> Optional[float]:
+    """
+    Shannon entropy (nats) of the next-token distribution from the returned top-k
+    candidates. Tail mass not in the top-k is lumped into a single residual
+    bucket (a lower bound on the true tail contribution). None if no candidates.
+    """
+    if not top:
+        return None
+    ps = [math.exp(lp) for _, lp in top if lp is not None]
+    if not ps:
+        return None
+    h = -sum(p * math.log(p) for p in ps if p > 0.0)
+    residual = 1.0 - sum(ps)
+    if residual > 1e-9:
+        h -= residual * math.log(residual)
+    return h
+
+
+_LOGPROB_STREAMS: List[List[TokenLP]] = []
+
+
+def _logprob_streams() -> List[List[TokenLP]]:
     return _LOGPROB_STREAMS
 
 
@@ -113,7 +146,7 @@ def reset_logprob_capture() -> None:
     _LOGPROB_STREAMS.clear()
 
 
-def _last_content_stream() -> Optional[List[Tuple[str, float]]]:
+def _last_content_stream() -> Optional[List[TokenLP]]:
     """Tokens of the most recent streamed generation that emitted any tokens."""
     for toks in reversed(_logprob_streams()):
         if toks:
@@ -129,11 +162,26 @@ def last_content_mean_logprob() -> Optional[float]:
     toks = _last_content_stream()
     if not toks:
         return None
-    return sum(lp for _, lp in toks) / len(toks)
+    return sum(t.logprob for t in toks) / len(toks)
 
 
-def last_content_token_logprobs() -> Optional[List[Tuple[str, float]]]:
-    """Raw (token_text, logprob) pairs of the last content-bearing generation."""
+def last_content_mean_entropy() -> Optional[float]:
+    """
+    Mean per-token predictive entropy (nats) over the most recent streamed
+    generation, using each position's top-k candidate distribution. Returns None
+    if top_logprobs were unavailable (no token yielded a candidate distribution).
+    """
+    toks = _last_content_stream()
+    if not toks:
+        return None
+    ents = [e for e in (_token_entropy(t.top) for t in toks) if e is not None]
+    if not ents:
+        return None
+    return sum(ents) / len(ents)
+
+
+def last_content_token_logprobs() -> Optional[List[TokenLP]]:
+    """The captured TokenLP entries of the last content-bearing generation."""
     return _last_content_stream()
 
 
@@ -153,7 +201,7 @@ def _patch_openai_for_streaming_logprobs() -> None:
         resp = _orig_create(self, *args, **kwargs)
         if not kwargs.get("stream"):
             return resp  # non-streaming responses keep logprobs natively
-        tokens: List[Tuple[str, float]] = []
+        tokens: List[TokenLP] = []
         _logprob_streams().append(tokens)
 
         def _tee():
@@ -164,7 +212,13 @@ def _patch_openai_for_streaming_logprobs() -> None:
                         content = getattr(lp, "content", None) if lp else None
                         for tok in (content or []):
                             if getattr(tok, "logprob", None) is not None:
-                                tokens.append((getattr(tok, "token", "") or "", tok.logprob))
+                                top = [
+                                    (getattr(c, "token", "") or "", c.logprob)
+                                    for c in (getattr(tok, "top_logprobs", None) or [])
+                                    if getattr(c, "logprob", None) is not None
+                                ]
+                                tokens.append(TokenLP(
+                                    getattr(tok, "token", "") or "", tok.logprob, top))
                 except Exception:
                     pass  # never let capture break the actual generation
                 yield chunk
@@ -200,46 +254,71 @@ _ENTITY_TYPE_VALUE_RE = re.compile(r'"entity_type"\s*:\s*"([^"]*)"')
 
 
 def _per_entity_type_logprobs(
-    tokens: List[Tuple[str, float]],
+    tokens: List["TokenLP"],
     entities: List["EntityAnnotation"],
 ) -> List[Dict[str, Any]]:
     """
     Align streamed output tokens to each entity's entity_type VALUE and return,
-    per entity (in JSON order), the mean logprob over the tokens forming that
-    value — a label-token-only confidence signal, sharper than the whole-output
-    mean for the H1' baseline.
+    per entity (in JSON order), token-probability uncertainty over that value:
+
+      type_mean_logprob      mean logprob of the value's chosen tokens. SATURATES
+                             to ~0 under constrained/tool_choice decoding — kept
+                             for back-compat / the H1' baseline.
+      type_mean_entropy      mean predictive entropy (nats) over the value's
+                             tokens, from each position's top-k candidates. The
+                             informative signal: high when a competing type was
+                             plausible. None if top_logprobs were unavailable.
+      type_max_entropy       entropy of the single most-uncertain value token
+                             (usually the type-discriminating one).
+      type_top_alternatives  top candidate (token, prob) list at that most-
+                             uncertain token, for inspection.
 
     The i-th ``"entity_type": "..."`` occurrence in the generated JSON is matched
-    to the i-th entity (the parser preserves array order). Returns a list of
-    ``{"text", "entity_type", "type_mean_logprob"}``; ``type_mean_logprob`` is
-    None for any entity whose value tokens could not be located.
+    to the i-th entity (the parser preserves array order). Per-entity fields are
+    None when the value's tokens could not be located.
     """
     if not tokens or not entities:
         return []
-    # Reconstruct the generated text while recording each token's char span.
-    spans: List[Tuple[int, int, float]] = []
+    # Reconstruct the generated text while recording each token's char span,
+    # logprob, and candidate distribution.
+    spans: List[Tuple[int, int, float, List[Tuple[str, float]]]] = []
     pos = 0
     parts: List[str] = []
-    for tok_text, lp in tokens:
+    for t in tokens:
         start = pos
-        pos += len(tok_text)
-        parts.append(tok_text)
-        spans.append((start, pos, lp))
+        pos += len(t.token)
+        parts.append(t.token)
+        spans.append((start, pos, t.logprob, t.top))
     full = "".join(parts)
 
     matches = list(_ENTITY_TYPE_VALUE_RE.finditer(full))
     out: List[Dict[str, Any]] = []
     for i, ent in enumerate(entities):
         mean_lp: Optional[float] = None
+        mean_ent: Optional[float] = None
+        max_ent: Optional[float] = None
+        top_alts: Optional[List[Tuple[str, float]]] = None
         if i < len(matches):
             vstart, vend = matches[i].start(1), matches[i].end(1)
-            lps = [lp for (s, e, lp) in spans if e > vstart and s < vend]
+            val_toks = [(lp, top) for (s, e, lp, top) in spans if e > vstart and s < vend]
+            lps = [lp for lp, _ in val_toks]
             if lps:
                 mean_lp = sum(lps) / len(lps)
+            ent_top = [(_token_entropy(top), top) for _, top in val_toks]
+            ent_top = [(h, top) for h, top in ent_top if h is not None]
+            if ent_top:
+                hs = [h for h, _ in ent_top]
+                mean_ent = sum(hs) / len(hs)
+                max_ent, max_top = max(ent_top, key=lambda x: x[0])
+                top_alts = [(tk, round(math.exp(clp), 4)) for tk, clp in
+                            sorted(max_top, key=lambda c: c[1], reverse=True)[:3]]
         out.append({
             "text": ent.text,
             "entity_type": ent.entity_type,
             "type_mean_logprob": mean_lp,
+            "type_mean_entropy": mean_ent,
+            "type_max_entropy": max_ent,
+            "type_top_alternatives": top_alts,
         })
     return out
 
@@ -267,9 +346,15 @@ class DeliberationRecord(BaseModel):
     # Confidence baseline for H1' (pre-empts the "disagreement is just LLM
     # token uncertainty" objection). None if logprobs were unavailable.
     annotator_mean_logprob: Optional[float] = None
-    # Per-entity label-token confidence for the initial annotation: one entry per
-    # entity (JSON order) — {"text", "entity_type", "type_mean_logprob"}. Sharper
-    # than the whole-output mean because it isolates the entity_type value tokens.
+    # Mean per-token predictive ENTROPY (nats) over the Annotator's initial
+    # generation, from each position's top-k candidates. Unlike the chosen-token
+    # logprob (which saturates under constrained decoding), entropy reflects how
+    # contested each token was. None if top_logprobs were unavailable.
+    annotator_mean_entropy: Optional[float] = None
+    # Per-entity label-token uncertainty for the initial annotation: one entry per
+    # entity (JSON order) — {"text", "entity_type", "type_mean_logprob",
+    # "type_mean_entropy", "type_max_entropy", "type_top_alternatives"}. Isolates
+    # the entity_type value tokens; entropy fields are the informative signal.
     annotator_entity_logprobs: List[Dict[str, Any]] = Field(default_factory=list)
     timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
@@ -434,6 +519,10 @@ MODEL_ENDPOINTS = {
 # Override at run-time without code changes: ADJUDICATOR_MODEL=gpt4o python ...
 _DEFAULT_ADJUDICATOR_MODEL: str = os.getenv("ADJUDICATOR_MODEL", "qwen3-32B-vllm")
 
+# Top-k candidate logprobs requested at each token position, for type-token
+# predictive entropy. 0 (or empty) disables; OpenAI/vLLM cap is 20.
+ANNOTATOR_TOP_LOGPROBS: Optional[int] = int(os.getenv("ANNOTATOR_TOP_LOGPROBS", "20")) or None
+
 
 def build_llm_config(
     model_key: str,
@@ -441,6 +530,7 @@ def build_llm_config(
     timeout: int = 600,
     tool_choice: Optional[str] = None,
     logprobs: bool = False,
+    top_logprobs: Optional[int] = None,
 ) -> LLMConfig:
     """
     Build an AG2 LLMConfig for one of the SDSC endpoints.
@@ -451,6 +541,11 @@ def build_llm_config(
     behaviour — tools are optional), "required" (the model MUST emit a tool call
     on every turn), or "none" (tools disabled). When None, the key is omitted
     and the server default ("auto") applies.
+
+    top_logprobs (optional, 0-20): when set, requests the per-position candidate
+    distribution (implies logprobs=True) so the pipeline can compute type-token
+    predictive entropy. Forwarded to the OpenAI-compatible API; if the gateway
+    rejects it, set ANNOTATOR_TOP_LOGPROBS=0 to disable.
     """
     endpoint = MODEL_ENDPOINTS.get(model_key)
     if not endpoint:
@@ -474,8 +569,10 @@ def build_llm_config(
     }
     if tool_choice:
         config["tool_choice"] = tool_choice
-    if logprobs:
+    if logprobs or top_logprobs is not None:
         config["logprobs"] = True
+    if top_logprobs is not None:
+        config["top_logprobs"] = top_logprobs
     return LLMConfig(config, temperature=temperature)
 
 
@@ -1780,7 +1877,7 @@ class MultiAgentAnnotator:
             )
 
         # ── Build LLM configs ────────────────────────────────
-        annotator_llm = build_llm_config(annotator_model, temperature=0.2, timeout=request_timeout, tool_choice=tool_choice, logprobs=True)
+        annotator_llm = build_llm_config(annotator_model, temperature=0.2, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ANNOTATOR_TOP_LOGPROBS)
         critic_temperature = 0.5 if strict_critic else 0.3
         critic_llm = build_llm_config(critic_model, temperature=critic_temperature, timeout=request_timeout, tool_choice=tool_choice)
         adjudicator_llm = build_llm_config(adjudicator_model, temperature=0.1, timeout=request_timeout, tool_choice=tool_choice)
@@ -1926,6 +2023,7 @@ class MultiAgentAnnotator:
             # round 0, before any Critic influence).
             if record.annotator_mean_logprob is None:
                 record.annotator_mean_logprob = ann_record.get("mean_logprob")
+                record.annotator_mean_entropy = ann_record.get("mean_entropy")
             last_annotator_text = ann_content
             for k in annotator_tokens:
                 annotator_tokens[k] += ann_record["token_usage"].get(k, 0)
@@ -2647,10 +2745,12 @@ class MultiAgentAnnotator:
         )
         elapsed_s = time.perf_counter() - _t0
         mean_logprob = last_content_mean_logprob()
+        mean_entropy = last_content_mean_entropy()
         logger.info(
-            "  [%s] mean_logprob=%s (captured %d stream(s))",
+            "  [%s] mean_logprob=%s mean_entropy=%s (captured %d stream(s))",
             agent.name,
             f"{mean_logprob:.4f}" if mean_logprob is not None else "None",
+            f"{mean_entropy:.4f}" if mean_entropy is not None else "None",
             len(_logprob_streams()),
         )
         all_msgs = _collect_messages_with_tools(chat.chat_history, skip_first=True)
@@ -2674,6 +2774,7 @@ class MultiAgentAnnotator:
             "token_usage": self._sum_usage(getattr(chat, "cost", {})),
             "elapsed_s": round(elapsed_s, 2),
             "mean_logprob": mean_logprob,
+            "mean_entropy": mean_entropy,
         }
 
     @staticmethod
