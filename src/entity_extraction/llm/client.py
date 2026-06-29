@@ -145,34 +145,71 @@ class LLMClient:
         return self.config.model_name
 
     def call(self, messages: list, temperature: float = 0.0, **kwargs) -> str:
-        """Make a single LLM call."""
-        response = self.client.chat.completions.create(
+        """Make a single LLM call, streaming the response and collecting it.
+
+        We always stream and accumulate the chunks rather than waiting for the
+        whole completion in one shot. Several of our self-hosted vLLM endpoints
+        time out on long non-streaming generations (the HTTP request blocks
+        until the full answer is ready), but stream tokens happily as they are
+        produced. Collecting the stream keeps the connection alive and avoids
+        the timeout. The public contract is unchanged: we return the full text.
+        """
+        # A caller-supplied stream flag would clash with our own; drop it. Pull
+        # stream_options out so we can request usage stats from the final chunk
+        # (and let callers override / disable it by passing stream_options).
+        kwargs.pop("stream", None)
+        stream_options = kwargs.pop("stream_options", {"include_usage": True})
+
+        create_kwargs = dict(
             model=self.model_name,
             messages=messages,
             temperature=temperature,
-            **kwargs
+            stream=True,
+            **kwargs,
         )
-        message = response.choices[0].message
-        content = message.content
-        if content is None:
-            # Some vLLM/Qwen reasoning models return content=None and place the
-            # text in reasoning_content, or reply with only a tool call. Fall back
-            # to reasoning_content so we don't crash / lose the output.
-            content = getattr(message, "reasoning_content", None)
+        if stream_options is not None:
+            create_kwargs["stream_options"] = stream_options
+
+        stream = self.client.chat.completions.create(**create_kwargs)
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish_reason = None
+        usage = None
+        for chunk in stream:
+            # When include_usage is set, the final chunk carries usage and an
+            # empty choices list, so guard every choices access.
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                if delta.content:
+                    content_parts.append(delta.content)
+                # Some vLLM/Qwen reasoning models stream the text in
+                # reasoning_content (with content empty), or reply with only a
+                # tool call. Keep it so we don't lose the output.
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+        content = "".join(content_parts) or "".join(reasoning_parts)
         if self.model_type in ("qwen3-32B", "gpt4o", "qwen3-35B-vllm", "qwen3-32B-vllm"):
             content = remove_thinking_blocks(content)
         else:
             content = content or ""
         # Account for usage before any raise: the API call happened (and may be
         # billed) even when the returned content is empty.
-        usage = response.usage
         if usage is not None:
             with self._stats_lock:
                 self._query_count += 1
                 self._prompt_tokens_total += usage.prompt_tokens or 0
                 self._completion_tokens_total += usage.completion_tokens or 0
         if not content.strip():
-            finish_reason = getattr(response.choices[0], "finish_reason", None)
             raise EmptyLLMResponseError(
                 f"Model '{self.model_name}' returned empty content "
                 f"(finish_reason={finish_reason!r}). Sentence left unprocessed; "
