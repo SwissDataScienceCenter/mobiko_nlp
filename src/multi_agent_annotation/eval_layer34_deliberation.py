@@ -105,7 +105,14 @@ def analyze_flagged_items(
     }
 
     if human_data:
-        from eval_layer1_output import compute_entity_metrics
+        from eval_layer1_output import sentence_f1
+
+        # sentence_f1 expects {text, type}; the human loader emits {text,
+        # entity_type}. Map to text+type (renamed compute_entity_metrics "exact").
+        def _typed(ents):
+            return [{"text": e.get("text", ""),
+                     "type": e.get("entity_type", e.get("type", "")).strip().upper()}
+                    for e in ents]
 
         flagged_f1s, unflagged_f1s = [], []
         for rec in records:
@@ -116,11 +123,12 @@ def analyze_flagged_items(
             pair_f1s = []
             for i in range(len(ann_ids)):
                 for j in range(i + 1, len(ann_ids)):
-                    m = compute_entity_metrics(
-                        human_data[sent][ann_ids[i]]["entities"],
-                        human_data[sent][ann_ids[j]]["entities"],
-                    )
-                    pair_f1s.append(m["f1"])
+                    f1 = sentence_f1(
+                        _typed(human_data[sent][ann_ids[i]]["entities"]),
+                        _typed(human_data[sent][ann_ids[j]]["entities"]),
+                        mode="text_type",
+                    ) or 0.0
+                    pair_f1s.append(f1)
             avg_f1 = sum(pair_f1s) / len(pair_f1s) if pair_f1s else 0
             (flagged_f1s if sent in flagged_sentences else unflagged_f1s).append(avg_f1)
 
