@@ -27,9 +27,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Resolve flat sibling imports (eval_utils + the shared core at the package root)
+# however this module is launched.
+_PKG_ROOT = Path(__file__).resolve().parent.parent   # …/multi_agent_annotation
+for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from eval_utils import bootstrap_ci, two_sample_bootstrap_p, fmt_ci, fmt_p
 from deliberation_history import (
