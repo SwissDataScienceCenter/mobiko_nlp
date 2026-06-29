@@ -37,9 +37,17 @@ from __future__ import annotations
 import argparse
 import json
 import statistics as st
+import sys
 from pathlib import Path
 from random import Random
 from typing import Any, Dict, List, Optional, Tuple
+
+# Resolve flat imports: deliberation_history at the package root; eval siblings
+# (eval_layer1/2, eval_utils) in evaluation/.
+_PKG_ROOT = Path(__file__).resolve().parent.parent   # …/multi_agent_annotation
+for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from deliberation_history import load_records, norm, record_signals
 from eval_layer2_correlation import (

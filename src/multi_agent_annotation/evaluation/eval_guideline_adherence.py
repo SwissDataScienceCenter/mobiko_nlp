@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 _THIS_DIR = Path(__file__).resolve().parent
-_DEFAULT_DS = _THIS_DIR / "Decision_support.csv"
+_PKG_ROOT = _THIS_DIR.parent                         # …/multi_agent_annotation (shared data)
+_DEFAULT_DS = _PKG_ROOT / "Decision_support.csv"
 
 MATCH_THRESHOLD = 0.6  # fraction of cited-rule tokens that must appear in a DS row
 
