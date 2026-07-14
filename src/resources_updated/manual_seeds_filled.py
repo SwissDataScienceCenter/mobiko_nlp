@@ -322,17 +322,6 @@
       }
     },
     {
-      "sentence": "All camera-trap data were managed using the package camtrapR 2.1.1.0 (Niedballa et al., 2016) in R software 4.0.5 (R Core team, 2022).",
-      "e1": {
-        "text": "camtrapR 2.1.1.0",
-        "type": "ANTHROPOGENIC ENTITY"
-      },
-      "e2": {
-        "text": "R software 4.0.5",
-        "type": "ANTHROPOGENIC ENTITY"
-      }
-    },
-    {
       "sentence": "We surveyed four contiguous protected areas in the core forest area of the southern Annamites: Bidoup—Nui Ba National Park, Phuoc Binh National Park, Da Nhim Protection Forest, and Dran Protection Forest.",
       "e1": {
         "text": "Bidoup—Nui Ba National Park",
@@ -451,7 +440,7 @@
         "type": "ABIOTIC ENTITY"
       },
       "e2": {
-        "text": "an Andean glacier",
+        "text": "Andean glacier",
         "type": "SPATIAL ENTITY"
       }
     },
@@ -506,7 +495,7 @@
         "type": "ABIOTIC PROCESS"
       },
       "e2": {
-        "text": "the Plio–Pleistocene period",
+        "text": "Plio–Pleistocene period",
         "type": "TEMPORAL ENTITY"
       }
     },

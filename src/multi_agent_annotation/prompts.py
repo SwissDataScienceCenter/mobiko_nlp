@@ -28,6 +28,15 @@ You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM 
 and annotate every possible entity and every valid relation (triplet) in the given sentence. \
 It is far better to over-annotate than to miss entities or relations — the Critic will filter errors later.
 
+Here is the full relation list:
+
+1. IS_PART_OF
+2. LOCATED_IN
+3. AFFECTS
+4. HAS_PROCESS
+5. COMPARES_TO
+6. CAUSES
+
 ## Entity Type Schema
 {entity_schema}
 
@@ -50,6 +59,7 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 
 ## Coverage Rules
 - Prefer more entities over fewer: if a span could plausibly be an entity, include it.
+- All annotated entities must be linked to at least one relation. If an entity has no relations, it is likely a false positive and should be removed.
 
 ## Span boundary rule (apply top to bottom; stop at the first that decides)
 - Exclude leading determiners and demonstratives: "this species" → [species], "the frater complex" → [frater complex]. Never include "this/the/a/its/their".
@@ -132,6 +142,15 @@ You are Critic, a rigorous QA reviewer for biodiversity annotations. \
 Your objective is precision: scrutinise every label the Annotator proposes, \
 challenge anything that is incorrect or ambiguous, and surface anything that was missed. \
 Disagreement is expected and productive — correctness matters more than consensus.
+
+Here is the full relation list:
+
+1. IS_PART_OF
+2. LOCATED_IN
+3. AFFECTS
+4. HAS_PROCESS
+5. COMPARES_TO
+6. CAUSES
 
 ## Entity Type Schema
 {entity_schema}
@@ -224,6 +243,15 @@ and false negatives — errors you silently accept — are more harmful than fal
 When a label is borderline between two types, even if one reading is plausible, \
 raise it as a disagreement. Do not give the Annotator the benefit of the doubt.
 
+Here is the full relation list:
+
+1. IS_PART_OF
+2. LOCATED_IN
+3. AFFECTS
+4. HAS_PROCESS
+5. COMPARES_TO
+6. CAUSES
+
 ## Entity Type Schema
 {entity_schema}
 
@@ -244,6 +272,10 @@ Work through the annotation in this order:
    Identify any entity spans the Annotator overlooked. For each, state the span text, \
    the correct entity type, and cite the guideline step that supports it. \
    Every plausible span that was omitted belongs in missing_annotations.
+   
+2. **Missing relations** — for every pair of annotated entities whose relation you want to include, \
+   call schema_lookup first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. Include only relations that schema_lookup confirmed as valid.
+   
 
 {gs_rule}
    
@@ -301,6 +333,15 @@ def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema:
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations. 
 You see the Annotator's labels and the Critic's review.
+
+Here is the full relation list:
+
+1. IS_PART_OF
+2. LOCATED_IN
+3. AFFECTS
+4. HAS_PROCESS
+5. COMPARES_TO
+6. CAUSES
 
 ## Entity Type Schema
 {entity_schema}
