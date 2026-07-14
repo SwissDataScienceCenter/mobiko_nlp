@@ -239,7 +239,7 @@ def run_live(
     output_path: Path,
     precedent_store_path: Path | None = None,
     guideline_search_backend: str = "embedding",
-    use_precedent_memory: bool = True,
+    use_precedent_memory: bool = False,
     resume: bool = False,
     max_retries: int = 2,
     request_timeout: int = 600,
@@ -341,8 +341,9 @@ def main() -> None:
         help="Backend for guideline_search tool (default: embedding).",
     )
     parser.add_argument(
-        "--no-precedent-memory", action="store_true",
-        help="Disable cross-sentence precedent memory (lookup_precedent tool not registered).",
+        "--precedent-memory", action="store_true",
+        help="Enable cross-sentence precedent memory (lookup_precedent tool). "
+             "Default: disabled — not currently used.",
     )
     parser.add_argument(
         "--strict-critic", action="store_true",
@@ -408,7 +409,7 @@ def main() -> None:
             output_path=args.output,
             precedent_store_path=args.precedent_store,
             guideline_search_backend=args.guideline_search_backend,
-            use_precedent_memory=not args.no_precedent_memory,
+            use_precedent_memory=args.precedent_memory,
             resume=args.resume,
             max_retries=args.max_retries,
             request_timeout=args.timeout,

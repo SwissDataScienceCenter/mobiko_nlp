@@ -135,8 +135,8 @@ def run_annotation(args, guideline: Path, decision_tbl: Path,
         cmd += ["--strict-critic"]
     if args.tool_choice:
         cmd += ["--tool-choice", args.tool_choice]
-    if args.no_precedent_memory:
-        cmd += ["--no-precedent-memory"]
+    if args.precedent_memory:
+        cmd += ["--precedent-memory"]
     if args.resume:
         cmd += ["--resume"]
 
@@ -640,7 +640,9 @@ def main() -> None:
     p.add_argument("--guideline-search", choices=["mandatory", "optional"], default="optional")
     p.add_argument("--strict-critic", action="store_true")
     p.add_argument("--tool-choice", type=str, default=None, choices=["auto", "required", "none"])
-    p.add_argument("--no-precedent-memory", action="store_true")
+    p.add_argument("--precedent-memory", action="store_true",
+                   help="Enable the lookup_precedent tool / precedent store for the annotation "
+                        "subprocess (default: disabled — not currently used).")
     p.add_argument("--timeout", type=int, default=600)
 
     # ── Stopping rule (spec §11.3): dual friction + held-out F1 ──────────────

@@ -130,8 +130,9 @@ def main() -> None:
 
     parser.add_argument("--precedent-store", type=Path, default=None,
                         help="Persistent precedent-store JSON (default: fresh in-memory store).")
-    parser.add_argument("--no-precedent-memory", action="store_true",
-                        help="Disable the lookup_precedent tool / precedent store.")
+    parser.add_argument("--precedent-memory", action="store_true",
+                        help="Enable the lookup_precedent tool / precedent store "
+                             "(default: disabled — not currently used).")
     parser.add_argument("--guideline-search-backend", type=str, default="embedding",
                         choices=["lexical", "embedding"])
     parser.add_argument("--guideline-search", choices=["mandatory", "optional"],
@@ -177,7 +178,7 @@ def main() -> None:
         entity_types_list=SCHEMA_BIODIV_LIST,
         precedent_store_path=args.precedent_store,
         guideline_search_backend=args.guideline_search_backend,
-        use_precedent_memory=not args.no_precedent_memory,
+        use_precedent_memory=args.precedent_memory,
         request_timeout=args.timeout,
         strict_critic=args.strict_critic,
         guideline_search_mandatory=(args.guideline_search == "mandatory"),

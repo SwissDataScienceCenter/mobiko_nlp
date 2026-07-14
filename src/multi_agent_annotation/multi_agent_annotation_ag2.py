@@ -1803,7 +1803,7 @@ class MultiAgentAnnotator:
         guideline_search_backend: Optional[str] = None,
         guideline_search_embedding_model: Optional[str] = None,
         precedent_store_path: Optional[Path] = None,
-        use_precedent_memory: bool = True,
+        use_precedent_memory: bool = False,
         request_timeout: int = 600,
         strict_critic: bool = False,
         guideline_search_mandatory: bool = True,

@@ -30,12 +30,13 @@ It is far better to over-annotate than to miss entities or relations — the Cri
 
 Here is the full relation list:
 
-1. IS_PART_OF
-2. LOCATED_IN
-3. AFFECTS
-4. HAS_PROCESS
-5. COMPARES_TO
-6. CAUSES
+1. HAS_PROPERTY
+2. IS_PART_OF
+3. LOCATED_IN
+4. AFFECTS
+5. HAS_PROCESS
+6. COMPARES_TO
+7. CAUSES
 
 ## Entity Type Schema
 {entity_schema}
@@ -106,22 +107,28 @@ def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict
     )
     if precedent_memory:
         review_tail = (
-            "3. **Established precedents** — for any span you are about to dispute, call "
+            "4. **Established precedents** — for any span you are about to dispute, call "
             "lookup_precedent first. If an authoritative precedent exists from an earlier sentence "
             "this batch, do NOT re-open that decision unless the guideline clearly contradicts it.\n\n"
+            "5. **Relation validity** — for every proposed triplet, call schema_lookup to confirm "
+            "the relation is valid for that entity-type pair. Flag invalid or missing relations.\n\n"
+            "6. **Missing spans** — re-read the original sentence. Identify any entity spans the "
+            "Annotator overlooked. For each, state the span text, the correct entity type, and cite "
+            "the guideline step that supports it. \n\n"
+            "7. **Missing relations** — for every pair of annotated entities whose relation you want to include,"
+            " call schema_lookup first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup."
+            " Include only relations that schema_lookup confirmed as valid."
+        )
+    else:
+        review_tail = (
             "4. **Relation validity** — for every proposed triplet, call schema_lookup to confirm "
             "the relation is valid for that entity-type pair. Flag invalid or missing relations.\n\n"
             "5. **Missing spans** — re-read the original sentence. Identify any entity spans the "
             "Annotator overlooked. For each, state the span text, the correct entity type, and cite "
-            "the guideline step that supports it."
-        )
-    else:
-        review_tail = (
-            "3. **Relation validity** — for every proposed triplet, call schema_lookup to confirm "
-            "the relation is valid for that entity-type pair. Flag invalid or missing relations.\n\n"
-            "4. **Missing spans** — re-read the original sentence. Identify any entity spans the "
-            "Annotator overlooked. For each, state the span text, the correct entity type, and cite "
-            "the guideline step that supports it."
+            "the guideline step that supports it. \n\n"
+            "6. **Missing relations** — for every pair of annotated entities whose relation you want to include,"
+            " call schema_lookup first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup."
+            " Include only relations that schema_lookup confirmed as valid."
         )
     gs_rule = (
         "1. **Guideline violations** — you MUST call guideline_search for EACH entity label, "
@@ -145,12 +152,13 @@ Disagreement is expected and productive — correctness matters more than consen
 
 Here is the full relation list:
 
-1. IS_PART_OF
-2. LOCATED_IN
-3. AFFECTS
-4. HAS_PROCESS
-5. COMPARES_TO
-6. CAUSES
+1. HAS_PROPERTY
+2. IS_PART_OF
+3. LOCATED_IN
+4. AFFECTS
+5. HAS_PROCESS
+6. COMPARES_TO
+7. CAUSES
 
 ## Entity Type Schema
 {entity_schema}
@@ -191,7 +199,7 @@ Return a JSON object with exactly these fields:
 {{
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
-    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "severity": "major", "explanation": "reason"}}
+    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE",  "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY", "reasoning": "reason it should be annotated"}}
@@ -214,14 +222,14 @@ def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schem
         if precedent_memory else ""
     )
     precedent_step = (
-        "\n\n6. **Precedents** — call lookup_precedent for any span you are about to dispute. "
+        "\n\n7. **Precedents** — call lookup_precedent for any span you are about to dispute. "
         "If a precedent exists, note it in your reasoning. You may still raise the disagreement "
         "if the current sentence context gives independent grounds for a different label — "
         "precedents are informative, not binding."
         if precedent_memory else ""
     )
     gs_rule = (
-        "2. **Guideline violations** — you MUST call guideline_search for EACH entity label, "
+        "3. **Guideline violations** — you MUST call guideline_search for EACH entity label, "
         "passing the span text and its proposed type, before judging it. Do not agree to or "
         "dispute a label you have not checked. Decide whether the guideline supports the type, "
         "and cite the rule you relied on — verbatim from EITHER a decision-support "
@@ -229,7 +237,7 @@ def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schem
         "\"guideline_reference\". Flag any label that contradicts or is not clearly supported "
         "by the guideline."
         if guideline_search_mandatory else
-        "2. **Guideline violations** — when a label is unclear or borderline, you must call "
+        "3. **Guideline violations** — when a label is unclear or borderline, you must call "
         "guideline_search with the span text and its proposed type to retrieve the relevant "
         "rule. Cite the rule you relied on — verbatim from EITHER a decision-support "
         "definition/question/example OR a narrative guideline rule — in your "
@@ -279,24 +287,26 @@ Work through the annotation in this order:
 
 {gs_rule}
    
-3. When multiple properties, entities, or processes are connected with AND/OR, unfold them into separate spans.
+4. When multiple properties, entities, or processes are connected with AND/OR, unfold them into separate spans.
     **Example: *Antibacterial and antifungal properties***
     - Antibacterial properties → `BIOTIC_PROPERTY`
     - Antifungal properties → `BIOTIC_PROPERTY`
 
-4. **Category confusions** — look for common misclassifications:
+5. **Category confusions** — look for common misclassifications:
    - BIOTIC PROPERTY vs ABIOTIC PROPERTY (check the modified noun, not the adjective)
    - SPATIAL ENTITY vs ABIOTIC ENTITY (place/unit of analysis vs physical object)
    - CONCEPT vs any concrete category (abstract theoretical construct vs real-world referent)
    - BIOTIC PROCESS vs ANTHROPOGENIC PROCESS (organism-driven vs human-driven activity)
    For each suspected confusion, call guideline_search to cite the relevant rule.
 
-5. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the \
-   relation is valid for that entity-type pair. Flag invalid or missing relations.{precedent_step}
+6. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the \
+   relation is valid for that entity-type pair. Flag invalid or missing relations. 
 
-6. **CONCEPT is over-used as a fallback**. If the Annotator labelled something CONCEPT, \
-  check whether it has a concrete biotic/abiotic/spatial referent — if so, dispute \
-  the CONCEPT label and propose the domain type. Only accept CONCEPT for named abstract constructs.
+{precedent_step}
+
+**CONCEPT is over-used as a fallback**. If the Annotator labelled something CONCEPT, \
+check whether it has a concrete biotic/abiotic/spatial referent — if so, dispute \
+the CONCEPT label and propose the domain type. Only accept CONCEPT for named abstract constructs.
 
 **Low-confidence items:** Any entity or relation the Annotator flagged with \
 confidence < {LOW_CONFIDENCE_THRESHOLD} MUST appear in your disagreements \
@@ -309,12 +319,13 @@ before submitting — this outcome is unusual.
 
 After any tool calls return, you MUST produce the final review JSON. Do not stop after tool results or ask for another turn.
 
-## Output
+## OutputAfter any tool calls return, you MUST produce the final review JSON. Do not stop after tool results or ask for another turn.
+
 Return a JSON object with exactly these fields:
 {{
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
-    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step 5", "severity": "major", "explanation": "reason"}}
+    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY",  "reasoning": "reason it should be annotated"}}
@@ -351,6 +362,10 @@ Here is the full relation list:
 
 ## Labelling Guideline
 {guideline}
+
+## Available Tools
+- guideline_search   : retrieve the exact guideline rule that applies to a disputed span
+- schema_lookup      : verify that a relation is valid for a given entity-type pair
 
 ## Decision Rules
 1. Agreement between Annotator and Critic -> accept unchanged (high confidence). 

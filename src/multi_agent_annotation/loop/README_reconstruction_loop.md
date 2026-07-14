@@ -121,7 +121,7 @@ Skip this if you're happy for the loop to generate them automatically.
 
 Annotation passthrough flags also exist: `--guideline-search {mandatory,optional}`,
 `--guideline-search-backend {lexical,embedding}`, `--strict-critic`,
-`--tool-choice`, `--no-precedent-memory`, `--timeout`.
+`--tool-choice`, `--precedent-memory`, `--timeout`.
 
 ### Stopping-rule flags (§11.3)
 
