@@ -2614,9 +2614,15 @@ class MultiAgentAnnotator:
         messages: List[Dict[str, Any]],
         agent_name: str,
     ) -> str:
+        """Last message from ``agent_name`` with real content — skips a bare
+        trailing "TERMINATE" (ag2's end-of-turn convention when the substantive
+        reply was already sent in an earlier message), which would otherwise be
+        picked up as "the content" and strip down to an empty string."""
         for m in reversed(messages):
             if m.get("agent") == agent_name:
-                return m.get("content", "") or ""
+                content = m.get("content", "") or ""
+                if MultiAgentAnnotator._strip_terminate(content).strip():
+                    return content
         return ""
 
     @staticmethod
@@ -2773,7 +2779,14 @@ class MultiAgentAnnotator:
         agent_name = agent.name
         last_content = ""
         for msg in reversed(all_msgs):
-            if msg["agent"] == agent_name and msg["content"].strip():
+            # A bare trailing "TERMINATE" (no other content) is ag2's end-of-turn
+            # signal, not the substantive reply — the real content is in an
+            # earlier message. Without this check it gets picked up here, then
+            # _strip_terminate() downstream reduces it to "", handing the next
+            # agent (Critic's review, or the Annotator's own revision prompt) a
+            # blank "Annotation:"/"previous annotation" — see _strip_terminate.
+            if (msg["agent"] == agent_name
+                    and self._strip_terminate(msg["content"]).strip()):
                 last_content = msg["content"]
                 break
 
