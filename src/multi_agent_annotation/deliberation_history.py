@@ -252,9 +252,22 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
                 dis_by_round[k] += 1
                 a = (d.get("annotator_label") or "?").strip().upper()
                 b = (d.get("proposed_label") or "?").strip().upper()
-                taxonomy_by_round[k][(a, b)] += 1
-                taxonomy_all[(a, b)] += 1
-                severity_by_round[k][(d.get("severity") or "unspecified").lower()] += 1
+                sev = (d.get("severity") or "unspecified").lower()
+                severity_by_round[k][sev] += 1
+                # A "disagreement" entry with the SAME label on both sides isn't a
+                # type confusion: it's either the Critic confirming the annotation
+                # (explanations like "Correct" / "Confirmed valid", often with
+                # severity "none") while still logging the span under
+                # `disagreements`, or a relation-validity complaint attached to an
+                # otherwise-correctly-typed entity. Neither is something an
+                # entity-type decision_test can disambiguate, so keep both out of
+                # the confusion taxonomy that drives pattern mining/amendment —
+                # this only affects taxonomy_* (confusion reporting + mining);
+                # dis_by_round/severity_by_round (friction, IAA reports) still
+                # count every entry so those totals are unchanged.
+                if a != b and sev != "none":
+                    taxonomy_by_round[k][(a, b)] += 1
+                    taxonomy_all[(a, b)] += 1
 
         res = tl["adjudication"]["resolutions"]
         if res:
