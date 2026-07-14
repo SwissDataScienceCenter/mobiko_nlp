@@ -46,6 +46,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,6 +63,7 @@ for _p in (_SRC, _PKG_ROOT, _PKG_ROOT / "loop", _PKG_ROOT / "evaluation"):
 # Reuse the real pipeline's building blocks (flat imports → resolved via the
 # bootstrap above: deliberation_history is at the package root; the amender,
 # cold_start_*, decision_table and stopping_rule are loop/ siblings).
+from multi_agent_annotation_ag2 import MODEL_ENDPOINTS
 from deliberation_history import load_records, analyze
 from guideline_amender import (
     load_confusion_patterns,
@@ -73,6 +75,7 @@ from guideline_amender import (
     _make_client,
     generate_amendment,
 )
+import cold_start_annotate
 import cold_start_init
 import decision_table
 import stopping_rule
@@ -106,13 +109,19 @@ def run_annotation(args, guideline: Path, decision_tbl: Path,
     On a fresh (non-resume) run we clear any stale output first, because the
     underlying ``annotate_batch`` appends. With --resume we leave it and let the
     pipeline skip already-annotated sentences.
+
+    If the subprocess itself dies (crash, OOM, a flaky endpoint) we retry it up
+    to ``args.subprocess_retries`` times — every retry forces ``--resume`` on the
+    subprocess regardless of the top-level ``--resume`` flag, since any sentence
+    a prior attempt already flushed to ``out_jsonl`` must not be redone. Only
+    after exhausting all attempts do we raise.
     """
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     if not args.resume and out_jsonl.exists():
         out_jsonl.unlink()
 
     input_flag = "--input-jsonl" if input_format == "jsonl" else "--input-txt"
-    cmd = [
+    base_cmd = [
         args.python, str(_ANNOTATE_SCRIPT),
         input_flag, str(Path(input_path).resolve()),
         "--guideline", str(guideline.resolve()),
@@ -128,17 +137,15 @@ def run_annotation(args, guideline: Path, decision_tbl: Path,
         "--timeout", str(args.timeout),
     ]
     if args.seeds:
-        cmd += ["--seeds", str(args.seeds.resolve())]
+        base_cmd += ["--seeds", str(args.seeds.resolve())]
     if num_sentences is not None:
-        cmd += ["--num-sentences", str(num_sentences)]
+        base_cmd += ["--num-sentences", str(num_sentences)]
     if args.strict_critic:
-        cmd += ["--strict-critic"]
+        base_cmd += ["--strict-critic"]
     if args.tool_choice:
-        cmd += ["--tool-choice", args.tool_choice]
+        base_cmd += ["--tool-choice", args.tool_choice]
     if args.precedent_memory:
-        cmd += ["--precedent-memory"]
-    if args.resume:
-        cmd += ["--resume"]
+        base_cmd += ["--precedent-memory"]
 
     # Expose the loop dir, the shared package root, src/ (resources_updated) and
     # the evaluation siblings on PYTHONPATH so cold_start_annotate's flat imports
@@ -149,10 +156,75 @@ def run_annotation(args, guideline: Path, decision_tbl: Path,
          env.get("PYTHONPATH", "")]
     ).strip(os.pathsep)
 
-    logger.info("  [annotate] %s", " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(_THIS_DIR), env=env)
-    if proc.returncode != 0:
-        raise RuntimeError(f"annotation subprocess failed (exit {proc.returncode})")
+    max_attempts = max(1, args.subprocess_retries)
+    last_returncode: Optional[int] = None
+    for attempt in range(1, max_attempts + 1):
+        resume_this_attempt = args.resume or attempt > 1
+        cmd = list(base_cmd)
+        if resume_this_attempt:
+            cmd += ["--resume"]
+
+        logger.info("  [annotate attempt %d/%d] %s", attempt, max_attempts, " ".join(cmd))
+        proc = subprocess.run(cmd, cwd=str(_THIS_DIR), env=env)
+        if proc.returncode == 0:
+            return
+        last_returncode = proc.returncode
+        if attempt < max_attempts:
+            backoff = min(60, 10 * attempt)
+            logger.warning(
+                "  annotation subprocess failed (exit %d) on attempt %d/%d — already-"
+                "annotated sentences in %s are preserved; retrying in %ds with --resume…",
+                proc.returncode, attempt, max_attempts, out_jsonl, backoff,
+            )
+            time.sleep(backoff)
+
+    raise RuntimeError(
+        f"annotation subprocess failed (exit {last_returncode}) after {max_attempts} attempt(s)"
+    )
+
+
+def _load_expected_sentences(
+    input_path: Path, input_format: str, cap: Optional[int],
+) -> List[str]:
+    """The exact (deduplicated, order-preserved) sentence list ``run_annotation``
+    would send to the annotate subprocess for this input — same loaders
+    ``cold_start_annotate.main`` uses, so the comparison in
+    ``_deliberations_complete`` is apples-to-apples."""
+    if input_format == "jsonl":
+        sentences = cold_start_annotate.load_sentences_from_jsonl(Path(input_path).resolve())
+    else:
+        sentences = cold_start_annotate.load_sentences_from_txt(Path(input_path).resolve())
+    if cap is not None:
+        sentences = sentences[:cap]
+    return sentences
+
+
+def _deliberations_complete(
+    deliberations: Path, input_path: Path, input_format: str, cap: Optional[int],
+) -> bool:
+    """Whether ``deliberations`` already covers every expected sentence.
+
+    A crash mid-batch leaves a non-empty ``deliberations.jsonl`` with only some
+    sentences done — a plain "file exists and is non-empty" check would treat
+    that as finished and never annotate the rest. This checks the actual
+    sentence coverage instead, so --resume only skips re-annotation once the
+    iteration is genuinely complete.
+    """
+    if not (deliberations.exists() and deliberations.stat().st_size > 0):
+        return False
+    expected = set(_load_expected_sentences(input_path, input_format, cap))
+    if not expected:
+        return False
+    done: set = set()
+    for line in deliberations.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            done.add(json.loads(line).get("sentence", ""))
+        except Exception:
+            continue
+    return expected.issubset(done)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -412,8 +484,10 @@ def run_loop(args) -> Dict[str, Any]:
         )
 
         # (1) Annotate the working set under (G_i, D_i) ------------------------
-        if args.resume and deliberations.exists() and deliberations.stat().st_size > 0:
-            logger.info("  [resume] reusing working-set deliberations: %s", deliberations)
+        if args.resume and _deliberations_complete(
+            deliberations, working_path, working_format, args.num_sentences
+        ):
+            logger.info("  [resume] working-set deliberations already complete: %s", deliberations)
         else:
             run_annotation(args, g_i, d_i, working_path, deliberations, args.num_sentences,
                            input_format=working_format)
@@ -433,8 +507,10 @@ def run_loop(args) -> Dict[str, Any]:
         held_out = None
         if held_out_ready:
             ho_delib = iter_dir / "heldout_deliberations.jsonl"
-            if args.resume and ho_delib.exists() and ho_delib.stat().st_size > 0:
-                logger.info("  [resume] reusing held-out deliberations: %s", ho_delib)
+            if args.resume and _deliberations_complete(
+                ho_delib, held_out_path, held_out_format, args.held_out_num_sentences
+            ):
+                logger.info("  [resume] held-out deliberations already complete: %s", ho_delib)
             else:
                 run_annotation(args, g_i, d_i, held_out_path, ho_delib,
                                args.held_out_num_sentences, input_format=held_out_format)
@@ -630,7 +706,7 @@ def main() -> None:
     p.add_argument("--annotator-model", type=str, default="qwen3-35B-vllm")
     p.add_argument("--critic-model", type=str, default="qwen3-35B-vllm")
     p.add_argument("--adjudicator-model", type=str, default="qwen3-35B-vllm")
-    p.add_argument("--amender-model", choices=["gpt4o", "qwen3-35B-vllm"], default="qwen3-35B-vllm")
+    p.add_argument("--amender-model", choices=list(MODEL_ENDPOINTS), default="qwen3-35B-vllm")
     p.add_argument("--max-rounds", type=int, default=2)
     p.add_argument("--num-sentences", type=int, default=None,
                    help="Limit working-set size (smoke tests).")
@@ -644,6 +720,11 @@ def main() -> None:
                    help="Enable the lookup_precedent tool / precedent store for the annotation "
                         "subprocess (default: disabled — not currently used).")
     p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--subprocess-retries", type=int, default=3,
+                   help="Retries for a crashed annotation subprocess within a single "
+                        "iteration (flaky endpoint, OOM, …). Each retry forces --resume "
+                        "on the subprocess so already-annotated sentences aren't redone "
+                        "(default 3; set 1 to disable retrying).")
 
     # ── Stopping rule (spec §11.3): dual friction + held-out F1 ──────────────
     stop = p.add_argument_group("stopping rule (spec §11.3)")

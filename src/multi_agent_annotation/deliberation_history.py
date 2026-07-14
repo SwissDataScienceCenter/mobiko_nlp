@@ -19,21 +19,35 @@ build on these helpers so the two reports cannot drift apart.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
 
 # ───────────────────────── parsing helpers ─────────────────────────
 
 def load_records(path: Path) -> List[dict]:
+    """Parse a deliberations JSONL file, skipping any line that fails to
+    decode (e.g. a truncated trailing write left by a killed/crashed run)
+    instead of raising — so one bad line doesn't permanently brick every
+    subsequent resume attempt on the same file."""
     out = []
     with Path(path).open("r", encoding="utf8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
-            if line.startswith("{"):
+            if not line.startswith("{"):
+                continue
+            try:
                 out.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Skipping malformed JSON on line %d of %s (likely a truncated "
+                    "write from an interrupted run).", lineno, path,
+                )
     return out
 
 

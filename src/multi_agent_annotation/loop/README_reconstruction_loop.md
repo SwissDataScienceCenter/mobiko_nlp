@@ -91,7 +91,17 @@ Skip this if you're happy for the loop to generate them automatically.
   `--expert-rules` is optional (the §11.5b coverage curve, monitoring only).
 - Smoke test: add `--num-sentences 3 --held-out-num-sentences 3 --i-max 1`.
 - Re-run after an interruption with `--resume` (re-mines metrics from existing
-  logs so the trajectory + stop decision stay correct; skips re-annotation/draft).
+  logs so the trajectory + stop decision stay correct; skips re-annotation/draft
+  only once an iteration's deliberations actually cover every expected
+  sentence — a partially-annotated file from a crash is completed, not reused
+  as-is). **Without `--resume`, a re-run wipes and redoes annotation from
+  scratch** — always pass it when recovering from a break.
+- A crashed annotation subprocess (flaky endpoint, OOM, …) is retried
+  automatically within the same iteration — see `--subprocess-retries` below;
+  every retry forces `--resume` on the subprocess so sentences it already
+  flushed aren't redone. This is orthogonal to the top-level `--resume` flag,
+  which is about resuming a whole *loop* invocation, not a single annotation
+  call.
 
 ---
 
@@ -111,13 +121,14 @@ Skip this if you're happy for the loop to generate them automatically.
 | `--patterns` | `entity` | `entity` = reconstruct entity-type disambiguation only (relations fixed, spec 11.1); `all` = also amend relation/scope confusions. |
 | `--max-redrafts` | `2` | Redrafts when a decision test fails the operationality gate. |
 | `--examples-per-pattern` | `5` | Concrete examples mined per confusion to ground the amender. |
-| `--amender-model` | `qwen3-35B-vllm` | Amender LLM (`gpt4o` or `qwen3-35B-vllm`). |
+| `--amender-model` | `qwen3-35B-vllm` | Amender LLM — any `MODEL_ENDPOINTS` key (`gpt4o`, `qwen3-35B-vllm`, `swissai-qwen3.5-27B`, `swissai-gemma-31B`, `swissai-apertus-70B`, …). |
 | `--annotator/critic/adjudicator-model` | `qwen3-35B-vllm` | Annotation models (fixed across iterations). |
 | `--max-rounds` | `2` | Annotator↔Critic rounds per sentence. |
 | `--num-sentences` | all | Cap the working set (smoke tests). |
 | `--leak-ngram` | `7` | Word n-gram length for the corpus-leak safety check. |
 | `--python` | current interpreter | Python used for the annotation subprocess. |
-| `--resume` | off | Skip stages whose outputs already exist. |
+| `--resume` | off | Skip stages whose outputs are actually complete (not just present). |
+| `--subprocess-retries` | `3` | Retries for a crashed annotation subprocess within one iteration; each retry forces `--resume` so already-annotated sentences aren't redone. `1` disables retrying. |
 
 Annotation passthrough flags also exist: `--guideline-search {mandatory,optional}`,
 `--guideline-search-backend {lexical,embedding}`, `--strict-critic`,
