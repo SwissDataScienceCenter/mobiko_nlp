@@ -487,29 +487,44 @@ MODEL_ENDPOINTS = {
     },
     "qwen3-32B": {
         "base_url": "https://openwebui-runai-codev-llm.inference.compute.datascience.ch/api",
-        "api_key": None,
+        "api_key_env": "OPEN_WEB_UI_API_KEY",
         "model": "Qwen/Qwen3-32B-AWQ",
     },
     "qwen3-32B-vllm": {
         "base_url": "https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
-        "api_key": None,
+        "api_key_env": "OPEN_WEB_UI_API_KEY",
         "model": "Qwen/Qwen3-32B-AWQ",
     },
     "gpt4o": {
         "base_url": "https://api.openai.com/v1",
-        "api_key": None,
+        "api_key_env": "OPENAI_API_KEY",
         "model": "gpt-4o",
     },
     "qwen3-35B-vllm": {
         "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-        "api_key": None,
+        "api_key_env": "OPEN_WEB_UI_API_KEY",
         "model": "Qwen/Qwen3.6-35B-A3B-FP8",
     },
     "gemma4-26B": {
         "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-        "api_key": None,
+        "api_key_env": "OPEN_WEB_UI_API_KEY",
         "model": "google/gemma-4-26B-A4B-it",
-    }
+    },
+    "swissai-qwen3.5-27B": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "Qwen/Qwen3.5-27B",
+    },
+    "swissai-gemma-31B": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "google/gemma-4-31B-it-bdoan",
+    },
+    "swissai-apertus-70B": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "swiss-ai/Apertus-1.5-70B-SFT-RL-DPO-SDPO",
+    },
 }
 
 
@@ -551,11 +566,11 @@ def build_llm_config(
     if not endpoint:
         raise ValueError(f"Unknown model: {model_key}. Available: {list(MODEL_ENDPOINTS.keys())}")
 
-    api_key = (
-        endpoint["api_key"]
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("OPEN_WEB_UI_API_KEY")
-    )
+    # Each endpoint declares which env var its key lives in ("api_key_env"), so
+    # multiple providers (OpenAI, the SDSC gateway, SwissAI, …) can coexist
+    # without one provider's key leaking into another's requests. A literal
+    # "api_key" (e.g. "EMPTY" for endpoints that don't check it) wins if set.
+    api_key = endpoint.get("api_key") or os.getenv(endpoint.get("api_key_env", ""))
     if not api_key:
         raise ValueError(f"API key required for {model_key}.")
 
