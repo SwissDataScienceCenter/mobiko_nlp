@@ -62,8 +62,9 @@ for _p in (_SRC, _PKG_ROOT, _PKG_ROOT / "loop", _PKG_ROOT / "evaluation"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-# Source of truth for endpoints (gpt4o / qwen3-35B-vllm). Importing the pipeline
-# module is heavier than ideal but avoids duplicating endpoint URLs that drift.
+# Source of truth for endpoints (gpt4o / qwen3-35B-vllm / swissai-*). Importing
+# the pipeline module is heavier than ideal but avoids duplicating endpoint URLs
+# that drift.
 from multi_agent_annotation_ag2 import MODEL_ENDPOINTS
 from deliberation_history import reconstruct_timeline
 from resources_updated.entity_schema import SCHEMA_BIODIV_LIST
@@ -71,7 +72,7 @@ from resources_updated.entity_schema import SCHEMA_BIODIV_LIST
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_DEFAULT_GUIDELINE = _PKG_ROOT / "MoBiKo_label_guidance_v3.md"
+_DEFAULT_GUIDELINE = _PKG_ROOT / "MoBiKo_label_guidance_v4.md"
 
 # Load .env (OPENAI_API_KEY / OPEN_WEB_UI_API_KEY) so the amender picks up keys
 # the same way as the rest of the pipeline, without manually exporting them.
@@ -609,8 +610,9 @@ def main() -> None:
                         help="Deliberation JSONL file(s) — mined for confusion examples.")
     parser.add_argument("--guideline", type=Path, default=_DEFAULT_GUIDELINE,
                         help="Current guideline G_i (.md). Never modified.")
-    parser.add_argument("--model", choices=["gpt4o", "qwen3-35B-vllm"], default="qwen3-35B-vllm",
-                        help="Amender model. gpt4o sends examples to OpenAI; qwen3-35B-vllm stays on-cluster.")
+    parser.add_argument("--model", choices=list(MODEL_ENDPOINTS), default="qwen3-35B-vllm",
+                        help="Amender model. gpt4o sends examples to OpenAI, swissai-* to CSCS; "
+                             "qwen3-35B-vllm stays on-cluster.")
     parser.add_argument("--top-k", type=int, default=10, help="Number of top confusions to amend.")
     parser.add_argument("--examples-per-pattern", type=int, default=5)
     parser.add_argument("--max-redrafts", type=int, default=2,
