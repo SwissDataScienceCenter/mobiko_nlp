@@ -29,7 +29,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Annotated, Dict, List, NamedTuple, Optional, Tuple, Any
+from typing import Annotated, Callable, Dict, List, NamedTuple, Optional, Tuple, Any
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -1268,6 +1268,30 @@ def _critic_is_satisfied(msg: dict) -> bool:
     return False
 
 
+def _make_structured_termination_check(
+    parse_fn: Callable[[str], Optional[Any]],
+) -> Callable[[dict], bool]:
+    """Build an ``is_termination_msg`` that also accepts a message whose
+    content already parses as a complete, schema-valid structured output for
+    this agent's role (via ``parse_fn``, e.g. ``_parse_annotator_output``) —
+    purely "has this turn's output been produced", independent of what it
+    says (unlike ``_critic_is_satisfied``, which judges the Critic's verdict).
+
+    Not every model reliably appends the requested trailing "TERMINATE" line
+    once it has produced valid JSON. Requiring that literal string strictly
+    just makes ag2 bounce an empty auto-reply back and re-invoke the agent on
+    unchanged input, which regenerates the same output verbatim until
+    ``_agent_turn_max_turns()`` forces a stop — wasted calls that also flood
+    the console with duplicate content.
+    """
+    def _is_done(msg: dict) -> bool:
+        if _is_final_terminate_msg(msg):
+            return True
+        content = (msg.get("content") or "").strip()
+        return bool(content) and parse_fn(content) is not None
+    return _is_done
+
+
 # ─────────────────────────────────────────────────────────────
 # Default document paths (relative to this file)
 # ─────────────────────────────────────────────────────────────
@@ -1911,6 +1935,17 @@ class MultiAgentAnnotator:
             tool_choice if tool_choice else "auto (server default)",
         )
 
+        # Per-role termination checks: literal "TERMINATE", OR the message
+        # already parses as that role's complete structured output — see
+        # _make_structured_termination_check. Shared between each agent and
+        # its executor since either side may be the one ag2 evaluates first.
+        annotator_is_done = _make_structured_termination_check(
+            MultiAgentAnnotator._parse_annotator_output)
+        critic_is_done = _make_structured_termination_check(
+            MultiAgentAnnotator._parse_critic_output)
+        adjudicator_is_done = _make_structured_termination_check(
+            MultiAgentAnnotator._parse_adjudicator_output)
+
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
             name="Annotator",
@@ -1919,7 +1954,7 @@ class MultiAgentAnnotator:
                 guideline_search_mandatory=guideline_search_mandatory),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
-            is_termination_msg=_is_final_terminate_msg,
+            is_termination_msg=annotator_is_done,
         )
 
         _critic_prompt_fn = _critic_system_msg_strict if strict_critic else _critic_system_msg
@@ -1931,7 +1966,7 @@ class MultiAgentAnnotator:
                 precedent_memory=use_precedent_memory),
             llm_config=critic_llm,
             human_input_mode="NEVER",
-            is_termination_msg=_is_final_terminate_msg,
+            is_termination_msg=critic_is_done,
         )
 
         self.adjudicator = ConversableAgent(
@@ -1939,7 +1974,7 @@ class MultiAgentAnnotator:
             system_message=_adjudicator_system_msg(critic_guideline, entity_schema_str, relation_schema),
             llm_config=adjudicator_llm,
             human_input_mode="NEVER",
-            is_termination_msg=_is_final_terminate_msg,
+            is_termination_msg=adjudicator_is_done,
         )
 
         # A tool executor proxy (no LLM, just runs tool calls)
@@ -1947,17 +1982,17 @@ class MultiAgentAnnotator:
         # state across agents — shared executors caused AG2 to corrupt its
         # function_map when the same function name was registered for multiple
         # callers, producing content=None messages and a ValueError on send.
-        def _make_executor(name: str) -> ConversableAgent:
+        def _make_executor(name: str, is_done: Callable[[dict], bool]) -> ConversableAgent:
             return ConversableAgent(
                 name=name,
                 llm_config=False,
                 human_input_mode="NEVER",
-                is_termination_msg=_is_final_terminate_msg,
+                is_termination_msg=is_done,
             )
 
-        self.annotator_executor  = _make_executor("AnnotatorExecutor")
-        self.critic_executor     = _make_executor("CriticExecutor")
-        self.adj_executor        = _make_executor("AdjudicatorExecutor")
+        self.annotator_executor  = _make_executor("AnnotatorExecutor", annotator_is_done)
+        self.critic_executor     = _make_executor("CriticExecutor", critic_is_done)
+        self.adj_executor        = _make_executor("AdjudicatorExecutor", adjudicator_is_done)
 
         # ── Register tools ───────────────────────────────────
         if use_precedent_memory:
