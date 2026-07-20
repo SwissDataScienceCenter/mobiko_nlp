@@ -45,13 +45,20 @@ import streamlit as st
 
 RELATION_TYPES = [
     "HAS_PROPERTY",
-    "IS_AFFECTING",
     "IS_PART_OF",
     "LOCATED_IN",
+    "AFFECTS",
+    "HAS_PROCESS",
+    "COMPARES_TO",
+    "RELATED_TO",
+    "CAUSES",
+    "DURING",
 ]
 
 RE_SAVE_DIR = "/mydata/mobiko/anisia/data/aug_runs"
 RE_MAX_SNAPSHOTS = 50
+
+_CUSTOM_RELATION_SENTINEL = "＋ Custom relation…"
 
 # One background colour per entity type family.
 # Chosen to be distinct but soft; same palette as the NER mockup.
@@ -95,45 +102,68 @@ def _uid() -> str:
 #  HTML rendering                                                     #
 # ------------------------------------------------------------------ #
 
-def _build_entity_html(text: str, spans: List[Dict]) -> str:
+def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = None) -> str:
     """
     Return an HTML string with all spans highlighted in their type colour.
     Overlapping spans: inner-most wins (last boundary wins in tie).
+    Mark's relation hints (if given) are underlined on top of that.
+    Spans/hints with missing char offsets are skipped rather than crashing.
     """
     n = len(text)
     # Build a character-level label array (entity type or None)
-    labels = [None] * n
+    labels: List[str | None] = [None] * n
+    valid_spans = [
+        sp for sp in spans
+        if sp.get("start_char") is not None and sp.get("end_char") is not None
+    ]
     # Sort by span length descending so wider spans paint first and
     # narrower (more specific) spans overwrite them
-    for sp in sorted(spans, key=lambda s: s["end_char"] - s["start_char"], reverse=True):
+    for sp in sorted(valid_spans, key=lambda s: s["end_char"] - s["start_char"], reverse=True):
         a = max(0, int(sp["start_char"]))
         b = min(n, int(sp["end_char"]))
         for i in range(a, b):
             labels[i] = sp.get("type", "")
 
-    # Build fragments: consecutive chars with same label
-    fragments: List[Tuple[str, str | None]] = []
+    hint_labels: List[str | None] = [None] * n
+    for h in (hints or []):
+        if h.get("start_char") is None or h.get("end_char") is None:
+            continue
+        a = max(0, int(h["start_char"]))
+        b = min(n, int(h["end_char"]))
+        for i in range(a, b):
+            hint_labels[i] = h.get("label", "")
+
+    # Build fragments: consecutive chars with same (label, hint_label) pair
+    fragments: List[Tuple[str, str | None, str | None]] = []
     i = 0
     while i < n:
         lab = labels[i]
+        hlab = hint_labels[i]
         j = i + 1
-        while j < n and labels[j] == lab:
+        while j < n and labels[j] == lab and hint_labels[j] == hlab:
             j += 1
-        fragments.append((text[i:j], lab))
+        fragments.append((text[i:j], lab, hlab))
         i = j
 
     parts = []
-    for seg, lab in fragments:
+    for seg, lab, hlab in fragments:
         esc = html_mod.escape(seg)
-        if lab is None:
-            parts.append(esc)
-        else:
+        styles = []
+        titles = []
+        if lab is not None:
             bg, fg = _span_color(lab)
+            styles.append(f"background:{bg};color:{fg};border-radius:4px;padding:1px 4px;")
+            titles.append(lab)
+        if hlab is not None:
+            styles.append("border-bottom:3px dotted #d84315;")
+            titles.append(f"Mark's relation hint: {hlab}")
+        if styles:
             parts.append(
-                f'<mark style="background:{bg};color:{fg};'
-                f'border-radius:4px;padding:1px 4px;" '
-                f'title="{html_mod.escape(lab)}">{esc}</mark>'
+                f'<mark style="{"".join(styles)}" '
+                f'title="{html_mod.escape(" / ".join(titles))}">{esc}</mark>'
             )
+        else:
+            parts.append(esc)
 
     css = """
     <style>
@@ -189,6 +219,14 @@ def _safe_dirname_re(name: str) -> str:
     stem = os.path.splitext(base)[0]
     safe = re_mod.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
     return safe or "re_upload"
+
+
+def _normalize_relation_label(text: str) -> str:
+    """Normalize a free-typed relation label to the UPPER_SNAKE_CASE
+    convention used by the fixed RELATION_TYPES, e.g. "migrates to" ->
+    "MIGRATES_TO". Returns "" if nothing usable remains."""
+    safe = re_mod.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_")
+    return safe.upper()
 
 
 def _prune_re_snapshots(save_dir: str):
@@ -283,6 +321,15 @@ def _get_spans(model: Dict, key: Tuple) -> List[Dict]:
     return []
 
 
+def _get_hints(model: Dict, key: Tuple) -> List[Dict]:
+    """Return Mark's relation_hints list (if any) for a (doc_id, sent_idx) key."""
+    for sent_dict in model.get(key, []):
+        hints = sent_dict.get("relation_hints", [])
+        if hints:
+            return hints
+    return []
+
+
 def _get_text(model: Dict, key: Tuple) -> str:
     for sent_dict in model.get(key, []):
         t = sent_dict.get("text", "")
@@ -343,6 +390,18 @@ def render_relation_page(_unused_model: Dict = None):
     Accepts an optional _unused_model for backwards-compatibility with the
     integration call site, but ignores it — RE files are JSON, not JSONL.
     """
+    st.markdown("### Annotator")
+    username = st.text_input(
+        "Your username (keeps your saved annotations separate from other "
+        "annotators working on the same file)",
+        value=st.session_state.get("re_username", ""),
+        key="re_username_input",
+    ).strip()
+    if not username:
+        st.info("Enter your username above to start annotating.")
+        return
+    st.session_state["re_username"] = username
+
     st.markdown("### Input (relation annotation)")
     re_file = st.file_uploader(
         "Upload JSON file with pre-labelled entities", type=["json"]
@@ -363,12 +422,25 @@ def render_relation_page(_unused_model: Dict = None):
         st.session_state.re_upload_name = re_file.name
         # Reset relation annotations when file changes
         st.session_state.rel_gold = {}
-        # Set up save directory and fresh run ID for this file
+        # Fresh run ID for this file
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         st.session_state.re_run_id = f"{ts}-{uuid.uuid4().hex[:6]}"
-        upload_dir = os.path.join(RE_SAVE_DIR, _safe_dirname_re(re_file.name) + "_relation")
+        st.session_state.re_upload_dir_username = None  # force dir (re)computation below
+
+    # (Re)compute the save directory whenever the file or the username
+    # changes — nested under the annotator's username so two people
+    # annotating the SAME uploaded file get separate autosave/latest files
+    # instead of overwriting each other's "re_latest.jsonl". A username
+    # change alone does NOT reset the in-progress annotations, only where
+    # they're saved from now on.
+    if st.session_state.get("re_upload_dir_username") != username:
+        upload_dir = os.path.join(
+            RE_SAVE_DIR, _safe_dirname_re(re_file.name) + "_relation",
+            _safe_dirname_re(username),
+        )
         os.makedirs(upload_dir, exist_ok=True)
         st.session_state.re_upload_dir = upload_dir
+        st.session_state.re_upload_dir_username = username
 
     model = st.session_state.get("re_model")
     if not model:
@@ -419,6 +491,7 @@ def render_relation_page(_unused_model: Dict = None):
     cur_key = keys[idx]
     text = _get_text(model, cur_key)
     spans = _get_spans(model, cur_key)
+    hints = _get_hints(model, cur_key)
 
     st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}")
 
@@ -429,9 +502,9 @@ def render_relation_page(_unused_model: Dict = None):
     with col_left:
         st.markdown("#### Sentence")
         if hasattr(st, "html"):
-            st.html(_build_entity_html(text, spans))
+            st.html(_build_entity_html(text, spans, hints))
         else:
-            st.components.v1.html(_build_entity_html(text, spans), height=200, scrolling=True)
+            st.components.v1.html(_build_entity_html(text, spans, hints), height=200, scrolling=True)
 
         st.markdown("#### Entities")
         if not spans:
@@ -445,9 +518,30 @@ def render_relation_page(_unused_model: Dict = None):
                     f'font-weight:500;margin-right:6px">{html_mod.escape(sp["text"])}</span>'
                     f'<span style="font-size:11px;color:#888">{html_mod.escape(sp.get("type",""))}</span>'
                 )
+                concept_text = sp.get("concept_text")
+                if concept_text and concept_text != sp.get("text"):
+                    label_html += (
+                        f'<span style="font-size:11px;color:#666;margin-left:8px">'
+                        f'→ concept: <i>{html_mod.escape(concept_text)}</i></span>'
+                    )
                 st.markdown(
                     f'<div style="padding:2px 0"><span style="color:#aaa;font-size:10px;'
                     f'margin-right:6px">E{i+1}</span>{label_html}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        if hints:
+            st.markdown("#### Mark's relation hints")
+            st.caption("Preliminary relation phrases from Mark's annotation — "
+                       "pick one below to suggest its label.")
+            for i, h in enumerate(hints):
+                st.markdown(
+                    f'<div style="padding:2px 0"><span style="color:#aaa;font-size:10px;'
+                    f'margin-right:6px">R{i+1}</span>'
+                    f'<span style="border-bottom:3px dotted #d84315;font-size:12px;'
+                    f'margin-right:6px">{html_mod.escape(h.get("text",""))}</span>'
+                    f'<span style="font-size:11px;color:#888">→ {html_mod.escape(h.get("label",""))}</span>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
 
@@ -458,10 +552,14 @@ def render_relation_page(_unused_model: Dict = None):
         if not spans:
             st.warning("No entities — cannot add relations to this sentence.")
         else:
-            entity_labels = [
-                f"E{i+1} — {sp['text']} ({sp.get('type','')})"
-                for i, sp in enumerate(spans)
-            ]
+            def _entity_label(i: int, sp: Dict) -> str:
+                label = f"E{i+1} — {sp['text']} ({sp.get('type','')})"
+                concept_text = sp.get("concept_text")
+                if concept_text and concept_text != sp.get("text"):
+                    label += f" → concept: {concept_text}"
+                return label
+
+            entity_labels = [_entity_label(i, sp) for i, sp in enumerate(spans)]
 
             with st.container(border=True):
                 e1_idx = st.selectbox(
@@ -470,11 +568,48 @@ def render_relation_page(_unused_model: Dict = None):
                     format_func=lambda i: entity_labels[i],
                     key=f"re_e1_{cur_key}",
                 )
-                rel_type = st.selectbox(
+
+                hint_options = ["(none — pick manually)"] + [
+                    f'R{i+1} — "{h.get("text","")}" → {h.get("label","")}'
+                    for i, h in enumerate(hints)
+                ]
+                hint_sel = st.selectbox(
+                    "Suggest from Mark's relation hint (optional)",
+                    options=range(len(hint_options)),
+                    format_func=lambda i: hint_options[i],
+                    key=f"re_hint_{cur_key}",
+                ) if hints else 0
+                suggested_label = hints[hint_sel - 1]["label"] if hint_sel else None
+
+                # Custom relation types typed in earlier this session are
+                # remembered so they reappear as regular options afterwards.
+                custom_types = st.session_state.setdefault("re_custom_relation_types", [])
+                rel_options = list(RELATION_TYPES)
+                for t in custom_types:
+                    if t not in rel_options:
+                        rel_options.append(t)
+                if suggested_label and suggested_label not in rel_options:
+                    rel_options.append(suggested_label)
+                default_index = rel_options.index(suggested_label) if suggested_label else 0
+                rel_type_sel = st.selectbox(
                     "Relation type",
-                    options=RELATION_TYPES,
-                    key=f"re_rel_{cur_key}",
+                    options=rel_options + [_CUSTOM_RELATION_SENTINEL],
+                    index=default_index,
+                    # Key varies with the chosen hint so a new hint pick
+                    # refreshes the default, while the user can still
+                    # freely override it without the selection resetting.
+                    key=f"re_rel_{cur_key}_{hint_sel}",
                 )
+                if rel_type_sel == _CUSTOM_RELATION_SENTINEL:
+                    custom_input = st.text_input(
+                        "New relation type (letters/numbers only, e.g. MIGRATES_TO)",
+                        key=f"re_rel_custom_{cur_key}_{hint_sel}",
+                    )
+                    rel_type = _normalize_relation_label(custom_input)
+                    if custom_input and not rel_type:
+                        st.warning("Enter at least one letter or number for the new relation type.")
+                else:
+                    rel_type = rel_type_sel
                 e2_idx = st.selectbox(
                     "Target entity (E2)",
                     options=range(len(spans)),
@@ -489,19 +624,25 @@ def render_relation_page(_unused_model: Dict = None):
                 same_entity = (e1_idx == e2_idx)
                 if same_entity:
                     st.warning("Source and target must be different entities.")
+                missing_custom = rel_type_sel == _CUSTOM_RELATION_SENTINEL and not rel_type
+                if missing_custom:
+                    st.warning("Type a name for the new relation, or pick one from the list.")
 
                 if st.button(
                     "＋ Add relation",
                     type="primary",
-                    disabled=same_entity,
+                    disabled=(same_entity or missing_custom),
                     key=f"re_add_{cur_key}",
                 ):
+                    if rel_type not in custom_types and rel_type not in RELATION_TYPES:
+                        custom_types.append(rel_type)
                     new_rel = {
                         "uid": _uid(),
                         "relation": rel_type,
                         "e1": spans[e1_idx],
                         "e2": spans[e2_idx],
                         "note": note.strip(),
+                        "annotator": username,
                     }
                     st.session_state.rel_gold[cur_key].append(new_rel)
                     _maybe_autosave_re(model, keys)
@@ -523,12 +664,17 @@ def render_relation_page(_unused_model: Dict = None):
                 bg2, fg2 = _span_color(e2.get("type", ""))
 
                 with st.container(border=True):
+                    # concept_text (if any) shown as a hover tooltip on the chip
+                    e1_title = html_mod.escape(e1.get("concept_text") or "")
+                    e2_title = html_mod.escape(e2.get("concept_text") or "")
+                    e1_title_attr = f' title="concept: {e1_title}"' if e1_title else ""
+                    e2_title_attr = f' title="concept: {e2_title}"' if e2_title else ""
                     # Display row: E1 chip → relation badge → E2 chip
                     st.markdown(
                         f'<div style="display:flex;align-items:center;gap:6px;'
                         f'flex-wrap:wrap;margin-bottom:4px">'
                         f'<span style="background:{bg1};color:{fg1};border-radius:4px;'
-                        f'padding:2px 7px;font-size:12px;font-weight:500">'
+                        f'padding:2px 7px;font-size:12px;font-weight:500"{e1_title_attr}>'
                         f'{html_mod.escape(e1["text"])}</span>'
                         f'<span style="font-size:12px;color:#888">→</span>'
                         f'<span style="background:#f0f0f0;color:#444;border-radius:4px;'
@@ -536,7 +682,7 @@ def render_relation_page(_unused_model: Dict = None):
                         f'{html_mod.escape(rel["relation"])}</span>'
                         f'<span style="font-size:12px;color:#888">→</span>'
                         f'<span style="background:{bg2};color:{fg2};border-radius:4px;'
-                        f'padding:2px 7px;font-size:12px;font-weight:500">'
+                        f'padding:2px 7px;font-size:12px;font-weight:500"{e2_title_attr}>'
                         f'{html_mod.escape(e2["text"])}</span>'
                         f'</div>',
                         unsafe_allow_html=True,
@@ -545,15 +691,17 @@ def render_relation_page(_unused_model: Dict = None):
                     # Editable relation type + delete
                     c_type, c_saved, c_del = st.columns([3, 2, 1])
                     with c_type:
-                        idx_default = (
-                            RELATION_TYPES.index(rel["relation"])
-                            if rel["relation"] in RELATION_TYPES
-                            else 0
-                        )
+                        # Include the saved value even if it's a custom label
+                        # (e.g. one of Mark's hints) not in the fixed list —
+                        # otherwise the selectbox would fall back to the first
+                        # option and silently overwrite it on the next edit.
+                        type_options = list(RELATION_TYPES)
+                        if rel["relation"] not in type_options:
+                            type_options.append(rel["relation"])
                         new_type = st.selectbox(
                             "Relation",
-                            options=RELATION_TYPES,
-                            index=idx_default,
+                            options=type_options,
+                            index=type_options.index(rel["relation"]),
                             key=f"re_type_{uid}",
                             label_visibility="collapsed",
                         )
@@ -608,6 +756,6 @@ def render_relation_page(_unused_model: Dict = None):
     st.download_button(
         "Download relations JSONL",
         data=jsonl_out.encode("utf-8"),
-        file_name="relations_annotated.jsonl",
+        file_name=f"relations_annotated_{_safe_dirname_re(username)}.jsonl",
         mime="application/jsonl",
     )
