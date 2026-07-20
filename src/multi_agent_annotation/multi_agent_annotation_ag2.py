@@ -34,6 +34,7 @@ from typing import Annotated, Callable, Dict, List, NamedTuple, Optional, Tuple,
 from pydantic import BaseModel, Field, ValidationError
 
 from prompts import _annotator_system_msg, _critic_system_msg, _critic_system_msg_strict, _adjudicator_system_msg, _build_guideline_summary, LOW_CONFIDENCE_THRESHOLD
+from prompts import _annotator_system_msg_coldstart, _critic_system_msg_coldstart, _adjudicator_system_msg_coldstart
 
 from autogen import (
     ConversableAgent,
@@ -1847,6 +1848,10 @@ class MultiAgentAnnotator:
         strict_critic: bool = False,
         guideline_search_mandatory: bool = True,
         tool_choice: Optional[str] = None,
+        annotator_temperature: Optional[float] = None,
+        critic_temperature: Optional[float] = None,
+        adjudicator_temperature: Optional[float] = None,
+        cold_start: bool = False,
     ):
         self.max_rounds = max_rounds
         self.use_precedent_memory = use_precedent_memory
@@ -1916,15 +1921,21 @@ class MultiAgentAnnotator:
             )
 
         # ── Build LLM configs ────────────────────────────────
-        annotator_llm = build_llm_config(annotator_model, temperature=0.2, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ANNOTATOR_TOP_LOGPROBS)
-        critic_temperature = 0.5 if strict_critic else 0.3
-        critic_llm = build_llm_config(critic_model, temperature=critic_temperature, timeout=request_timeout, tool_choice=tool_choice)
-        adjudicator_llm = build_llm_config(adjudicator_model, temperature=0.1, timeout=request_timeout, tool_choice=tool_choice)
+        # Per-role temperatures: an explicit arg (e.g. from the reconstruction
+        # loop CLI) overrides the tuned per-role default; None keeps the default.
+        # The critic's default depends on strict mode.
+        annotator_temp = 0.7 if annotator_temperature is None else annotator_temperature
+        critic_temp = (0.5 if strict_critic else 0.3) if critic_temperature is None else critic_temperature
+        adjudicator_temp = 0.1 if adjudicator_temperature is None else adjudicator_temperature
+
+        annotator_llm = build_llm_config(annotator_model, temperature=annotator_temp, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ANNOTATOR_TOP_LOGPROBS)
+        critic_llm = build_llm_config(critic_model, temperature=critic_temp, timeout=request_timeout, tool_choice=tool_choice)
+        adjudicator_llm = build_llm_config(adjudicator_model, temperature=adjudicator_temp, timeout=request_timeout, tool_choice=tool_choice)
         critic_mode_label = "strict" if strict_critic else "default"
         logger.info(
-            f"Models — annotator: {annotator_model} | "
-            f"critic: {critic_model} (mode={critic_mode_label}, t={critic_temperature}) | "
-            f"adjudicator: {adjudicator_model}"
+            f"Models — annotator: {annotator_model} (t={annotator_temp}) | "
+            f"critic: {critic_model} (mode={critic_mode_label}, t={critic_temp}) | "
+            f"adjudicator: {adjudicator_model} (t={adjudicator_temp})"
         )
         logger.info(
             "guideline_search: %s",
@@ -1946,10 +1957,27 @@ class MultiAgentAnnotator:
         adjudicator_is_done = _make_structured_termination_check(
             MultiAgentAnnotator._parse_adjudicator_output)
 
+        # ── Select prompt set ────────────────────────────────
+        # Cold-start (RQ-D reconstruction loop): the guideline is a definitions-only
+        # scaffold, so swap in prompts that ground decisions in domain expertise +
+        # explicit reasoning rather than verbatim guideline citation — which against
+        # an empty guideline would force fabrication or make the Critic rubber-stamp,
+        # starving the loop of the disagreement signal it mines. Cold-start takes
+        # precedence over strict_critic for the Critic's prompt.
+        if cold_start:
+            _annotator_prompt_fn = _annotator_system_msg_coldstart
+            _critic_prompt_fn = _critic_system_msg_coldstart
+            _adjudicator_prompt_fn = _adjudicator_system_msg_coldstart
+            logger.info("prompt set: COLD-START (expertise-grounded; guideline treated as scaffold)")
+        else:
+            _annotator_prompt_fn = _annotator_system_msg
+            _critic_prompt_fn = _critic_system_msg_strict if strict_critic else _critic_system_msg
+            _adjudicator_prompt_fn = _adjudicator_system_msg
+
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
             name="Annotator",
-            system_message=_annotator_system_msg(
+            system_message=_annotator_prompt_fn(
                 annotator_guideline, entity_schema_str, relation_schema,
                 guideline_search_mandatory=guideline_search_mandatory),
             llm_config=annotator_llm,
@@ -1957,7 +1985,6 @@ class MultiAgentAnnotator:
             is_termination_msg=annotator_is_done,
         )
 
-        _critic_prompt_fn = _critic_system_msg_strict if strict_critic else _critic_system_msg
         self.critic = ConversableAgent(
             name="Critic",
             system_message=_critic_prompt_fn(
@@ -1971,7 +1998,7 @@ class MultiAgentAnnotator:
 
         self.adjudicator = ConversableAgent(
             name="Adjudicator",
-            system_message=_adjudicator_system_msg(critic_guideline, entity_schema_str, relation_schema),
+            system_message=_adjudicator_prompt_fn(critic_guideline, entity_schema_str, relation_schema),
             llm_config=adjudicator_llm,
             human_input_mode="NEVER",
             is_termination_msg=adjudicator_is_done,

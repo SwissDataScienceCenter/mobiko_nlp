@@ -131,17 +131,24 @@ def run_annotation(args, guideline: Path, decision_tbl: Path,
         "--annotator-model", args.annotator_model,
         "--critic-model", args.critic_model,
         "--adjudicator-model", args.adjudicator_model,
+        "--annotator-temp", str(args.annotator_temp),
         "--max-rounds", str(args.max_rounds),
         "--guideline-search-backend", args.guideline_search_backend,
         "--guideline-search", args.guideline_search,
         "--timeout", str(args.timeout),
     ]
+    if args.critic_temp is not None:
+        base_cmd += ["--critic-temp", str(args.critic_temp)]
+    if args.adjudicator_temp is not None:
+        base_cmd += ["--adjudicator-temp", str(args.adjudicator_temp)]
     if args.seeds:
         base_cmd += ["--seeds", str(args.seeds.resolve())]
     if num_sentences is not None:
         base_cmd += ["--num-sentences", str(num_sentences)]
     if args.strict_critic:
         base_cmd += ["--strict-critic"]
+    if args.cold_start:
+        base_cmd += ["--cold-start"]
     if args.tool_choice:
         base_cmd += ["--tool-choice", args.tool_choice]
     if args.precedent_memory:
@@ -407,6 +414,8 @@ def run_loop(args) -> Dict[str, Any]:
             "patterns": args.patterns,
             "annotator_model": args.annotator_model, "critic_model": args.critic_model,
             "adjudicator_model": args.adjudicator_model, "amender_model": args.amender_model,
+            "annotator_temp": args.annotator_temp, "critic_temp": args.critic_temp,
+            "adjudicator_temp": args.adjudicator_temp, "cold_start": args.cold_start,
             "max_rounds": args.max_rounds, "date": today,
             "stopping_rule": {
                 "enabled": stopping_enabled,
@@ -694,7 +703,7 @@ def main() -> None:
 
     p.add_argument("--i-max", type=int, default=6, help="Hard iteration cap (spec 11.2).")
     p.add_argument("--top-k", type=int, default=5, help="Top confusions amended per iteration.")
-    p.add_argument("--min-count", type=int, default=5,
+    p.add_argument("--min-count", type=int, default=2,
                    help="Minimum confusion occurrences to amend (spec 11.2: ≥ 5).")
     p.add_argument("--patterns", choices=["entity", "all"], default="entity",
                    help="'entity' (default, spec 11.1) reconstructs entity-type "
@@ -707,6 +716,13 @@ def main() -> None:
     p.add_argument("--critic-model", type=str, default="qwen3-35B-vllm")
     p.add_argument("--adjudicator-model", type=str, default="qwen3-35B-vllm")
     p.add_argument("--amender-model", choices=list(MODEL_ENDPOINTS), default="qwen3-35B-vllm")
+    p.add_argument("--annotator-temp", type=float, default=0.7,
+                   help="Annotator sampling temperature forwarded to the annotate "
+                        "subprocess (default 0.7 — higher = more diverse annotations).")
+    p.add_argument("--critic-temp", type=float, default=None,
+                   help="Critic temperature (default: 0.3, or 0.5 with --strict-critic).")
+    p.add_argument("--adjudicator-temp", type=float, default=None,
+                   help="Adjudicator temperature (default 0.1).")
     p.add_argument("--max-rounds", type=int, default=2)
     p.add_argument("--num-sentences", type=int, default=None,
                    help="Limit working-set size (smoke tests).")
@@ -715,6 +731,11 @@ def main() -> None:
                    choices=["lexical", "embedding"])
     p.add_argument("--guideline-search", choices=["mandatory", "optional"], default="optional")
     p.add_argument("--strict-critic", action="store_true")
+    p.add_argument("--cold-start", action="store_true",
+                   help="Use cold-start prompts in the annotation subprocess: agents "
+                        "disambiguate from domain expertise + explicit reasoning instead of "
+                        "citing the (still-scaffold) guideline verbatim. Recommended for early "
+                        "iterations; overrides --strict-critic for the Critic's prompt.")
     p.add_argument("--tool-choice", type=str, default=None, choices=["auto", "required", "none"])
     p.add_argument("--precedent-memory", action="store_true",
                    help="Enable the lookup_precedent tool / precedent store for the annotation "

@@ -124,6 +124,13 @@ def main() -> None:
     parser.add_argument("--annotator-model", type=str, default="qwen3-35B-vllm")
     parser.add_argument("--critic-model", type=str, default="qwen3-35B-vllm")
     parser.add_argument("--adjudicator-model", type=str, default="qwen3-35B-vllm")
+    parser.add_argument("--annotator-temp", type=float, default=0.7,
+                        help="Annotator sampling temperature (default 0.7 — higher = "
+                             "more diverse annotations).")
+    parser.add_argument("--critic-temp", type=float, default=None,
+                        help="Critic temperature (default: 0.3, or 0.5 with --strict-critic).")
+    parser.add_argument("--adjudicator-temp", type=float, default=None,
+                        help="Adjudicator temperature (default 0.1).")
     parser.add_argument("--max-rounds", type=int, default=2)
     parser.add_argument("--num-sentences", type=int, default=None,
                         help="Limit the number of sentences (default: all).")
@@ -139,6 +146,12 @@ def main() -> None:
                         default="optional",
                         help="Whether agents MUST call guideline_search before deciding.")
     parser.add_argument("--strict-critic", action="store_true")
+    parser.add_argument("--cold-start", action="store_true",
+                        help="Use cold-start prompts: agents disambiguate from domain "
+                             "expertise + explicit reasoning instead of citing the guideline "
+                             "verbatim. Intended for early loop iterations when the guideline "
+                             "is still a definitions-only scaffold. Overrides --strict-critic "
+                             "for the Critic's prompt.")
     parser.add_argument("--tool-choice", type=str, default=None,
                         choices=["auto", "required", "none"])
     parser.add_argument("--timeout", type=int, default=600)
@@ -183,6 +196,10 @@ def main() -> None:
         strict_critic=args.strict_critic,
         guideline_search_mandatory=(args.guideline_search == "mandatory"),
         tool_choice=args.tool_choice,
+        annotator_temperature=args.annotator_temp,
+        critic_temperature=args.critic_temp,
+        adjudicator_temperature=args.adjudicator_temp,
+        cold_start=args.cold_start,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

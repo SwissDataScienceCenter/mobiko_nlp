@@ -219,6 +219,13 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
       - guideline grounding coverage (guideline_step vs guideline_rule)
     """
     dis_by_round: Counter = Counter()
+    # Genuine disagreements only (a real type change or extent correction, severity
+    # != "none") — same predicate that gates the confusion taxonomy below. Kept
+    # separate from dis_by_round so IAA/severity reports still count every logged
+    # entry, while friction (the PRIMARY stop signal) can read the de-noised count
+    # and not be inflated by "disagreement" entries whose proposed_label just
+    # echoes the annotator's (Critic confirmations mis-filed as disagreements).
+    genuine_dis_by_round: Counter = Counter()
     agr_by_round: Counter = Counter()
     miss_by_round: Counter = Counter()
     critic_turns_by_round: Counter = Counter()
@@ -266,6 +273,7 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
                 # dis_by_round/severity_by_round (friction, IAA reports) still
                 # count every entry so those totals are unchanged.
                 if a != b and sev != "none":
+                    genuine_dis_by_round[k] += 1
                     taxonomy_by_round[k][(a, b)] += 1
                     taxonomy_all[(a, b)] += 1
 
@@ -327,6 +335,11 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
         "per_step": {
             "critic_turns_by_round": dict(critic_turns_by_round),
             "disagreements_by_round": dict(dis_by_round),
+            # De-noised: excludes same-label / severity="none" entries (see comment
+            # at genuine_dis_by_round). Friction reads this; IAA reports read the raw
+            # disagreements_by_round above.
+            "genuine_disagreements_by_round": dict(genuine_dis_by_round),
+            "total_genuine_disagreements": sum(genuine_dis_by_round.values()),
             "agreements_by_round": dict(agr_by_round),
             "missing_by_round": dict(miss_by_round),
             "disagreement_rate_by_round": {
