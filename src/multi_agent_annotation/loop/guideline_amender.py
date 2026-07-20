@@ -417,11 +417,9 @@ def _make_client(model_key: str):
     endpoint = MODEL_ENDPOINTS.get(model_key)
     if not endpoint:
         raise ValueError(f"Unknown model: {model_key}. Available: {list(MODEL_ENDPOINTS)}")
-    api_key = (
-        endpoint["api_key"]
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("OPEN_WEB_UI_API_KEY")
-    )
+    api_key = endpoint.get("api_key") or os.getenv(endpoint.get("api_key_env", ""))
+
+
     if not api_key:
         raise ValueError(f"API key required for {model_key} (set OPENAI_API_KEY / OPEN_WEB_UI_API_KEY).")
     client = openai.OpenAI(base_url=endpoint["base_url"], api_key=api_key)
