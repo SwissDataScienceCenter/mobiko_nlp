@@ -36,6 +36,17 @@ from pydantic import BaseModel, Field, ValidationError
 from prompts import _annotator_system_msg, _critic_system_msg, _critic_system_msg_strict, _adjudicator_system_msg, _build_guideline_summary, LOW_CONFIDENCE_THRESHOLD
 from prompts import _annotator_system_msg_coldstart, _critic_system_msg_coldstart, _adjudicator_system_msg_coldstart
 
+# Optional dependency-parser relation-candidate net (Option A). Imported lazily
+# — the module itself only loads spaCy when a hinter is actually constructed, so
+# importing it here is cheap and safe even when the feature is off.
+try:
+    from dependency_relations import DependencyRelationHinter
+except ImportError:  # when imported as a package (src.multi_agent_annotation.*)
+    try:
+        from src.multi_agent_annotation.dependency_relations import DependencyRelationHinter
+    except ImportError:
+        DependencyRelationHinter = None  # feature unavailable; guarded at use sites
+
 from autogen import (
     ConversableAgent,
     GroupChat,
@@ -524,8 +535,23 @@ MODEL_ENDPOINTS = {
     "swissai-apertus-70B": {
         "base_url": "https://api.swissai.svc.cscs.ch/v1",
         "api_key_env": "SWISSAI_API_KEY",
-        "model": "swiss-ai/Apertus-1.5-70B-SFT-RL-DPO-SDPO",
+        "model": "swiss-ai/Apertus-1.5-70B-SFT-RL-DPO",
     },
+    "swissai-llama-3.3-70B": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+    },
+    "rcp-qwen3.6-35B": {
+        "base_url": "https://inference.rcp.epfl.ch/v1/",
+        "api_key_env": "RCP_API_KEY",
+        "model": "Qwen/Qwen3.6-35B-A3B",
+    },
+    "rcp-kimi-2.6": {
+        "base_url": "https://inference.rcp.epfl.ch/v1/",
+        "api_key_env": "RCP_API_KEY",
+        "model": "moonshotai/Kimi-K2.6",
+    }
 }
 
 
@@ -1852,10 +1878,53 @@ class MultiAgentAnnotator:
         critic_temperature: Optional[float] = None,
         adjudicator_temperature: Optional[float] = None,
         cold_start: bool = False,
+        use_dependency_relation_hints: bool = False,
+        dependency_model: str = "en_core_web_trf",
+        dependency_max_dep_distance: int = 4,
+        dependency_max_candidates: int = 12,
     ):
         self.max_rounds = max_rounds
         self.use_precedent_memory = use_precedent_memory
         self.precedent_store_path = Path(precedent_store_path) if precedent_store_path else None
+
+        # ── Dependency-parser relation-candidate net (Option A, optional) ──
+        # Surfaces syntactically-connected entity pairs that have no relation to
+        # the Critic as candidates to check — a recall aid, off by default.
+        # Toggle via the constructor arg or DEPENDENCY_RELATION_HINTS={1,true,on}.
+        _env_flag = os.getenv("DEPENDENCY_RELATION_HINTS")
+        if _env_flag is not None:
+            use_dependency_relation_hints = _env_flag.strip().lower() in {"1", "true", "yes", "on"}
+        self.use_dependency_relation_hints = use_dependency_relation_hints
+        self.relation_hinter = None
+        if use_dependency_relation_hints:
+            if DependencyRelationHinter is None:
+                logger.warning(
+                    "Dependency relation hints requested but dependency_relations "
+                    "module could not be imported; disabling."
+                )
+                self.use_dependency_relation_hints = False
+            else:
+                hinter = DependencyRelationHinter(
+                    model=dependency_model,
+                    max_dep_distance=dependency_max_dep_distance,
+                    max_candidates=dependency_max_candidates,
+                )
+                if hinter.available:
+                    self.relation_hinter = hinter
+                    logger.info(
+                        "Dependency relation hints: ENABLED (model=%s, "
+                        "max_dep_distance=%d, max_candidates=%d)",
+                        hinter.loaded_model, dependency_max_dep_distance,
+                        dependency_max_candidates,
+                    )
+                else:
+                    logger.warning(
+                        "Dependency relation hints requested but parser unavailable "
+                        "(%s); disabling.", hinter.load_error,
+                    )
+                    self.use_dependency_relation_hints = False
+        else:
+            logger.info("Dependency relation hints: disabled.")
 
         # ── Load resources ───────────────────────────────────
         relation_schema = load_schema(schema_path) if schema_path else {}
@@ -2124,9 +2193,15 @@ class MultiAgentAnnotator:
             # ── Critic turn ───────────────────────────────────
             # On re-reviews, give the Critic its own prior verdict so it stays
             # consistent and does not flip-flop on unchanged spans.
+            # Optional (Option A): surface dependency-parser missing-relation
+            # candidates for the CURRENT annotation so the Critic checks pairs
+            # the Annotator left unlinked. Recomputed each round, so relations
+            # added in a prior round drop off the list.
+            relation_hint_block = self._relation_hint_block(sentence, last_annotator_out)
             crit_msg = self._build_critic_review_msg(
                 sentence, ann_content,
                 prev_critic_text=last_critic_text if round_idx > 0 else None,
+                relation_hint_block=relation_hint_block,
             )
             logger.info("  [round %d] Critic …", round_idx + 1)
             crit_content, crit_record = self._run_agent_turn(self.critic, self.critic_executor, crit_msg)
@@ -2734,11 +2809,41 @@ class MultiAgentAnnotator:
             )
         return msg
 
+    def _relation_hint_block(
+        self,
+        sentence: str,
+        parsed_ann: Optional[AnnotatorOutput],
+    ) -> Optional[str]:
+        """
+        Build the dependency-parser missing-relation candidate block for the
+        Critic (Option A). Returns None when the feature is off, the parser is
+        unavailable, the annotation didn't parse, or no candidates were found.
+        Never raises — hinting must not break the deliberation.
+        """
+        if (
+            not self.use_dependency_relation_hints
+            or self.relation_hinter is None
+            or parsed_ann is None
+        ):
+            return None
+        try:
+            candidates = self.relation_hinter.find_missing_candidates(
+                sentence, parsed_ann.entities, parsed_ann.relations
+            )
+            if not candidates:
+                return None
+            logger.info("  Dependency net: %d missing-relation candidate(s)", len(candidates))
+            return self.relation_hinter.format_block(candidates)
+        except Exception as exc:  # never let hinting break the run
+            logger.warning("Dependency relation hinting failed: %s", exc)
+            return None
+
     @staticmethod
     def _build_critic_review_msg(
         sentence: str,
         annotator_text: str,
         prev_critic_text: Optional[str] = None,
+        relation_hint_block: Optional[str] = None,
     ) -> str:
         clean = MultiAgentAnnotator._strip_terminate(annotator_text)
         if prev_critic_text:
@@ -2786,6 +2891,8 @@ class MultiAgentAnnotator:
                     f"\n\nLow-confidence items (< {LOW_CONFIDENCE_THRESHOLD}) — check these first:\n"
                     + "\n".join(low_conf)
                 )
+        if relation_hint_block:
+            msg += "\n\n" + relation_hint_block
         return msg
 
     @staticmethod
@@ -3754,6 +3861,28 @@ def main():
             "Omit to use a fresh in-memory store that is discarded after the run."
         ),
     )
+    parser.add_argument(
+        "--use-dependency-relation-hints", action="store_true",
+        help="Enable the dependency-parser relation-candidate net (Option A): surface "
+             "syntactically-connected entity pairs that have no relation to the Critic as "
+             "candidates to check. Optional recall aid; off by default. Most effective with "
+             "--max-rounds >= 2 (so the Annotator can add flagged relations). Also toggle via "
+             "DEPENDENCY_RELATION_HINTS=1.",
+    )
+    parser.add_argument(
+        "--dependency-model", type=str, default="en_core_web_trf",
+        help="spaCy model for the relation-candidate net (default: en_core_web_trf; "
+             "falls back to en_core_web_sm).",
+    )
+    parser.add_argument(
+        "--dependency-max-dep-distance", type=int, default=4,
+        help="Max shortest-dependency-path length between two entity heads for a candidate "
+             "pair (default: 4). Lower = fewer, tighter candidates.",
+    )
+    parser.add_argument(
+        "--dependency-max-candidates", type=int, default=12,
+        help="Max candidate pairs surfaced to the Critic per sentence (default: 12).",
+    )
 
     args = parser.parse_args()
 
@@ -3785,6 +3914,10 @@ def main():
         guideline_search_backend=args.guideline_search_backend,
         guideline_search_embedding_model=args.guideline_search_embedding_model,
         precedent_store_path=args.precedent_store,
+        use_dependency_relation_hints=args.use_dependency_relation_hints,
+        dependency_model=args.dependency_model,
+        dependency_max_dep_distance=args.dependency_max_dep_distance,
+        dependency_max_candidates=args.dependency_max_candidates,
     )
 
     records = annotator.annotate_batch(sentences, output_path=args.output)

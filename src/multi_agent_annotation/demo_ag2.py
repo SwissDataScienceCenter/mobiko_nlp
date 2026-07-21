@@ -246,6 +246,10 @@ def run_live(
     strict_critic: bool = False,
     guideline_search_mandatory: bool = True,
     tool_choice: str | None = None,
+    use_dependency_relation_hints: bool = False,
+    dependency_model: str = "en_core_web_trf",
+    dependency_max_dep_distance: int = 4,
+    dependency_max_candidates: int = 12,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -264,6 +268,10 @@ def run_live(
         strict_critic=strict_critic,
         guideline_search_mandatory=guideline_search_mandatory,
         tool_choice=tool_choice,
+        use_dependency_relation_hints=use_dependency_relation_hints,
+        dependency_model=dependency_model,
+        dependency_max_dep_distance=dependency_max_dep_distance,
+        dependency_max_candidates=dependency_max_candidates,
     )
 
     records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume, max_retries=max_retries)
@@ -298,14 +306,14 @@ def main() -> None:
         help="Path to seed examples .py or .json file.",
     )
     parser.add_argument(
-        "--annotator-model", type=str, default="qwen3-35B-vllm",
+        "--annotator-model", type=str, default="swissai-qwen3.5-27B",
     )
     parser.add_argument(
-        "--critic-model", type=str, default="qwen3-35B-vllm",
+        "--critic-model", type=str, default="swissai-qwen3.5-27B",
     )
     parser.add_argument(
         "--adjudicator-model", type=str,
-        default=os.getenv("ADJUDICATOR_MODEL", "qwen3-35B-vllm"),
+        default=os.getenv("ADJUDICATOR_MODEL", "swissai-qwen3.5-27B"),
         help="Model key for the Adjudicator (recommend 'gpt4o' for stronger reasoning; "
              "override with ADJUDICATOR_MODEL env var).",
     )
@@ -313,7 +321,7 @@ def main() -> None:
         "--max-rounds", type=int, default=2,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled2.jsonl"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled_swissai-qwen3.5-27B"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(
@@ -380,6 +388,27 @@ def main() -> None:
              "optional, the model decides; 'required' = the model MUST emit a tool call every "
              "turn (diagnostic only — breaks final-JSON turns); 'none' = tools disabled.",
     )
+    parser.add_argument(
+        "--use-dependency-relation-hints", action="store_true",
+        help="Enable the dependency-parser relation-candidate net (Option A): surface "
+             "syntactically-connected entity pairs with no relation to the Critic as candidates "
+             "to check. Optional recall aid; off by default. Most effective with --max-rounds >= 2. "
+             "Also toggle via DEPENDENCY_RELATION_HINTS=1.",
+    )
+    parser.add_argument(
+        "--dependency-model", type=str, default="en_core_web_trf",
+        help="spaCy model for the relation-candidate net (default: en_core_web_trf; "
+             "falls back to en_core_web_sm).",
+    )
+    parser.add_argument(
+        "--dependency-max-dep-distance", type=int, default=4,
+        help="Max shortest-dependency-path length between two entity heads for a candidate pair "
+             "(default: 4).",
+    )
+    parser.add_argument(
+        "--dependency-max-candidates", type=int, default=12,
+        help="Max candidate pairs surfaced to the Critic per sentence (default: 12).",
+    )
     args = parser.parse_args()
 
     if args.fix_offsets:
@@ -416,6 +445,10 @@ def main() -> None:
             strict_critic=args.strict_critic,
             guideline_search_mandatory=(args.guideline_search == "mandatory"),
             tool_choice=args.tool_choice,
+            use_dependency_relation_hints=args.use_dependency_relation_hints,
+            dependency_model=args.dependency_model,
+            dependency_max_dep_distance=args.dependency_max_dep_distance,
+            dependency_max_candidates=args.dependency_max_candidates,
         )
 
 
