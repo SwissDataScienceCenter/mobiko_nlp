@@ -217,9 +217,29 @@ def _patch_openai_for_streaming_logprobs() -> None:
         _logprob_streams().append(tokens)
 
         def _tee():
+            # Some OpenAI-compatible gateways (EPFL RCP / vLLM, e.g. serving
+            # Kimi-K2.7) emit the real finish_reason on one chunk and then send
+            # an extra trailing chunk that still carries `choices` but with
+            # finish_reason=None. AG2 reassembles streams last-write-wins
+            # (finish_reasons[idx] = choice.finish_reason on every chunk, see
+            # autogen/oai/client.py) and then builds a strict OpenAI `Choice`,
+            # which rejects finish_reason=None with a pydantic literal_error —
+            # surfacing to the caller as an opaque failure. Carry the last
+            # non-null finish_reason forward per choice index so a trailing None
+            # cannot clobber it, keeping stream=True working for every role.
+            last_finish: Dict[int, Any] = {}
             for chunk in resp:
                 try:
                     for choice in (getattr(chunk, "choices", None) or []):
+                        idx = getattr(choice, "index", 0)
+                        fr = getattr(choice, "finish_reason", None)
+                        if fr is not None:
+                            last_finish[idx] = fr
+                        elif last_finish.get(idx) is not None:
+                            try:
+                                choice.finish_reason = last_finish[idx]
+                            except Exception:
+                                pass  # field not assignable on this SDK shape
                         lp = getattr(choice, "logprobs", None)
                         content = getattr(lp, "content", None) if lp else None
                         for tok in (content or []):
@@ -535,7 +555,7 @@ MODEL_ENDPOINTS = {
     "swissai-apertus-70B": {
         "base_url": "https://api.swissai.svc.cscs.ch/v1",
         "api_key_env": "SWISSAI_API_KEY",
-        "model": "swiss-ai/Apertus-1.5-70B-SFT-RL-DPO",
+        "model": "swiss-ai/Apertus-v1.5-70B",
     },
     "swissai-llama-3.3-70B": {
         "base_url": "https://api.swissai.svc.cscs.ch/v1",
@@ -543,14 +563,16 @@ MODEL_ENDPOINTS = {
         "model": "meta-llama/Llama-3.3-70B-Instruct",
     },
     "rcp-qwen3.6-35B": {
-        "base_url": "https://inference.rcp.epfl.ch/v1/",
+        "base_url": "https://inference.rcp.epfl.ch/v1",
         "api_key_env": "RCP_API_KEY",
         "model": "Qwen/Qwen3.6-35B-A3B",
+        "reasoning": True,
     },
-    "rcp-kimi-2.6": {
-        "base_url": "https://inference.rcp.epfl.ch/v1/",
+    "rcp-kimi-2.7": {
+        "base_url": "https://inference.rcp.epfl.ch/v1",
         "api_key_env": "RCP_API_KEY",
-        "model": "moonshotai/Kimi-K2.6",
+        "model": "moonshotai/Kimi-K2.7-Code",
+        "reasoning": True,
     }
 }
 
@@ -566,6 +588,17 @@ _DEFAULT_ADJUDICATOR_MODEL: str = os.getenv("ADJUDICATOR_MODEL", "qwen3-32B-vllm
 ANNOTATOR_TOP_LOGPROBS: Optional[int] = int(os.getenv("ANNOTATOR_TOP_LOGPROBS", "20")) or None
 
 
+def _env_enable_thinking() -> Optional[bool]:
+    """Default reasoning ("thinking") toggle for reasoning-capable endpoints,
+    from the RCP_ENABLE_THINKING env var. Returns None (leave the gateway
+    default untouched) when unset; otherwise a bool. Set RCP_ENABLE_THINKING=0
+    to turn thinking off for all RCP models without code changes."""
+    val = os.getenv("RCP_ENABLE_THINKING")
+    if val is None or val.strip() == "":
+        return None
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
 def build_llm_config(
     model_key: str,
     temperature: float = 0.3,
@@ -573,6 +606,8 @@ def build_llm_config(
     tool_choice: Optional[str] = None,
     logprobs: bool = False,
     top_logprobs: Optional[int] = None,
+    enable_thinking: Optional[bool] = None,
+    max_tokens: Optional[int] = None,
 ) -> LLMConfig:
     """
     Build an AG2 LLMConfig for one of the SDSC endpoints.
@@ -588,6 +623,27 @@ def build_llm_config(
     distribution (implies logprobs=True) so the pipeline can compute type-token
     predictive entropy. Forwarded to the OpenAI-compatible API; if the gateway
     rejects it, set ANNOTATOR_TOP_LOGPROBS=0 to disable.
+
+    max_tokens (optional): cap on completion tokens per response, forwarded to the
+    OpenAI-compatible API. When None the key is omitted and the server default
+    applies. Reasoning models (e.g. Kimi) spend a large share of the completion
+    budget on the chain-of-thought before emitting the final answer, so the
+    server default can truncate the answer mid-JSON — raise this for those
+    endpoints. Note this bounds OUTPUT tokens, not the total context window.
+
+    enable_thinking (optional): reasoning toggle for reasoning-capable vLLM
+    endpoints (those flagged "reasoning" in MODEL_ENDPOINTS — currently the RCP
+    Qwen3.x and Kimi models). False disables the separate chain-of-thought pass;
+    True forces it on. When None, falls back to the RCP_ENABLE_THINKING env var
+    (see _env_enable_thinking), and if that is also unset the gateway default is
+    left untouched. Forwarded via the OpenAI SDK's extra_body as
+    chat_template_kwargs — a top-level chat_template_kwargs kwarg is rejected by
+    the SDK. Ignored for non-reasoning endpoints (e.g. the OpenAI API, which
+    rejects unknown body fields). NOTE: on Kimi-K2.7 disabling thinking does not
+    remove the reasoning — it merges the chain-of-thought inline into `content`
+    instead of a separate reasoning_content field, which is worse for JSON
+    parsing; it works cleanly on the Qwen3.x models. Prefer leaving thinking on
+    for Kimi.
     """
     endpoint = MODEL_ENDPOINTS.get(model_key)
     if not endpoint:
@@ -611,10 +667,22 @@ def build_llm_config(
     }
     if tool_choice:
         config["tool_choice"] = tool_choice
+    if max_tokens is not None:
+        config["max_tokens"] = max_tokens
     if logprobs or top_logprobs is not None:
         config["logprobs"] = True
     if top_logprobs is not None:
         config["top_logprobs"] = top_logprobs
+
+    # Reasoning ("thinking") toggle for reasoning-capable vLLM endpoints. Only
+    # applied where the endpoint understands it (flagged "reasoning") so we
+    # never send chat_template_kwargs to gateways that reject unknown body
+    # fields. Explicit arg wins; otherwise fall back to RCP_ENABLE_THINKING.
+    if endpoint.get("reasoning"):
+        think = enable_thinking if enable_thinking is not None else _env_enable_thinking()
+        if think is not None:
+            config["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think}}
+
     return LLMConfig(config, temperature=temperature)
 
 
@@ -1877,6 +1945,9 @@ class MultiAgentAnnotator:
         annotator_temperature: Optional[float] = None,
         critic_temperature: Optional[float] = None,
         adjudicator_temperature: Optional[float] = None,
+        annotator_max_tokens: Optional[int] = None,
+        critic_max_tokens: Optional[int] = None,
+        adjudicator_max_tokens: Optional[int] = None,
         cold_start: bool = False,
         use_dependency_relation_hints: bool = False,
         dependency_model: str = "en_core_web_trf",
@@ -1997,14 +2068,18 @@ class MultiAgentAnnotator:
         critic_temp = (0.5 if strict_critic else 0.3) if critic_temperature is None else critic_temperature
         adjudicator_temp = 0.1 if adjudicator_temperature is None else adjudicator_temperature
 
-        annotator_llm = build_llm_config(annotator_model, temperature=annotator_temp, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ANNOTATOR_TOP_LOGPROBS)
-        critic_llm = build_llm_config(critic_model, temperature=critic_temp, timeout=request_timeout, tool_choice=tool_choice)
-        adjudicator_llm = build_llm_config(adjudicator_model, temperature=adjudicator_temp, timeout=request_timeout, tool_choice=tool_choice)
+        # Per-role max completion tokens: None leaves the server default in place.
+        # Bump these for reasoning models (e.g. Kimi) whose chain-of-thought eats
+        # the default budget before the final answer is emitted.
+        annotator_llm = build_llm_config(annotator_model, temperature=annotator_temp, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ANNOTATOR_TOP_LOGPROBS, max_tokens=annotator_max_tokens)
+        critic_llm = build_llm_config(critic_model, temperature=critic_temp, timeout=request_timeout, tool_choice=tool_choice, max_tokens=critic_max_tokens)
+        adjudicator_llm = build_llm_config(adjudicator_model, temperature=adjudicator_temp, timeout=request_timeout, tool_choice=tool_choice, max_tokens=adjudicator_max_tokens)
         critic_mode_label = "strict" if strict_critic else "default"
+        _mt = lambda v: f", max_tokens={v}" if v is not None else ""
         logger.info(
-            f"Models — annotator: {annotator_model} (t={annotator_temp}) | "
-            f"critic: {critic_model} (mode={critic_mode_label}, t={critic_temp}) | "
-            f"adjudicator: {adjudicator_model} (t={adjudicator_temp})"
+            f"Models — annotator: {annotator_model} (t={annotator_temp}{_mt(annotator_max_tokens)}) | "
+            f"critic: {critic_model} (mode={critic_mode_label}, t={critic_temp}{_mt(critic_max_tokens)}) | "
+            f"adjudicator: {adjudicator_model} (t={adjudicator_temp}{_mt(adjudicator_max_tokens)})"
         )
         logger.info(
             "guideline_search: %s",

@@ -246,6 +246,9 @@ def run_live(
     strict_critic: bool = False,
     guideline_search_mandatory: bool = True,
     tool_choice: str | None = None,
+    annotator_max_tokens: int | None = None,
+    critic_max_tokens: int | None = None,
+    adjudicator_max_tokens: int | None = None,
     use_dependency_relation_hints: bool = False,
     dependency_model: str = "en_core_web_trf",
     dependency_max_dep_distance: int = 4,
@@ -268,6 +271,9 @@ def run_live(
         strict_critic=strict_critic,
         guideline_search_mandatory=guideline_search_mandatory,
         tool_choice=tool_choice,
+        annotator_max_tokens=annotator_max_tokens,
+        critic_max_tokens=critic_max_tokens,
+        adjudicator_max_tokens=adjudicator_max_tokens,
         use_dependency_relation_hints=use_dependency_relation_hints,
         dependency_model=dependency_model,
         dependency_max_dep_distance=dependency_max_dep_distance,
@@ -306,14 +312,14 @@ def main() -> None:
         help="Path to seed examples .py or .json file.",
     )
     parser.add_argument(
-        "--annotator-model", type=str, default="swissai-qwen3.5-27B",
+        "--annotator-model", type=str, default="qwen3-35B-vllm",
     )
     parser.add_argument(
-        "--critic-model", type=str, default="swissai-qwen3.5-27B",
+        "--critic-model", type=str, default="qwen3-35B-vllm",
     )
     parser.add_argument(
         "--adjudicator-model", type=str,
-        default=os.getenv("ADJUDICATOR_MODEL", "swissai-qwen3.5-27B"),
+        default=os.getenv("ADJUDICATOR_MODEL", "qwen3-35B-vllm"),
         help="Model key for the Adjudicator (recommend 'gpt4o' for stronger reasoning; "
              "override with ADJUDICATOR_MODEL env var).",
     )
@@ -321,7 +327,7 @@ def main() -> None:
         "--max-rounds", type=int, default=2,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled_swissai-qwen3.5-27B"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled_swissai-qwen3-35B-vllm"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(
@@ -389,6 +395,26 @@ def main() -> None:
              "turn (diagnostic only — breaks final-JSON turns); 'none' = tools disabled.",
     )
     parser.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="Max completion tokens per model response, applied to all three roles "
+             "(annotator/critic/adjudicator) unless overridden per-role below. Default: "
+             "unset (use the server default). Raise this for reasoning models such as Kimi, "
+             "whose chain-of-thought consumes the default budget before the final answer, "
+             "causing mid-JSON truncation. Bounds OUTPUT tokens, not the context window.",
+    )
+    parser.add_argument(
+        "--annotator-max-tokens", type=int, default=None,
+        help="Override --max-tokens for the Annotator only (default: inherit --max-tokens).",
+    )
+    parser.add_argument(
+        "--critic-max-tokens", type=int, default=None,
+        help="Override --max-tokens for the Critic only (default: inherit --max-tokens).",
+    )
+    parser.add_argument(
+        "--adjudicator-max-tokens", type=int, default=None,
+        help="Override --max-tokens for the Adjudicator only (default: inherit --max-tokens).",
+    )
+    parser.add_argument(
         "--use-dependency-relation-hints", action="store_true",
         help="Enable the dependency-parser relation-candidate net (Option A): surface "
              "syntactically-connected entity pairs with no relation to the Critic as candidates "
@@ -427,6 +453,11 @@ def main() -> None:
             sentences = load_sentences(args.input.resolve())
         if args.num_sentences is not None:
             sentences = sentences[: args.num_sentences]
+        # Per-role max_tokens: an explicit per-role flag wins, else fall back to
+        # the shared --max-tokens, else None (server default).
+        annotator_max_tokens = args.annotator_max_tokens if args.annotator_max_tokens is not None else args.max_tokens
+        critic_max_tokens = args.critic_max_tokens if args.critic_max_tokens is not None else args.max_tokens
+        adjudicator_max_tokens = args.adjudicator_max_tokens if args.adjudicator_max_tokens is not None else args.max_tokens
         run_live(
             sentences=sentences,
             schema_path=schema_path,
@@ -445,6 +476,9 @@ def main() -> None:
             strict_critic=args.strict_critic,
             guideline_search_mandatory=(args.guideline_search == "mandatory"),
             tool_choice=args.tool_choice,
+            annotator_max_tokens=annotator_max_tokens,
+            critic_max_tokens=critic_max_tokens,
+            adjudicator_max_tokens=adjudicator_max_tokens,
             use_dependency_relation_hints=args.use_dependency_relation_hints,
             dependency_model=args.dependency_model,
             dependency_max_dep_distance=args.dependency_max_dep_distance,
