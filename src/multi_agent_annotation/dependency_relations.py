@@ -46,20 +46,41 @@ logger = logging.getLogger(__name__)
 _LOC_PREPS = {
     "in", "at", "on", "within", "across", "near", "throughout", "along",
     "around", "inside", "among", "amongst", "over", "beneath", "under",
-    "above", "between",
+    "above", "between", "behind", "beyond", "beside", "by", "opposite",
+    "outside", "upon", "underneath", "amid", "amidst", "against",
+    "toward", "towards", "into", "onto", "through", "atop", "alongside",
+    "via",
 }
+
 _CAUSAL_VERBS = {
     "cause", "lead", "result", "produce", "generate", "induce", "trigger",
-    "yield",
+    "yield", "create", "prompt", "provoke", "spark", "precipitate",
+    "engender", "foster", "spawn", "stem", "arise", "originate",
+    "stimulate", "incite", "instigate",
 }
+
 _EFFECT_VERBS = {
     "affect", "influence", "reduce", "increase", "decrease", "alter", "impact",
     "hinder", "contribute", "enhance", "limit", "threaten", "change", "modify",
     "regulate", "control", "shape", "drive", "damage", "improve", "promote",
-    "suppress", "facilitate", "disrupt", "diminish",
+    "suppress", "facilitate", "disrupt", "diminish", "boost", "weaken",
+    "strengthen", "accelerate", "decelerate", "slow", "inhibit", "moderate",
+    "mitigate", "exacerbate", "worsen", "lower", "raise", "lessen",
+    "restrict", "constrain", "govern", "determine", "mediate", "modulate",
+    "undermine", "curb", "curtail", "expand", "stabilize", "destabilize",
 }
-_COMPARE_VERBS = {"compare", "exceed", "differ", "resemble", "outnumber", "surpass"}
-_POSSESS_VERBS = {"have", "contain", "include", "comprise", "possess", "consist", "encompass"}
+
+_COMPARE_VERBS = {
+    "compare", "exceed", "differ", "resemble", "outnumber", "surpass",
+    "match", "rival", "parallel", "mirror", "contrast", "correlate",
+    "equal", "approximate", "outperform", "underperform", "trail", "align",
+}
+
+_POSSESS_VERBS = {
+    "have", "contain", "include", "comprise", "possess", "consist",
+    "encompass", "involve", "entail", "hold", "feature", "incorporate",
+    "embody", "carry", "own", "exhibit", "display", "constitute",
+}
 
 # Path made only of these edges ⇒ the two entities are coordinate siblings /
 # in apposition, not (usually) related to each other directly.
