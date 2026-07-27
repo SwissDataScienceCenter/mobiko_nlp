@@ -169,7 +169,7 @@ Annotation passthrough flags also exist: `--guideline-search {mandatory,optional
 out-dir/
 ├── coldstart/            # G0.md + D0.csv, if auto-generated
 ├── guidelines/           # the guideline chain
-│   ├── G0.md  G1.md  G2.md … (G_i + accepted amendment sections appended)
+│   ├── G0.md  G1.md  G2.md … (G_i with the accepted rules integrated into it)
 ├── tables/               # the decision-table chain
 │   ├── D0.csv  D1.csv  D2.csv … (decision tests injected into the Question column)
 ├── iter_00/
@@ -214,10 +214,23 @@ out-dir/
 6. **Draft** one amendment per confusion via `guideline_amender` — each must pass
    the operationality gate (a concrete if-then `decision_test` naming the
    competing labels), redrafting on failure.
-7. **Apply (append-only)** the accepted amendments to **both** artifacts:
-   - `G_i → G_{i+1}`: amendment sections appended to the guideline;
-   - `D_i → D_{i+1}`: each `decision_test` injected into the `Question` column of
-     the rows for the two confused labels (`decision_table.py`, dedup'd).
+7. **Apply** the accepted amendments to **both** artifacts:
+   - `G_i → G_{i+1}`: each rule is **integrated into the section it concerns** —
+     the amender routes it (verbatim `original_rule` → `target_section` heading →
+     a heading naming one of the competing labels) and rewrites that section so
+     the rule replaces the wording it supersedes. Sections nothing was routed to
+     are copied through untouched, so the rewrite cannot silently drop or reword
+     the rest of the guideline. Unroutable rules land in a single stable
+     `## Disambiguation rules` section, itself rewritten on later iterations.
+     A rewrite is accepted only if it keeps the section's content (word-count
+     floor), still states each `decision_test` as a checkable rule naming the
+     competing labels, and carries no changelog phrasing; otherwise it is
+     redrafted (`--max-rewrite-retries`) and finally falls back to a
+     deterministic merge at the end of that same section. `--integration append`
+     restores the legacy dated-appendix behaviour.
+   - `D_i → D_{i+1}` (append-only): each `decision_test` injected into the
+     `Question` column of the rows for the two confused labels
+     (`decision_table.py`, dedup'd).
 
 **Why both?** `G_i` only feeds the Critic/Adjudicator; the Annotator reads the
 decision table. Cold-starting and amending only the guideline would leave the

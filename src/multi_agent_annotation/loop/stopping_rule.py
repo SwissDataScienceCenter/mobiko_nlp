@@ -85,7 +85,20 @@ def friction_from_report(report: Dict[str, Any], records: List[dict]) -> Dict[st
     the friction trajectory is fully auditable.
     """
     per_step = report.get("per_step", {}) or {}
-    by_round = per_step.get("disagreements_by_round", {}) or {}
+    raw_by_round = per_step.get("disagreements_by_round", {}) or {}
+    # PRIMARY signal reads the de-noised count: genuine disagreements only (real
+    # type change or extent correction, severity != "none"). This excludes Critic
+    # "disagreements" that just echo the annotator's label (proposed_label ==
+    # annotator_label), which would otherwise inflate friction and mask real
+    # convergence. Falls back to the raw count ONLY for older reports that predate
+    # the genuine_* field — an empty genuine dict is a real "zero genuine
+    # disagreements" and must be used, not treated as missing. NOTE: same-label
+    # *extent-only* corrections are also excluded (no structured proposed-extent
+    # field distinguishes them), matching the confusion-taxonomy predicate.
+    if "genuine_disagreements_by_round" in per_step:
+        by_round = per_step["genuine_disagreements_by_round"] or {}
+    else:
+        by_round = raw_by_round
 
     sigs = [record_signals(r) for r in records]
     n = len(sigs)
@@ -94,12 +107,15 @@ def friction_from_report(report: Dict[str, Any], records: List[dict]) -> Dict[st
 
     return {
         "n_sentences": report.get("n_sentences", n),
-        # PRIMARY signal:
+        # PRIMARY signal (de-noised — see above):
         "r1_disagreements": _round_value(by_round, 1),
+        # raw round-1 count including same-label/none entries, for auditing:
+        "r1_disagreements_raw": _round_value(raw_by_round, 1),
         # context / auditing:
         "total_critic_disagreements": per_step.get("total_critic_disagreements", 0),
         "total_disagreements_all_steps": per_step.get("total_disagreements_all_steps", 0),
         "disagreements_by_round": by_round,
+        "disagreements_by_round_raw": raw_by_round,
         "mean_rounds_used": round(sum(rounds) / n, 4) if n else None,
         # "rounds_used rate" = fraction of sentences that needed a 2nd round:
         "rounds_used_rate": round(n_multi / n, 4) if n else None,

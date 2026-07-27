@@ -7,7 +7,9 @@ Drives the iteration loop of spec 11.2:
       (1) annotate the WORKING set with the multi-agent system under guideline G_i
       (2) mine confusion patterns from the deliberation logs (Layer 4), ≥ min-count
       (3) draft amendments for the top-K patterns (guideline_amender)
-      (4) apply the programmatically-approved amendments → G_{i+1}  (append-only)
+      (4) apply the programmatically-approved amendments → G_{i+1}, rewriting the
+          guideline sections they concern (--integration append for the legacy
+          append-only behaviour); the decision table stays append-only
       (5) stop on the hard cap i_max, or when the loop can no longer progress
 
 This is the FULLY AUTOMATIC loop: "approval" in step (4) is the amender's own
@@ -70,8 +72,10 @@ from guideline_amender import (
     classify_pattern,
     collect_examples,
     amend_pattern,
+    rewrite_guideline,
     write_outputs,
     verify_no_corpus_leak,
+    verify_rewrite_no_corpus_leak,
     _make_client,
     generate_amendment,
 )
@@ -279,12 +283,15 @@ def draft_amendments(
     amend_dir: Path,
     today: str,
 ) -> Dict[str, Any]:
-    """Draft one amendment per pattern, write outputs, run the leak check.
+    """Draft one amendment per pattern, integrate them, run the leak check.
 
     ``guideline_path`` is the current G_i (used by write_outputs for the base
-    text and the next-version filename). Returns a summary dict: amendments,
-    status counts, output paths, the drafted next-guideline path (G_i + accepted
-    amendments appended), and any detected corpus leaks.
+    text and the next-version filename). With the default
+    ``--integration rewrite`` the accepted amendments are woven into the sections
+    of G_i they concern (untouched sections are copied through); ``append`` falls
+    back to the legacy dated appendix. Returns a summary dict: amendments, status
+    counts, output paths, the drafted next-guideline path, the per-section
+    rewrite log, and any detected corpus leaks.
     """
     guideline_text = guideline_path.read_text(encoding="utf-8")
     client, model_name = _make_client(args.amender_model)
@@ -300,10 +307,24 @@ def draft_amendments(
         logger.info("      → %s (%d attempt(s))", a["status"], a.get("attempts", 0))
         amendments.append(a)
 
-    paths = write_outputs(amendments, guideline_text, guideline_path, amend_dir, today)
+    accepted = [a for a in amendments if a.get("status") == "accepted"]
+    new_text: Optional[str] = None
+    rewrite_log: Optional[Dict[str, Any]] = None
+    if args.integration == "rewrite" and accepted:
+        new_text, rewrite_log = rewrite_guideline(
+            guideline_text, accepted, generate_fn=gen,
+            max_retries=args.max_rewrite_retries)
+        logger.info("    integrate: %d section(s) rewritten, %d fallback merge(s)",
+                    rewrite_log["n_rewritten"], rewrite_log["n_fallback"])
+
+    paths = write_outputs(amendments, guideline_text, guideline_path, amend_dir, today,
+                          new_guideline_text=new_text, rewrite_log=rewrite_log)
 
     corpus_sentences = [(r.get("sentence") or "") for r in records]
     leaks = verify_no_corpus_leak(amendments, corpus_sentences, n=args.leak_ngram)
+    if new_text is not None:
+        leaks = leaks + verify_rewrite_no_corpus_leak(
+            guideline_text, new_text, corpus_sentences, n=args.leak_ngram)
 
     counts = {"accepted": 0, "rejected": 0, "malformed": 0}
     for a in amendments:
@@ -315,6 +336,7 @@ def draft_amendments(
         "counts": counts,
         "paths": {k: str(v) for k, v in paths.items()},
         "drafted_guideline": paths["guideline"],
+        "rewrite_log": rewrite_log,
         "leaks": leaks,
     }
 
@@ -634,9 +656,12 @@ def run_loop(args) -> Dict[str, Any]:
             flush_manifest()
             break
 
-        # Guideline: the amender already drafted G_i + accepted sections appended.
+        # Guideline: the amender already drafted G_{i+1} — the accepted rules
+        # integrated into the sections they concern (or appended, under
+        # --integration append).
         shutil.copyfile(draft["drafted_guideline"], g_next)
         rec["guideline_out"] = str(g_next)
+        rec["rewrite_log"] = draft["rewrite_log"]
 
         # Decision table: inject each accepted decision_test into the Question
         # column of the rows for the two labels it disambiguates. patterns and
@@ -659,8 +684,11 @@ def run_loop(args) -> Dict[str, Any]:
         last_accepted = draft["counts"]["accepted"]
         last_injections = n_inject
 
-        logger.info("  → G%d = %s (%d accepted amendment(s) appended)",
-                    i + 1, g_next, draft["counts"]["accepted"])
+        rl = draft["rewrite_log"]
+        how = (f"{rl['n_rewritten']} section(s) rewritten, {rl['n_fallback']} merged"
+               if rl else "appended")
+        logger.info("  → G%d = %s (%d accepted amendment(s); %s)",
+                    i + 1, g_next, draft["counts"]["accepted"], how)
         logger.info("  → D%d = %s (%d decision_test injection(s))", i + 1, d_next, n_inject)
 
         manifest["iterations"].append(rec)
@@ -709,6 +737,13 @@ def main() -> None:
                    help="'entity' (default, spec 11.1) reconstructs entity-type "
                         "disambiguation only; 'all' also amends relation/scope confusions.")
     p.add_argument("--max-redrafts", type=int, default=2)
+    p.add_argument("--integration", choices=["rewrite", "append"], default="rewrite",
+                   help="How G_i becomes G_{i+1}: 'rewrite' (default) integrates each accepted "
+                        "rule into the section it concerns, rewriting that section; 'append' is "
+                        "the legacy dated-appendix behaviour.")
+    p.add_argument("--max-rewrite-retries", type=int, default=1,
+                   help="Redraft attempts per section when a rewrite drops content, loses a "
+                        "decision test, or reads as a changelog.")
     p.add_argument("--examples-per-pattern", type=int, default=5)
     p.add_argument("--leak-ngram", type=int, default=7)
 
