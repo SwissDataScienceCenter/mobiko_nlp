@@ -301,17 +301,18 @@ def print_report(rep: Dict[str, Any]) -> None:
           " agent's own errors)")
 
     sl = rep["span_level"]
+    lp = sl["logprob"]
     print("\n  ── Span level: type-logprob on spans where humans DISAGREE vs AGREE on type ──")
     print(f"    matched agent spans: {sl['n_matched_spans']}   "
-          f"(human type-disagreed {sl['n_human_type_disagreed']} / "
-          f"agreed {sl['n_human_type_agreed']})")
-    if sl["mean_logprob_disagreed"] is not None and sl["mean_logprob_agreed"] is not None:
-        print(f"    mean type-logprob  disagreed {sl['mean_logprob_disagreed']:.5f}   "
-              f"agreed {sl['mean_logprob_agreed']:.5f}   "
-              f"(perm p {fmt_p(sl.get('mean_diff_perm_p'))})")
+          f"(human type-disagreed {lp['n_disagreed']} / "
+          f"agreed {lp['n_agreed']})")
+    if lp["mean_uncertain_disagreed"] is not None and lp["mean_uncertain_agreed"] is not None:
+        print(f"    mean type-logprob  disagreed {lp['mean_uncertain_disagreed']:.5f}   "
+              f"agreed {lp['mean_uncertain_agreed']:.5f}   "
+              f"(perm p {fmt_p(lp.get('mean_diff_perm_p'))})")
     print(f"    point-biserial ρ(uncertainty, human_type_disagree): "
-          f"{sl['point_biserial_rho']:+.3f}  p {fmt_p(sl['point_biserial_p'])}"
-          if sl["point_biserial_rho"] is not None else "    point-biserial: n/a")
+          f"{lp['point_biserial_rho']:+.3f}  p {fmt_p(lp['point_biserial_p'])}"
+          if lp["point_biserial_rho"] is not None else "    point-biserial: n/a")
 
 
 def main():
