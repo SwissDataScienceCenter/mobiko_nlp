@@ -273,11 +273,19 @@ def _remember_relation_property(p: str):
 
 
 def _prune_re_snapshots(save_dir: str):
+    """Cap the number of run snapshots, newest kept. A snapshot no descendant
+    has merged yet is never pruned: it is the only copy of that session's work
+    (see the run index)."""
     if not save_dir or not os.path.isdir(save_dir):
         return
-    files = [f for f in os.listdir(save_dir)
-             if f.startswith("re_") and f.endswith(".jsonl")]
-    for f in sorted(files, reverse=True)[RE_MAX_SNAPSHOTS:]:
+    merged = _merged_run_ids(save_dir)
+    snaps = [f for f in os.listdir(save_dir)
+             if f.startswith("re_") and f.endswith(".jsonl")
+             and f != "re_latest.jsonl"]
+    prunable = [f for f in snaps if _run_id_of(f) in merged]
+    keep = max(0, RE_MAX_SNAPSHOTS - (len(snaps) - len(prunable)))
+    for f in sorted(prunable, key=lambda n: os.path.getmtime(
+            os.path.join(save_dir, n)), reverse=True)[keep:]:
         try:
             os.remove(os.path.join(save_dir, f))
         except Exception:
@@ -301,7 +309,509 @@ def _maybe_autosave_re(model, keys):
     payload = export_relations_jsonl(model, keys)
     _atomic_write_re(payload, run_path)
     _atomic_write_re(payload, latest_path)
+    # Written before pruning: the index is what tells pruning which snapshots
+    # are already contained in a newer one and may go.
+    _record_run(os.path.dirname(run_path))
     _prune_re_snapshots(os.path.dirname(run_path))
+
+
+# ------------------------------------------------------------------ #
+#  Run index                                                          #
+# ------------------------------------------------------------------ #
+#  Each session writes a full snapshot, so a snapshot alone cannot say
+#  whether an annotation missing from it was deleted or simply never
+#  seen by that session.  The index records which runs a run was built
+#  from ('parents'), which makes that difference explicit:
+#    - a run listed as somebody's ancestor is superseded — its work is
+#      already inside the descendant, so it is not merged again and the
+#      deletions the descendant made stick;
+#    - a run nobody descends from is a head: work that exists nowhere
+#      else and has to be merged in.
+#  A missing or unreadable index degrades to "every snapshot is a head",
+#  i.e. the plain union that scripts/merge_relation_annotations.py does.
+# ------------------------------------------------------------------ #
+
+RE_RUNS_INDEX = "re_runs.json"
+
+
+def _run_id_of(filename: str) -> str:
+    m = re_mod.match(r"re_(.+)\.jsonl$", os.path.basename(filename))
+    return m.group(1) if m else ""
+
+
+def _load_runs_index(save_dir: str) -> Dict[str, Dict]:
+    path = os.path.join(save_dir or "", RE_RUNS_INDEX)
+    if not save_dir or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        runs = data.get("runs", {})
+        return runs if isinstance(runs, dict) else {}
+    except Exception:
+        return {}
+
+
+def _record_run(save_dir: str):
+    """Register the current run and the heads it was merged from."""
+    if not save_dir:
+        return
+    run_id = st.session_state.get("re_run_id")
+    if not run_id:
+        return
+    runs = _load_runs_index(save_dir)
+    entry = runs.setdefault(run_id, {})
+    entry["parents"] = list(st.session_state.get("re_run_parents", []))
+    entry["annotator"] = st.session_state.get("re_username", "")
+    entry["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    entry["relations"] = sum(
+        len(v) for v in st.session_state.get("rel_gold", {}).values())
+    try:
+        _atomic_write_re(
+            json.dumps({"runs": runs}, ensure_ascii=False, indent=1),
+            os.path.join(save_dir, RE_RUNS_INDEX),
+        )
+    except Exception:
+        # The index is an optimisation, not the data: losing it costs a
+        # redundant merge next time, never an annotation.
+        pass
+
+
+def _merged_run_ids(save_dir: str) -> set:
+    """Runs that some other run was built from, transitively."""
+    runs = _load_runs_index(save_dir)
+    merged: set = set()
+    frontier = list(runs)
+    while frontier:
+        for parent in runs.get(frontier.pop(), {}).get("parents", []) or []:
+            if parent not in merged:
+                merged.add(parent)
+                frontier.append(parent)
+    return merged
+
+
+def _re_snapshot_order_key(save_dir: str, name: str) -> Tuple[str, float]:
+    """Oldest first. Run ids start with a timestamp; mtime breaks ties between
+    two runs started in the same second."""
+    stamp = re_mod.match(r"re_(\d{8}-\d{6})-", name)
+    try:
+        mtime = os.path.getmtime(os.path.join(save_dir, name))
+    except OSError:
+        mtime = 0.0
+    return (stamp.group(1) if stamp else "00000000-000000", mtime)
+
+
+def _re_unmerged_snapshots(save_dir: str) -> List[Tuple[str, str]]:
+    """(run_id, path) of every snapshot whose work is not already inside a
+    newer one, oldest first — everything that has to be merged to show all the
+    work done on this file so far.
+
+    re_latest.jsonl joins the list only when it matches no run snapshot byte
+    for byte, in which case it is the sole copy of a session whose own
+    snapshot went missing."""
+    if not save_dir or not os.path.isdir(save_dir):
+        return []
+    merged = _merged_run_ids(save_dir)
+    names = [f for f in os.listdir(save_dir)
+             if f.startswith("re_") and f.endswith(".jsonl")
+             and os.path.isfile(os.path.join(save_dir, f))
+             and os.path.getsize(os.path.join(save_dir, f)) > 0]
+    runs = sorted((f for f in names if f != "re_latest.jsonl"),
+                  key=lambda n: _re_snapshot_order_key(save_dir, n))
+    heads = [(_run_id_of(f), os.path.join(save_dir, f))
+             for f in runs if _run_id_of(f) not in merged]
+
+    if "re_latest.jsonl" in names:
+        latest = os.path.join(save_dir, "re_latest.jsonl")
+        try:
+            blob = open(latest, "rb").read()
+            twin = any(open(os.path.join(save_dir, f), "rb").read() == blob
+                       for f in runs)
+        except OSError:
+            twin = True
+        if not twin:
+            heads.append(("latest", latest))
+    return heads
+
+
+# ------------------------------------------------------------------ #
+#  Resuming an interrupted session                                    #
+# ------------------------------------------------------------------ #
+#  Session state dies with the browser tab, so re-uploading a file would
+#  otherwise start from the file's entities again and lose everything
+#  annotated before.  What is on disk is therefore read back whenever the
+#  same annotator opens the same file: those entities and relations
+#  become the working state, editable exactly as if they had just been
+#  annotated.
+#
+#  Not just the newest file: each session writes a snapshot of its own
+#  state, and sessions from before this resuming existed each started
+#  empty, so their snapshots hold disjoint parts of the work — several
+#  sittings on one file end up in several files, none of them complete.
+#  All the sessions that no newer one already contains are therefore
+#  merged (see the run index and the merge section below), and the result
+#  is saved as this session's snapshot so the consolidation happens once.
+#  Nothing is ever deleted or rewritten: every earlier snapshot stays on
+#  disk as the record of what was annotated when.
+# ------------------------------------------------------------------ #
+
+#  Recomputed on export from the (kind, uid) references, so they are not
+#  part of what a relation stores.
+_DERIVED_REL_FIELDS = ("text", "level")
+
+
+def _load_re_saved(path: str) -> Dict[Tuple, Dict]:
+    """(doc_id, sent_idx) → saved sentence record, from a file this page wrote.
+    Sentences are exported in sent_idx order over the whole document, so their
+    position in the list is their index."""
+    out: Dict[Tuple, Dict] = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            doc_id = rec.get("doc_id", "unknown")
+            for i, sent in enumerate(rec.get("sentences", []) or []):
+                out[(doc_id, i)] = sent
+    return out
+
+
+# ------------------------------------------------------------------ #
+#  Merging snapshots                                                  #
+# ------------------------------------------------------------------ #
+#  The same algorithm as scripts/merge_relation_annotations.py, which
+#  merges these snapshots offline — keep the two in step.  Entities and
+#  relations are unioned by structural signature rather than by uid,
+#  because uids are minted per session: the same relation added in two
+#  sessions carries two different uids and must still collapse into one.
+# ------------------------------------------------------------------ #
+
+def _span_sig(sp: Dict) -> Tuple:
+    """Identity of an entity: offsets, type, text and whether it is virtual.
+    Virtualness is derived, not read, so a signature taken from an 'original'
+    snapshot (which has no 'virtual' key) still matches."""
+    start, end = sp.get("start_char"), sp.get("end_char")
+    start = None if start is None else int(start)
+    end = None if end is None else int(end)
+    virtual = (bool(sp.get("virtual")) or start is None or end is None
+               or start < 0 or end < 0)
+    return (start, end, sp.get("type", "") or "", sp.get("text", "") or "",
+            virtual)
+
+
+def _topo_order(relations: List[Dict]) -> List[Dict]:
+    """Arguments before the relations that use them, so a hyper-relation is
+    only merged once its argument has a merged uid to point at."""
+    by_uid = {r["uid"]: r for r in relations if r.get("uid")}
+    ordered: List[Dict] = []
+    seen: set = set()
+
+    def visit(rel: Dict, trail: set):
+        uid = rel.get("uid")
+        if uid in seen or uid in trail:
+            return
+        trail.add(uid)
+        for side in ("e1", "e2"):
+            kind, ref = _endpoint_ref(rel, side)
+            if kind == RELATION_KIND and ref in by_uid:
+                visit(by_uid[ref], trail)
+        trail.discard(uid)
+        seen.add(uid)
+        ordered.append(rel)
+
+    for rel in relations:
+        if rel.get("uid"):
+            visit(rel, set())
+        else:
+            ordered.append(rel)      # no uid: nothing can reference it
+    return ordered
+
+
+class _SentenceMerge:
+    """One sentence's merged entities and relations, built snapshot by
+    snapshot, oldest first."""
+
+    def __init__(self):
+        self.spans: List[Dict] = []
+        self.span_uid_by_sig: Dict[Tuple, str] = {}
+        self.relations: List[Dict] = []
+        self.rel_uid_by_sig: Dict[Tuple, str] = {}
+
+    # -- entities ---------------------------------------------------
+    def add_spans(self, spans: List[Dict], source: str) -> Dict[str, str]:
+        """Union entities by signature. Returns this snapshot's uid → merged
+        uid map, so its relations can be repointed at the merged entities."""
+        uid_map: Dict[str, str] = {}
+        used = {s["uid"] for s in self.spans if s.get("uid")}
+        for sp in spans:
+            sig = _span_sig(sp)
+            own_uid = sp.get("uid")
+            superseded = self._supersedes(sp, sig)
+            if superseded is not None:
+                # This session corrected an entity an earlier one had (the page
+                # records the pre-edit state in 'original'): the merged entity
+                # keeps its uid and takes the corrected content, so relations
+                # recorded before the fix follow it automatically.
+                merged = next(s for s in self.spans if s["uid"] == superseded)
+                merged.update({k: v for k, v in sp.items() if k != "uid"})
+                _add_source(merged, source)
+                # Both signatures must resolve to it: the old one because
+                # earlier relations stored the pre-edit dict.
+                self.span_uid_by_sig[sig] = superseded
+                if own_uid:
+                    uid_map[own_uid] = superseded
+                continue
+            if sig in self.span_uid_by_sig:
+                merged_uid = self.span_uid_by_sig[sig]
+                merged = next(s for s in self.spans if s.get("uid") == merged_uid)
+                # A later session may carry a richer version of the same entity
+                # (concept_text filled in, edit provenance): fill gaps only,
+                # never overwrite what is already there.
+                for k, v in sp.items():
+                    if k != "uid" and k not in merged:
+                        merged[k] = v
+                _add_source(merged, source)
+            else:
+                merged = copy.deepcopy(sp)
+                merged_uid = own_uid or _uid()
+                if merged_uid in used:            # collision across sessions
+                    merged_uid = _uid()
+                    while merged_uid in used:
+                        merged_uid = _uid()
+                merged["uid"] = merged_uid
+                _add_source(merged, source)
+                used.add(merged_uid)
+                self.spans.append(merged)
+                self.span_uid_by_sig[sig] = merged_uid
+            if own_uid:
+                uid_map[own_uid] = merged_uid
+        return uid_map
+
+    def _supersedes(self, sp: Dict, sig: Tuple) -> str | None:
+        """The merged uid this entity is an edit of, or None."""
+        if sig in self.span_uid_by_sig:
+            return None                          # identical entity, not an edit
+        original = sp.get("original")
+        if not isinstance(original, dict):
+            return None
+        return self.span_uid_by_sig.get(_span_sig(original))
+
+    # -- relations --------------------------------------------------
+    def add_relations(self, relations: List[Dict], span_uid_map: Dict[str, str],
+                      source: str) -> Tuple[int, int]:
+        """Union relations. Returns (added, deduped)."""
+        rel_uid_map: Dict[str, str] = {}
+        added = deduped = 0
+
+        for rel in _topo_order(relations):
+            # Identity is the label plus what both arguments resolve to AFTER
+            # the entity merge, not what the snapshot stored: an entity retyped
+            # in a later session has a different span signature there, and
+            # signing on that would keep one relation twice. Topological order
+            # guarantees a hyper-relation's argument already has its merged uid.
+            refs: Dict[str, Tuple[str, str]] = {}
+            for side in ("e1", "e2"):
+                kind, ref = _endpoint_ref(rel, side)
+                if kind == RELATION_KIND:
+                    # Argument missing from this snapshot: keep the reference
+                    # rather than dropping the relation.
+                    refs[side] = (RELATION_KIND, rel_uid_map.get(ref, ref))
+                else:
+                    # Match on the stored span dict first, not on the uid: the
+                    # uploaded files reuse one uid for two different entities,
+                    # so a uid alone does not say which one is meant.
+                    by_sig = self.span_uid_by_sig.get(
+                        _span_sig(rel.get(side, {}) or {}))
+                    refs[side] = (ENTITY_KIND,
+                                  by_sig or span_uid_map.get(ref) or ref or "")
+            sig = (refs["e1"], rel.get("relation", ""), refs["e2"])
+
+            if sig in self.rel_uid_by_sig:
+                kept_uid = self.rel_uid_by_sig[sig]
+                kept = next(r for r in self.relations if r["uid"] == kept_uid)
+                _add_source(kept, source)
+                # Never lose annotator text to deduplication.
+                note = (rel.get("note") or "").strip()
+                if note and note not in (kept.get("note") or ""):
+                    kept["note"] = " | ".join(
+                        p for p in [(kept.get("note") or "").strip(), note] if p
+                    )
+                # A property set in a later session wins; one only the older
+                # copy has is kept.
+                if rel.get("property"):
+                    kept["property"] = rel["property"]
+                if rel.get("uid"):
+                    rel_uid_map[rel["uid"]] = kept_uid
+                deduped += 1
+                continue
+
+            merged = _relation_from_saved(rel)
+            merged_uid = merged["uid"]
+            if any(r["uid"] == merged_uid for r in self.relations):
+                merged_uid = _uid()
+                while any(r["uid"] == merged_uid for r in self.relations):
+                    merged_uid = _uid()
+                merged["uid"] = merged_uid
+
+            for side in ("e1", "e2"):
+                merged[f"{side}_kind"], merged[f"{side}_uid"] = refs[side]
+            _add_source(merged, source)
+            self.relations.append(merged)
+            self.rel_uid_by_sig[sig] = merged_uid
+            if rel.get("uid"):
+                rel_uid_map[rel["uid"]] = merged_uid
+            added += 1
+        return added, deduped
+
+
+def _add_source(item: Dict, source: str):
+    """Which run(s) an entity or relation came from — provenance the offline
+    merge records too."""
+    runs = item.setdefault("source_runs", [])
+    if source not in runs:
+        runs.append(source)
+
+
+def _relation_from_saved(rel: Dict) -> Dict:
+    """An exported relation stripped back to what the page stores. e1/e2 are
+    kept as the fallback snapshot they already were; the live values come from
+    resolving e1_uid/e2_uid against the restored entities and relations."""
+    out = {k: v for k, v in rel.items() if k not in _DERIVED_REL_FIELDS}
+    out.setdefault("uid", _uid())
+    out.setdefault("relation", "")
+    out.setdefault("property", "")
+    out.setdefault("e1_kind", ENTITY_KIND)
+    out.setdefault("e2_kind", ENTITY_KIND)
+    return out
+
+
+def _restore_re_progress(model: Dict, keys: List[Tuple],
+                         sources: List[Tuple[str, str]]) -> Dict:
+    """Merge every given snapshot into the working entity and relation state,
+    oldest first, and report what came from where.
+
+    `sources` is [(run_id, path)]. Merging rather than reading only the newest
+    file is what makes ALL the work show up: before sessions resumed each
+    other, every session's snapshot held only its own relations, so the work of
+    several sittings sits in several files.
+
+    Call before _init_rel_state/_init_ent_state, which then only seed the
+    sentences nothing was restored for."""
+    ent_store = st.session_state.setdefault("ent_gold", {})
+    rel_store = st.session_state.setdefault("rel_gold", {})
+    merges: Dict[Tuple, _SentenceMerge] = {}
+    stats = {"sentences": 0, "relations": 0, "added": 0, "edited": 0,
+             "skipped": 0, "deduped": 0, "files": [], "sources": []}
+
+    for run, path in sources:
+        try:
+            saved = _load_re_saved(path)
+        except Exception as exc:
+            stats["files"].append({"run": run, "path": path, "error": str(exc)})
+            continue
+        file_added = file_deduped = 0
+        for key in keys:
+            rec = saved.get(key)
+            if not rec:
+                continue
+            # Only adopt a record that belongs to this very sentence: a
+            # snapshot taken from a different version of the file must not be
+            # grafted on top of text it does not address.
+            if (rec.get("text") or "") != _get_text(model, key):
+                stats["skipped"] += 1
+                continue
+            merge = merges.setdefault(key, _SentenceMerge())
+            uid_map = merge.add_spans(rec.get("spans") or [], run)
+            added, deduped = merge.add_relations(
+                rec.get("relations") or [], uid_map, run)
+            file_added += added
+            file_deduped += deduped
+        stats["files"].append({"run": run, "path": path,
+                               "added": file_added, "deduped": file_deduped})
+        stats["deduped"] += file_deduped
+        if run not in stats["sources"]:
+            stats["sources"].append(run)
+
+    customs = st.session_state.setdefault("re_custom_relation_types", [])
+    for key, merge in merges.items():
+        # Wholesale, including an empty list: the merged spans are the
+        # annotator's working set, so an entity deleted in every snapshot that
+        # saw it must not come back from the uploaded file.
+        ent_store[key] = merge.spans
+        stats["added"] += sum(1 for sp in merge.spans if sp.get("added_by"))
+        stats["edited"] += sum(1 for sp in merge.spans if sp.get("edited_by"))
+        for sp in merge.spans:
+            _remember_entity_type(sp.get("type", ""))
+        if merge.relations:
+            rel_store[key] = merge.relations
+            stats["relations"] += len(merge.relations)
+            stats["sentences"] += 1
+            # Labels and properties typed in an earlier session have to be
+            # selectable again, or editing what they are on would mean
+            # re-typing them.
+            for r in merge.relations:
+                _remember_relation_property(r.get("property", ""))
+                label = r.get("relation", "")
+                if label and label not in RELATION_TYPES and label not in customs:
+                    customs.append(label)
+    return stats
+
+
+def _goto_sentence(idx: int):
+    """Move to a sentence. The 'Jump to' box is remounted (see its widget key)
+    so it shows the sentence actually being displayed."""
+    st.session_state.re_sentence_idx = idx
+    st.session_state.re_nav_ver = st.session_state.get("re_nav_ver", 0) + 1
+
+
+def _session_gen() -> int:
+    """Bumped every time the (file, annotator) pair changes; part of the
+    add-form widget keys so a form half-filled for one pair cannot reappear
+    pre-filled for the next."""
+    return st.session_state.get("re_session_gen", 0)
+
+
+def _resume_summary(stats: Dict) -> str:
+    bits = [f"{stats['relations']} relation(s) on {stats['sentences']} "
+            f"sentence(s)"]
+    if stats["added"] or stats["edited"]:
+        bits.append(f"{stats['added']} added / {stats['edited']} edited "
+                    f"entities")
+    n = len(stats["sources"])
+    out = ("Continuing your earlier annotation of this file: "
+           + ", ".join(bits)
+           + (f" merged from {n} earlier session(s)." if n > 1
+              else " restored from your last session."))
+    if stats["deduped"]:
+        out += (f" {stats['deduped']} relation(s) were annotated in more than "
+                f"one session and were kept once.")
+    if stats["skipped"]:
+        out += (f" {stats['skipped']} saved sentence(s) did not match this "
+                f"file's text and were left out.")
+    return out
+
+
+def _render_resume_details(stats: Dict):
+    """Which snapshot contributed what — the merge is only trustworthy if it
+    can be checked against the files on disk."""
+    if not stats.get("files"):
+        return
+    with st.expander(f"Sessions merged ({len(stats['files'])})",
+                     expanded=False):
+        for entry in stats["files"]:
+            if entry.get("error"):
+                st.markdown(f"- `{entry['path']}` — **unreadable**: "
+                            f"{entry['error']}")
+                continue
+            detail = f"{entry['added']} relation(s)"
+            if entry["deduped"]:
+                detail += f", {entry['deduped']} already present"
+            st.markdown(f"- `{os.path.basename(entry['path'])}` → {detail}")
+        st.caption("Merged oldest first. Identical relations from two sessions "
+                   "are kept once; both sessions' notes are preserved. The "
+                   "offline equivalent is "
+                   "`scripts/merge_relation_annotations.py`.")
 
 
 # ------------------------------------------------------------------ #
@@ -784,11 +1294,11 @@ def _entity_chip_html(i: int, sp: Dict, text: str = "") -> str:
 
 
 def _entity_chip_compact_html(i: int, sp: Dict, text: str = "") -> str:
-    """The read-only (edit mode off) rendering of one entity: E-number, text
-    chip and type on a single inline chip so a whole sentence's entities take a
-    couple of wrapped lines instead of one row plus expander each. Concept and
-    edited/added/virtual/offset flags move into the tooltip and a small marker;
-    switch edit mode on to see them spelled out."""
+    """The read-only (edit mode off) rendering of one entity: one row per
+    entity — E-number, text chip and type — without the per-entity editor and
+    expander that edit mode adds. Concept and edited/added/virtual/offset flags
+    move into the tooltip and a small marker; switch edit mode on to see them
+    spelled out."""
     bg, fg = _span_color(sp.get("type", ""))
     tips = [sp.get("type", "")]
     concept_text = sp.get("concept_text")
@@ -814,16 +1324,18 @@ def _entity_chip_compact_html(i: int, sp: Dict, text: str = "") -> str:
         marker = '<span style="color:#c8a415;font-size:11px">•</span>'
 
     return (
-        '<span style="display:inline-flex;align-items:baseline;gap:4px;'
-        'margin:0 10px 4px 0;white-space:nowrap" '
-        f'title="{html_mod.escape(" / ".join(t for t in tips if t))}">'
-        f'<span style="color:#aaa;font-size:10px">E{i+1}</span>'
+        # One entity per row: flex, so the E-number column stays put and a long
+        # entity text pushes the type sideways instead of wrapping under it.
+        '<div style="display:flex;align-items:baseline;gap:6px;padding:2px 0">'
+        f'<span title="{html_mod.escape(" / ".join(t for t in tips if t))}" '
+        'style="display:flex;align-items:baseline;gap:6px;min-width:0">'
+        f'<span style="color:#aaa;font-size:10px;flex:none">E{i+1}</span>'
         f'<span style="background:{bg};color:{fg};border-radius:4px;'
         f'padding:1px 6px;font-size:12px;font-weight:500">'
         f'{html_mod.escape(sp.get("text", ""))}</span>'
         f'<span style="font-size:10px;color:#999">'
         f'{html_mod.escape(sp.get("type", ""))}</span>'
-        f'{marker}</span>'
+        f'{marker}</span></div>'
     )
 
 
@@ -979,7 +1491,7 @@ def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
                        "add one.")
         else:
             st.markdown(
-                '<div style="line-height:2.1;padding:2px 0">'
+                '<div style="line-height:1.5;padding:2px 0">'
                 + "".join(_entity_chip_compact_html(i, sp, text)
                           for i, sp in enumerate(spans))
                 + "</div>",
@@ -1153,7 +1665,7 @@ def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
     # ---- add a missing entity ---------------------------------------
     add_vers = st.session_state.setdefault("re_ent_add_ver", {})
     ver = add_vers.get(cur_key, 0)
-    key_root = f"re_ent_add_{cur_key}_{ver}"
+    key_root = f"re_ent_add_{cur_key}_{_session_gen()}_{ver}"
 
     with st.expander("➕ Add entity", expanded=False):
         new_type = _entity_type_picker("", key_root, require_choice=True)
@@ -1243,6 +1755,51 @@ def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
 #  Main page renderer                                                 #
 # ------------------------------------------------------------------ #
 
+def _render_legacy_import(model: Dict, keys: List[Tuple]):
+    """Autosaves used to be written straight into '<file>_relation/', before
+    they were nested per annotator. Offer to pull such a file in when this
+    annotator has nothing of their own yet — but only on request, since work
+    from before the per-annotator folders cannot be attributed to anyone."""
+    save_dir = st.session_state.get("re_upload_dir")
+    if not save_dir:
+        return
+    # Importing replaces the working state, so stop offering it the moment
+    # there is work of this session to lose.
+    if any(st.session_state.get("rel_gold", {}).values()) or any(
+        sp.get("added_by") or sp.get("edited_by")
+        for spans in st.session_state.get("ent_gold", {}).values()
+        for sp in spans
+    ):
+        return
+    legacy = _re_unmerged_snapshots(os.path.dirname(save_dir))
+    if not legacy:
+        return
+
+    st.info(f"Nothing saved under your username for this file yet, but "
+            f"{len(legacy)} annotation session(s) from before per-annotator "
+            f"folders existed are in `{os.path.dirname(save_dir)}`. They may "
+            f"be another annotator's work.")
+    if st.button("↩ Merge them in and continue from there",
+                 key="re_legacy_import"):
+        try:
+            stats = _restore_re_progress(model, keys, legacy)
+        except Exception as exc:
+            st.error(f"Could not read {os.path.dirname(save_dir)}: {exc}")
+            return
+        # The entity and relation lists just changed under the widgets that
+        # offer them as options.
+        for key in keys:
+            _bump_ent_ver(key)
+            _bump_rel_ver(key)
+        st.session_state.re_session_gen = _session_gen() + 1
+        st.session_state.re_resume_note = _resume_summary(stats)
+        st.session_state.re_resume_stats = stats
+        # Those runs are now inside this one, so they are not merged again.
+        st.session_state.re_run_parents = stats["sources"]
+        _maybe_autosave_re(model, keys)   # now under this annotator's name
+        st.rerun()
+
+
 def render_relation_page(_unused_model: Dict = None):
     """
     Self-contained relation annotation page with its own file uploader.
@@ -1279,12 +1836,9 @@ def render_relation_page(_unused_model: Dict = None):
             return
         st.session_state.re_model = model
         st.session_state.re_upload_name = re_file.name
-        # Reset relation annotations and the editable entity list when the
-        # file changes; reseed the type inventory from the new file.
-        st.session_state.rel_gold = {}
-        st.session_state.ent_gold = {}
-        st.session_state.re_ent_ver = {}
-        st.session_state.re_rel_ver = {}
+        # Reseed the type inventory from the new file; the working entity and
+        # relation state is (re)built by the annotator+file block below, which
+        # always triggers too because its pair contains the file name.
         st.session_state.re_entity_types = _collect_entity_types(model)
         # Fresh run ID for this file
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1294,9 +1848,7 @@ def render_relation_page(_unused_model: Dict = None):
     # (Re)compute the save directory whenever the file or the username
     # changes — nested under the annotator's username so two people
     # annotating the SAME uploaded file get separate autosave/latest files
-    # instead of overwriting each other's "re_latest.jsonl". A username
-    # change alone does NOT reset the in-progress annotations, only where
-    # they're saved from now on.
+    # instead of overwriting each other's "re_latest.jsonl".
     if st.session_state.get("re_upload_dir_username") != username:
         upload_dir = os.path.join(
             RE_SAVE_DIR, _safe_dirname_re(re_file.name) + "_relation",
@@ -1312,8 +1864,62 @@ def render_relation_page(_unused_model: Dict = None):
         return
 
     keys = sorted(model.keys())
+
+    # ---- resume this annotator's earlier work on this file -----------
+    # Keyed on (file, annotator): whichever of the two changes, the working
+    # state is rebuilt from that pair's own snapshots, so nothing carries over
+    # from the previous pair and nothing is lost — the pair being left behind
+    # was autosaved on every change it made.
+    load_pair = (re_file.name, username)
+    if st.session_state.get("re_loaded_pair") != load_pair:
+        st.session_state.re_loaded_pair = load_pair
+        st.session_state.rel_gold = {}
+        st.session_state.ent_gold = {}
+        st.session_state.re_ent_ver = {}
+        st.session_state.re_rel_ver = {}
+        # Namespaces the add-form widget keys, so a half-filled form from the
+        # previous file or annotator cannot reappear in this one.
+        st.session_state.re_session_gen = st.session_state.get("re_session_gen", 0) + 1
+        st.session_state.pop("re_resume_note", None)
+        st.session_state.pop("re_resume_stats", None)
+        st.session_state.re_run_parents = []
+        _goto_sentence(0)   # also remounts 'Jump to', whose max is now this file's
+
+        # Every session whose work is not already inside a newer one, merged
+        # oldest first: sessions from before resuming existed each hold only
+        # their own relations, so all of them together are "everything
+        # annotated so far".
+        heads = _re_unmerged_snapshots(st.session_state.get("re_upload_dir"))
+        if heads:
+            try:
+                stats = _restore_re_progress(model, keys, heads)
+            except Exception as exc:
+                st.warning(f"Could not read your previous annotations from "
+                           f"{st.session_state.get('re_upload_dir')}: {exc}")
+            else:
+                if stats["relations"] or stats["added"] or stats["edited"]:
+                    st.session_state.re_resume_note = _resume_summary(stats)
+                    st.session_state.re_resume_stats = stats
+                    # This run now contains those sessions, so the next load
+                    # merges this one instead of all of them again — and the
+                    # deletions made from here on are not undone by an
+                    # ancestor that still lists what was deleted.
+                    st.session_state.re_run_parents = stats["sources"]
+                    # Consolidate immediately: the merged state becomes this
+                    # session's snapshot, while the sessions it came from stay
+                    # on disk untouched.
+                    _init_rel_state(keys)
+                    _init_ent_state(model, keys)
+                    _maybe_autosave_re(model, keys)
+
     _init_rel_state(keys)
     _init_ent_state(model, keys)
+
+    if st.session_state.get("re_resume_note"):
+        st.caption(f"↩ {st.session_state['re_resume_note']}")
+        _render_resume_details(st.session_state.get("re_resume_stats", {}))
+    else:
+        _render_legacy_import(model, keys)
 
     # ---- sentence navigation ----------------------------------------
     if "re_sentence_idx" not in st.session_state:
@@ -1326,7 +1932,7 @@ def render_relation_page(_unused_model: Dict = None):
     with nav1:
         if st.button("◀ Prev", key="re_prev",
                      disabled=st.session_state.re_sentence_idx == 0):
-            st.session_state.re_sentence_idx -= 1
+            _goto_sentence(st.session_state.re_sentence_idx - 1)
             st.rerun()
     with nav2:
         idx = st.session_state.re_sentence_idx
@@ -1341,15 +1947,20 @@ def render_relation_page(_unused_model: Dict = None):
         jump = st.number_input(
             "Jump to", min_value=1, max_value=len(keys),
             value=st.session_state.re_sentence_idx + 1,
-            step=1, label_visibility="collapsed", key="re_jump"
+            step=1, label_visibility="collapsed",
+            # A keyed number_input keeps the value the annotator last saw, and
+            # `value=` no longer applies to it: with a fixed key it would still
+            # report the old sentence after Prev/Next and immediately drag the
+            # page back there. The version makes each navigation remount it.
+            key=f"re_jump_{st.session_state.get('re_nav_ver', 0)}",
         )
         if jump - 1 != st.session_state.re_sentence_idx:
-            st.session_state.re_sentence_idx = jump - 1
+            _goto_sentence(jump - 1)
             st.rerun()
     with nav4:
         if st.button("Next ▶", key="re_next",
                      disabled=st.session_state.re_sentence_idx == len(keys) - 1):
-            st.session_state.re_sentence_idx += 1
+            _goto_sentence(st.session_state.re_sentence_idx + 1)
             st.rerun()
 
     idx = st.session_state.re_sentence_idx
@@ -1420,7 +2031,7 @@ def render_relation_page(_unused_model: Dict = None):
             # the next one (same trick as the 'Add entity' form).
             add_vers = st.session_state.setdefault("re_rel_add_ver", {})
             form_ver = add_vers.get(cur_key, 0)
-            form_root = f"{cur_key}_{form_ver}"
+            form_root = f"{cur_key}_{_session_gen()}_{form_ver}"
             if existing_rels:
                 st.caption("Arguments can be entities (E…) or triplets already "
                            "annotated on this sentence (T…) — linking two "
@@ -1603,8 +2214,12 @@ def render_relation_page(_unused_model: Dict = None):
                         # otherwise the selectbox would fall back to the first
                         # option and silently overwrite it on the next edit.
                         type_options = list(RELATION_TYPES)
-                        if rel["relation"] not in type_options:
-                            type_options.append(rel["relation"])
+                        for label in (
+                            st.session_state.get("re_custom_relation_types", [])
+                            + [rel["relation"]]
+                        ):
+                            if label and label not in type_options:
+                                type_options.append(label)
                         new_type = st.selectbox(
                             "Relation",
                             options=type_options,
