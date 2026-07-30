@@ -56,22 +56,30 @@ RELATION_TYPES = [
     "DURING",
 ]
 
+#  Optional qualifier on a relation itself (not on its arguments), e.g. the
+#  sentence states that the relation does NOT hold.  Free additions are kept
+#  for the rest of the session, like custom relation types.
+RELATION_PROPERTIES = [
+    "Negative_polarity",
+    "Negation",
+]
+
 RE_SAVE_DIR = "/mydata/mobiko/anisia/data/aug_runs"
 RE_MAX_SNAPSHOTS = 50
 
 _CUSTOM_RELATION_SENTINEL = "＋ Custom relation…"
 _CUSTOM_TYPE_SENTINEL = "＋ Custom entity type…"
+_CUSTOM_PROPERTY_SENTINEL = "＋ Custom property…"
+_NO_PROPERTY = "(none)"
 
 # One background colour per entity type family.
 # Chosen to be distinct but soft; same palette as the NER mockup.
 _TYPE_COLORS: Dict[str, Tuple[str, str]] = {
     # (background, text-on-background)
     "BIOTIC ENTITY":              ("#a5d6a7", "#1b5e20"),
-    "BIOTIC COLLECTIVE ENTITY":   ("#69b06b", "#143d15"),
     "BIOTIC PROCESS":             ("#b2dfdb", "#004d40"),
     "BIOTIC PROPERTY":            ("#80cbc4", "#003d33"),
     "ABIOTIC ENTITY":             ("#b2ebf2", "#006064"),
-    "ABIOTIC COLLECTIVE ENTITY":  ("#4dd0e1", "#004d55"),
     "ABIOTIC PROCESS":            ("#b3e5fc", "#01579b"),
     "ABIOTIC PROPERTY":           ("#81d4fa", "#014e89"),
     "SPATIAL ENTITY":             ("#ffe0b2", "#bf360c"),
@@ -233,6 +241,35 @@ def _normalize_relation_label(text: str) -> str:
     "MIGRATES_TO". Returns "" if nothing usable remains."""
     safe = re_mod.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_")
     return safe.upper()
+
+
+def _normalize_relation_property(text: str) -> str:
+    """Normalize a free-typed relation property to the Mixed_Case convention of
+    RELATION_PROPERTIES, e.g. "negative polarity" -> "negative_polarity".
+    Unlike relation labels the annotator's capitalisation is kept, so
+    "Negative_polarity" survives unchanged. Returns "" if nothing usable
+    remains."""
+    return re_mod.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_")
+
+
+def _relation_property_options(*extra: str) -> List[str]:
+    """Fixed properties first, then any typed by the annotator this session,
+    then whatever `extra` needs to be selectable (the value currently stored on
+    the relation being edited)."""
+    options = list(RELATION_PROPERTIES)
+    seen = st.session_state.get("re_custom_relation_props", [])
+    for p in list(seen) + [e for e in extra if e]:
+        if p and p not in options:
+            options.append(p)
+    return options
+
+
+def _remember_relation_property(p: str):
+    if not p or p in RELATION_PROPERTIES:
+        return
+    seen = st.session_state.setdefault("re_custom_relation_props", [])
+    if p not in seen:
+        seen.append(p)
 
 
 def _prune_re_snapshots(save_dir: str):
@@ -417,6 +454,20 @@ def _ent_ver(key: Tuple) -> int:
     return st.session_state.get("re_ent_ver", {}).get(key, 0)
 
 
+def _bump_rel_ver(key: Tuple):
+    """Same idea for the relation list: once a triplet is gone, the argument
+    pickers must not still be holding a reference to it."""
+    vers = st.session_state.setdefault("re_rel_ver", {})
+    vers[key] = vers.get(key, 0) + 1
+
+
+def _args_ver(key: Tuple) -> str:
+    """Widget-key suffix for anything whose options are the sentence's
+    entities and triplets."""
+    rel_ver = st.session_state.get("re_rel_ver", {}).get(key, 0)
+    return f"{_ent_ver(key)}_{rel_ver}"
+
+
 def _entity_type_options(*extra: str) -> List[str]:
     """Schema types first (palette order), then any type seen in the uploaded
     file or typed by the annotator this session, then whatever `extra` needs
@@ -451,30 +502,121 @@ def _collect_entity_types(model: Dict) -> List[str]:
 
 
 # ------------------------------------------------------------------ #
-#  Relation ↔ entity resolution                                       #
+#  Relation arguments                                                 #
 # ------------------------------------------------------------------ #
-#  Relations reference their entities by uid, so an edited entity shows
-#  up (and is exported) with its corrected type/boundary in every
-#  relation that uses it.  The embedded e1/e2 dicts are kept as a
-#  fallback snapshot for relations recorded before uids were stored.
+#  An argument of a relation is a *reference*: either an entity, or an
+#  already annotated triplet.  Linking triplets is what makes a
+#  hyper-relation, e.g.
+#      ⟨warming CAUSES forest loss⟩ --DURING--> ⟨dry season⟩
+#  References are (kind, uid) pairs resolved against the working entity
+#  list and this sentence's relations, so editing an entity or retyping a
+#  triplet shows through everywhere it is used.  The embedded e1/e2 dicts
+#  are kept as a fallback snapshot for relations recorded before uids
+#  were stored, and 'kind' defaults to "entity" for the same reason.
+#
+#  Arguments can only reference relations that already exist, so the
+#  reference graph is a DAG by construction and the recursive walks below
+#  terminate; _MAX_REL_DEPTH is a belt-and-braces cap.
 # ------------------------------------------------------------------ #
 
-def _resolve_rel_entity(key: Tuple, rel: Dict, side: str) -> Dict:
-    uid = rel.get(f"{side}_uid")
-    if uid:
+_MAX_REL_DEPTH = 12
+
+ENTITY_KIND = "entity"
+RELATION_KIND = "relation"
+
+
+def _rel_by_uid(key: Tuple, uid: str) -> Dict | None:
+    for rel in st.session_state.get("rel_gold", {}).get(key, []):
+        if rel.get("uid") == uid:
+            return rel
+    return None
+
+
+def _endpoint_ref(rel: Dict, side: str) -> Tuple[str, str]:
+    """The (kind, uid) reference a relation holds on one side."""
+    return rel.get(f"{side}_kind", ENTITY_KIND), rel.get(f"{side}_uid", "")
+
+
+def _resolve_endpoint(key: Tuple, rel: Dict, side: str, _depth: int = 0) -> Dict:
+    """Resolve one argument to a self-describing dict: an entity resolves to
+    its span, a triplet to a nested {relation, e1, e2} record."""
+    kind, uid = _endpoint_ref(rel, side)
+    if kind == RELATION_KIND and uid and _depth < _MAX_REL_DEPTH:
+        inner = _rel_by_uid(key, uid)
+        if inner is not None:
+            return {
+                "kind": RELATION_KIND,
+                "uid": uid,
+                "relation": inner.get("relation", ""),
+                "property": inner.get("property", ""),
+                # A readable rendering of the triplet, so a consumer that
+                # only knows about entity endpoints still gets something
+                # printable out of the 'text' field it expects.
+                "text": _triplet_text(key, inner, _depth + 1),
+                "e1": _resolve_endpoint(key, inner, "e1", _depth + 1),
+                "e2": _resolve_endpoint(key, inner, "e2", _depth + 1),
+            }
+    if kind == ENTITY_KIND and uid:
         for sp in _cur_spans(key):
             if sp.get("uid") == uid:
                 return sp
     return rel.get(side, {}) or {}
 
 
-def _relations_using(key: Tuple, uid: str) -> List[int]:
-    """Indices of this sentence's relations that reference the given entity."""
-    out = []
-    for j, rel in enumerate(st.session_state.get("rel_gold", {}).get(key, [])):
-        if uid and (rel.get("e1_uid") == uid or rel.get("e2_uid") == uid):
-            out.append(j)
-    return out
+def _triplet_text(key: Tuple, rel: Dict, _depth: int = 0) -> str:
+    """"a --RELATION--> b", with nested triplets in angle brackets."""
+    if _depth >= _MAX_REL_DEPTH:
+        return "…"
+
+    def side_text(side: str) -> str:
+        kind, uid = _endpoint_ref(rel, side)
+        if kind == RELATION_KIND and uid:
+            inner = _rel_by_uid(key, uid)
+            if inner is not None:
+                return f"⟨{_triplet_text(key, inner, _depth + 1)}⟩"
+        resolved = _resolve_endpoint(key, rel, side, _depth + 1)
+        return resolved.get("text", "?")
+
+    return f"{side_text('e1')} --{rel.get('relation', '')}--> {side_text('e2')}"
+
+
+def _relation_level(key: Tuple, rel: Dict, _depth: int = 0) -> int:
+    """0 for a plain entity-entity triplet, 1 + the deepest argument level
+    for a hyper-relation."""
+    if _depth >= _MAX_REL_DEPTH:
+        return _depth
+    levels = [0]
+    for side in ("e1", "e2"):
+        kind, uid = _endpoint_ref(rel, side)
+        if kind == RELATION_KIND and uid:
+            inner = _rel_by_uid(key, uid)
+            if inner is not None:
+                levels.append(1 + _relation_level(key, inner, _depth + 1))
+    return max(levels)
+
+
+def _is_hyper(rel: Dict) -> bool:
+    return any(_endpoint_ref(rel, side)[0] == RELATION_KIND
+               for side in ("e1", "e2"))
+
+
+def _dependent_rel_uids(key: Tuple, kind: str, uid: str) -> List[str]:
+    """Uids of the relations that would be left dangling if the given entity
+    or relation went away — direct users plus, transitively, the
+    hyper-relations built on top of them."""
+    rels = st.session_state.get("rel_gold", {}).get(key, [])
+    doomed: List[str] = []
+    frontier = [(kind, uid)]
+    while frontier:
+        k, u = frontier.pop()
+        for rel in rels:
+            r_uid = rel.get("uid")
+            if not r_uid or r_uid in doomed:
+                continue
+            if any(_endpoint_ref(rel, side) == (k, u) for side in ("e1", "e2")):
+                doomed.append(r_uid)
+                frontier.append((RELATION_KIND, r_uid))
+    return doomed
 
 
 # ------------------------------------------------------------------ #
@@ -491,15 +633,26 @@ def export_relations_jsonl(model: Dict, keys: List[Tuple]) -> str:
           "spans": [...],
           "relations": [
             {"uid": "...", "relation": "HAS_PROPERTY",
-             "e1_uid": "...", "e2_uid": "...",
-             "e1": {span dict}, "e2": {span dict},
-             "note": "..."}
+             "e1_kind": "entity", "e1_uid": "...", "e1": {span dict},
+             "e2_kind": "entity", "e2_uid": "...", "e2": {span dict},
+             "text": "a --HAS_PROPERTY--> b", "level": 0,
+             "property": "Negation", "note": "..."}
           ]
         }
     'spans' are the annotator's working entities: edited spans carry
     'edited_by' plus an 'original' snapshot, added ones 'added_by'.
-    e1/e2 are re-resolved from the working entities by uid, so a relation
-    always exports the current state of the entities it links.
+    e1/e2 are re-resolved by uid, so a relation always exports the current
+    state of what it links.
+
+    'property' is an optional qualifier on the relation itself (one of
+    RELATION_PROPERTIES or a label the annotator typed); "" when unset.
+
+    An argument with "kind": "relation" is a hyper-relation argument: another
+    triplet, nested inline as {"kind": "relation", "uid", "relation", "text",
+    "e1", "e2"} and also present as a top-level entry of this same list.
+    'level' is 0 for entity-entity triplets and 1 + the deepest argument
+    level above that, so consumers that only model binary entity relations
+    can filter on `level == 0`.
     """
     buf = io.StringIO()
     docs: Dict[str, List[Tuple[int, Tuple]]] = defaultdict(list)
@@ -517,8 +670,15 @@ def export_relations_jsonl(model: Dict, keys: List[Tuple]) -> str:
             rels = []
             for rel in st.session_state.rel_gold.get(key, []):
                 out = dict(rel)
-                out["e1"] = _resolve_rel_entity(key, rel, "e1")
-                out["e2"] = _resolve_rel_entity(key, rel, "e2")
+                out.setdefault("e1_kind", ENTITY_KIND)
+                out.setdefault("e2_kind", ENTITY_KIND)
+                # Stable schema for relations recorded before properties
+                # existed, so consumers can read the field unconditionally.
+                out.setdefault("property", "")
+                out["e1"] = _resolve_endpoint(key, rel, "e1")
+                out["e2"] = _resolve_endpoint(key, rel, "e2")
+                out["text"] = _triplet_text(key, rel)
+                out["level"] = _relation_level(key, rel)
                 rels.append(out)
             sentences.append({
                 "text": text,
@@ -623,6 +783,106 @@ def _entity_chip_html(i: int, sp: Dict, text: str = "") -> str:
     return out
 
 
+def _entity_chip_compact_html(i: int, sp: Dict, text: str = "") -> str:
+    """The read-only (edit mode off) rendering of one entity: E-number, text
+    chip and type on a single inline chip so a whole sentence's entities take a
+    couple of wrapped lines instead of one row plus expander each. Concept and
+    edited/added/virtual/offset flags move into the tooltip and a small marker;
+    switch edit mode on to see them spelled out."""
+    bg, fg = _span_color(sp.get("type", ""))
+    tips = [sp.get("type", "")]
+    concept_text = sp.get("concept_text")
+    if concept_text and concept_text != sp.get("text"):
+        tips.append(f"concept: {concept_text}")
+
+    flags = []
+    if sp.get("added_by"):
+        flags.append("added")
+    elif sp.get("edited_by"):
+        flags.append("edited")
+    if _is_virtual(sp):
+        flags.append("virtual")
+    offsets_bad = bool(text) and not _offsets_match_sentence(sp, text)
+    if offsets_bad:
+        flags.append("check offsets")
+    tips.extend(flags)
+
+    marker = ""
+    if offsets_bad:
+        marker = '<span style="color:#b71c1c;font-size:11px">⚠</span>'
+    elif flags:
+        marker = '<span style="color:#c8a415;font-size:11px">•</span>'
+
+    return (
+        '<span style="display:inline-flex;align-items:baseline;gap:4px;'
+        'margin:0 10px 4px 0;white-space:nowrap" '
+        f'title="{html_mod.escape(" / ".join(t for t in tips if t))}">'
+        f'<span style="color:#aaa;font-size:10px">E{i+1}</span>'
+        f'<span style="background:{bg};color:{fg};border-radius:4px;'
+        f'padding:1px 6px;font-size:12px;font-weight:500">'
+        f'{html_mod.escape(sp.get("text", ""))}</span>'
+        f'<span style="font-size:10px;color:#999">'
+        f'{html_mod.escape(sp.get("type", ""))}</span>'
+        f'{marker}</span>'
+    )
+
+
+def _relation_badge_html(rel_type: str) -> str:
+    return (
+        '<span style="background:#f0f0f0;color:#444;border-radius:4px;'
+        'padding:2px 7px;font-size:11px;font-weight:500;'
+        f'border:0.5px solid #ccc">{html_mod.escape(rel_type)}</span>'
+    )
+
+
+def _property_badge_html(prop: str) -> str:
+    return (
+        '<span style="background:#fff3e0;color:#8a4b00;border-radius:4px;'
+        'padding:2px 6px;font-size:10px;font-weight:600;'
+        'border:0.5px solid #ffcc80" title="Relation property">'
+        f'{html_mod.escape(prop)}</span>'
+    )
+
+
+def _entity_ref_chip_html(sp: Dict) -> str:
+    bg, fg = _span_color(sp.get("type", ""))
+    concept = html_mod.escape(sp.get("concept_text") or "")
+    title = f' title="concept: {concept}"' if concept else ""
+    return (
+        f'<span style="background:{bg};color:{fg};border-radius:4px;'
+        f'padding:2px 7px;font-size:12px;font-weight:500"{title}>'
+        f'{html_mod.escape(sp.get("text", ""))}</span>'
+    )
+
+
+def _endpoint_html(res: Dict, t_num: Dict[str, int] | None = None,
+                   depth: int = 0) -> str:
+    """Render a resolved argument: an entity chip, or — for a hyper-relation
+    argument — the whole nested triplet boxed inline, recursively."""
+    if res.get("kind") != RELATION_KIND:
+        return _entity_ref_chip_html(res)
+    if depth >= _MAX_REL_DEPTH:
+        return '<span style="font-size:12px;color:#888">…</span>'
+    tag = ""
+    n = (t_num or {}).get(res.get("uid"))
+    if n:
+        tag = (f'<span style="color:#5c6bc0;font-size:10px;font-weight:600">'
+               f'T{n}</span>')
+    return (
+        '<span style="display:inline-flex;align-items:center;gap:4px;'
+        'flex-wrap:wrap;border:1px dashed #7986cb;background:#eef1ff;'
+        'border-radius:7px;padding:2px 6px">'
+        + tag
+        + _endpoint_html(res.get("e1", {}), t_num, depth + 1)
+        + '<span style="font-size:12px;color:#888">→</span>'
+        + _relation_badge_html(res.get("relation", ""))
+        + '<span style="font-size:12px;color:#888">→</span>'
+        + _endpoint_html(res.get("e2", {}), t_num, depth + 1)
+        + (_property_badge_html(res["property"]) if res.get("property") else "")
+        + '</span>'
+    )
+
+
 def _entity_label(i: int, sp: Dict) -> str:
     """Plain-text entity label for the E1/E2 pickers."""
     label = f"E{i+1} — {sp.get('text','')} ({sp.get('type','')})"
@@ -661,13 +921,72 @@ def _entity_type_picker(sp_type: str, key_root: str,
     return new_type
 
 
+def _relation_property_picker(current: str, key_root: str,
+                              label: str = "Relation property (optional)",
+                              label_visibility: str = "visible"
+                              ) -> Tuple[str, bool]:
+    """Property selectbox + free-text fallback, as (property, pending).
+    `pending` is True while "Custom" is selected but nothing usable has been
+    typed yet: the caller must not read that as "no property" and clear /
+    record an empty one."""
+    options = _relation_property_options(current)
+    all_options = [_NO_PROPERTY] + options + [_CUSTOM_PROPERTY_SENTINEL]
+    sel = st.selectbox(
+        label,
+        options=all_options,
+        index=all_options.index(current) if current in all_options else 0,
+        key=f"{key_root}_prop",
+        label_visibility=label_visibility,
+        help="Optional qualifier on the relation itself, e.g. the sentence "
+             "states that it does not hold.",
+    )
+    if sel != _CUSTOM_PROPERTY_SENTINEL:
+        return ("" if sel == _NO_PROPERTY else sel), False
+    typed = st.text_input(
+        "New relation property (e.g. Uncertain)",
+        key=f"{key_root}_prop_custom",
+    )
+    prop = _normalize_relation_property(typed)
+    if typed and not prop:
+        st.warning("Enter at least one letter or number for the new property.")
+    return prop, not prop
+
+
 def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
                           text: str, username: str):
-    """The 'Entities' block: index of the sentence's working entities, an
-    inline editor per entity, and a form to add a missing one."""
+    """The 'Entities' block: index of the sentence's working entities and,
+    with edit mode on, an inline editor per entity plus a form to add a missing
+    one. Edit mode is off by default and session-wide (not per sentence), so
+    annotators who only link relations keep a compact, read-only index."""
     spans = _cur_spans(cur_key)
 
-    st.markdown("#### Entities")
+    h_left, h_right = st.columns([2, 1])
+    with h_left:
+        st.markdown("#### Entities")
+    with h_right:
+        edit_mode = st.toggle(
+            "✎ Edit mode", key="re_ent_edit_mode",
+            help="Off: compact read-only list. On: fix a wrong type, boundary "
+                 "or concept, delete an entity, or add a missing one.",
+        )
+
+    if not edit_mode:
+        # Nothing can be saved from here, so drop a pending save flag rather
+        # than flashing "✓ saved" whenever edit mode comes back on.
+        st.session_state.pop("re_just_saved_ent", None)
+        if not spans:
+            st.caption("No entities on this sentence — switch on edit mode to "
+                       "add one.")
+        else:
+            st.markdown(
+                '<div style="line-height:2.1;padding:2px 0">'
+                + "".join(_entity_chip_compact_html(i, sp, text)
+                          for i, sp in enumerate(spans))
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+        return
+
     st.caption("Entities come from the uploaded entity annotation — fix a wrong "
                "type or boundary here, or add one that is missing, before "
                "linking them below.")
@@ -776,7 +1095,7 @@ def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
                 or bool(sp.get("virtual")) != virtual
             )
 
-            used = _relations_using(cur_key, uid)
+            used = _dependent_rel_uids(cur_key, ENTITY_KIND, uid)
             can_save = bool(changed and offsets_ok and new_type)
             c_save, c_del = st.columns([1, 1])
             with c_save:
@@ -809,22 +1128,24 @@ def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
             with c_del:
                 confirm = True
                 if used:
+                    # Includes the hyper-relations stacked on top of those
+                    # relations, which would otherwise dangle.
                     st.caption(f"⚠️ used in {len(used)} relation(s)")
                     confirm = st.checkbox(
                         f"also delete {len(used)} relation(s)",
                         key=f"{key_root}_delconf",
                     )
                 if st.button("🗑 Delete entity", disabled=not confirm,
-                             key=f"{key_root}_del"):
+                             key=f"{key_root}_del") and confirm:
                     st.session_state.ent_gold[cur_key] = [
                         s for s in spans if s.get("uid") != uid
                     ]
                     if used:
                         st.session_state.rel_gold[cur_key] = [
-                            r for j, r in
-                            enumerate(st.session_state.rel_gold.get(cur_key, []))
-                            if j not in used
+                            r for r in st.session_state.rel_gold.get(cur_key, [])
+                            if r.get("uid") not in used
                         ]
+                        _bump_rel_ver(cur_key)
                     _bump_ent_ver(cur_key)
                     _maybe_autosave_re(model, keys)
                     st.rerun()
@@ -963,6 +1284,7 @@ def render_relation_page(_unused_model: Dict = None):
         st.session_state.rel_gold = {}
         st.session_state.ent_gold = {}
         st.session_state.re_ent_ver = {}
+        st.session_state.re_rel_ver = {}
         st.session_state.re_entity_types = _collect_entity_types(model)
         # Fresh run ID for this file
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1074,20 +1396,42 @@ def render_relation_page(_unused_model: Dict = None):
             st.warning("No entities — add one on the left before annotating "
                        "relations on this sentence.")
         else:
-            # Entities are picked by uid, not by position: deleting an entity
-            # then invalidates the pick instead of silently re-pointing it at
-            # whatever entity shifted into that slot.
+            # Arguments are picked by (kind, uid), not by position: deleting an
+            # entity or a triplet then invalidates the pick instead of silently
+            # re-pointing it at whatever shifted into that slot.
+            existing_rels = st.session_state.rel_gold.get(cur_key, [])
             span_by_uid = {sp["uid"]: sp for sp in spans}
-            entity_labels = {sp["uid"]: _entity_label(i, sp)
-                             for i, sp in enumerate(spans)}
-            ent_ver = _ent_ver(cur_key)
+            arg_options: List[Tuple[str, str]] = (
+                [(ENTITY_KIND, sp["uid"]) for sp in spans]
+                + [(RELATION_KIND, r["uid"]) for r in existing_rels
+                   if r.get("uid")]
+            )
+            arg_labels = {(ENTITY_KIND, sp["uid"]): _entity_label(i, sp)
+                          for i, sp in enumerate(spans)}
+            arg_labels.update({
+                (RELATION_KIND, r["uid"]):
+                    f"T{j+1} — ⟨{_triplet_text(cur_key, r)}⟩"
+                for j, r in enumerate(existing_rels) if r.get("uid")
+            })
+            args_ver = _args_ver(cur_key)
+            # Every widget of this form carries a version that is bumped once a
+            # relation is recorded, so the whole form remounts empty instead of
+            # carrying the previous relation's type, property and note over to
+            # the next one (same trick as the 'Add entity' form).
+            add_vers = st.session_state.setdefault("re_rel_add_ver", {})
+            form_ver = add_vers.get(cur_key, 0)
+            form_root = f"{cur_key}_{form_ver}"
+            if existing_rels:
+                st.caption("Arguments can be entities (E…) or triplets already "
+                           "annotated on this sentence (T…) — linking two "
+                           "triplets records a hyper-relation.")
 
             with st.container(border=True):
-                e1_uid = st.selectbox(
-                    "Source entity (E1)",
-                    options=list(span_by_uid),
-                    format_func=lambda u: entity_labels[u],
-                    key=f"re_e1_{cur_key}_{ent_ver}",
+                e1_ref = st.selectbox(
+                    "Source argument (E1)",
+                    options=arg_options,
+                    format_func=lambda r: arg_labels[r],
+                    key=f"re_e1_{form_root}_{args_ver}",
                 )
 
                 hint_options = ["(none — pick manually)"] + [
@@ -1098,7 +1442,7 @@ def render_relation_page(_unused_model: Dict = None):
                     "Suggest from Mark's relation hint (optional)",
                     options=range(len(hint_options)),
                     format_func=lambda i: hint_options[i],
-                    key=f"re_hint_{cur_key}",
+                    key=f"re_hint_{form_root}",
                 ) if hints else 0
                 suggested_label = hints[hint_sel - 1]["label"] if hint_sel else None
 
@@ -1119,58 +1463,86 @@ def render_relation_page(_unused_model: Dict = None):
                     # Key varies with the chosen hint so a new hint pick
                     # refreshes the default, while the user can still
                     # freely override it without the selection resetting.
-                    key=f"re_rel_{cur_key}_{hint_sel}",
+                    key=f"re_rel_{form_root}_{hint_sel}",
                 )
                 if rel_type_sel == _CUSTOM_RELATION_SENTINEL:
                     custom_input = st.text_input(
                         "New relation type (letters/numbers only, e.g. MIGRATES_TO)",
-                        key=f"re_rel_custom_{cur_key}_{hint_sel}",
+                        key=f"re_rel_custom_{form_root}_{hint_sel}",
                     )
                     rel_type = _normalize_relation_label(custom_input)
                     if custom_input and not rel_type:
                         st.warning("Enter at least one letter or number for the new relation type.")
                 else:
                     rel_type = rel_type_sel
-                e2_uid = st.selectbox(
-                    "Target entity (E2)",
-                    options=list(span_by_uid),
-                    format_func=lambda u: entity_labels[u],
-                    key=f"re_e2_{cur_key}_{ent_ver}",
+                e2_ref = st.selectbox(
+                    "Target argument (E2)",
+                    options=arg_options,
+                    format_func=lambda r: arg_labels[r],
+                    # Second argument by default: a fresh form should not open
+                    # on E1 → E1, which is the one combination it rejects.
+                    index=1 if len(arg_options) > 1 else 0,
+                    key=f"re_e2_{form_root}_{args_ver}",
+                )
+                rel_prop, prop_pending = _relation_property_picker(
+                    "", f"re_relprop_add_{form_root}",
                 )
                 note = st.text_input(
                     "Note / reasoning (optional)",
-                    key=f"re_note_{cur_key}",
+                    key=f"re_note_{form_root}",
                 )
 
-                same_entity = (e1_uid == e2_uid)
-                if same_entity:
-                    st.warning("Source and target must be different entities.")
+                def _snapshot(ref: Tuple[str, str]) -> Dict:
+                    """Frozen copy of an argument, so a relation stays readable
+                    even if what it points at is later deleted; e1/e2 are
+                    re-resolved by uid on render and on export."""
+                    kind, uid = ref
+                    if kind == RELATION_KIND:
+                        inner = _rel_by_uid(cur_key, uid)
+                        return copy.deepcopy({
+                            "kind": RELATION_KIND, "uid": uid,
+                            "relation": (inner or {}).get("relation", ""),
+                            "property": (inner or {}).get("property", ""),
+                            "text": _triplet_text(cur_key, inner or {}),
+                        })
+                    return copy.deepcopy(span_by_uid.get(uid, {}))
+
+                same_arg = (e1_ref == e2_ref)
+                if same_arg:
+                    st.warning("Source and target must be different.")
                 missing_custom = rel_type_sel == _CUSTOM_RELATION_SENTINEL and not rel_type
                 if missing_custom:
                     st.warning("Type a name for the new relation, or pick one from the list.")
+                if prop_pending:
+                    st.warning(f"Type a name for the new relation property, or "
+                               f"pick “{_NO_PROPERTY}”.")
 
+                can_add_rel = not (same_arg or missing_custom or prop_pending)
                 if st.button(
                     "＋ Add relation",
                     type="primary",
-                    disabled=(same_entity or missing_custom),
+                    disabled=not can_add_rel,
                     key=f"re_add_{cur_key}",
-                ):
+                ) and can_add_rel:
                     if rel_type not in custom_types and rel_type not in RELATION_TYPES:
                         custom_types.append(rel_type)
+                    _remember_relation_property(rel_prop)
                     new_rel = {
                         "uid": _uid(),
                         "relation": rel_type,
-                        "e1_uid": e1_uid,
-                        "e2_uid": e2_uid,
-                        # Snapshot, so a relation stays readable even if its
-                        # entity is later deleted; e1/e2 are re-resolved from
-                        # the working entities on render and on export.
-                        "e1": copy.deepcopy(span_by_uid[e1_uid]),
-                        "e2": copy.deepcopy(span_by_uid[e2_uid]),
+                        "property": rel_prop,
+                        "e1_kind": e1_ref[0],
+                        "e1_uid": e1_ref[1],
+                        "e2_kind": e2_ref[0],
+                        "e2_uid": e2_ref[1],
+                        "e1": _snapshot(e1_ref),
+                        "e2": _snapshot(e2_ref),
                         "note": note.strip(),
                         "annotator": username,
                     }
                     st.session_state.rel_gold[cur_key].append(new_rel)
+                    _bump_rel_ver(cur_key)
+                    add_vers[cur_key] = form_ver + 1   # remount → clears the form
                     _maybe_autosave_re(model, keys)
                     st.rerun()
 
@@ -1181,38 +1553,45 @@ def render_relation_page(_unused_model: Dict = None):
         if not rels:
             st.caption("No relations yet for this sentence.")
         else:
-            to_delete = []
+            # T-numbers label the triplets so the argument pickers above and
+            # this list refer to the same things.
+            t_num = {r["uid"]: i + 1 for i, r in enumerate(rels) if r.get("uid")}
+            to_delete: List[str] = []
             for j, rel in enumerate(rels):
-                # Resolved from the working entities, so an entity edited on
-                # the left is shown with its current text/type here too.
-                e1 = _resolve_rel_entity(cur_key, rel, "e1")
-                e2 = _resolve_rel_entity(cur_key, rel, "e2")
+                # Resolved from the working entities and triplets, so an entity
+                # edited on the left, or a triplet retyped below, shows its
+                # current state everywhere it is used.
+                e1 = _resolve_endpoint(cur_key, rel, "e1")
+                e2 = _resolve_endpoint(cur_key, rel, "e2")
                 uid = rel.get("uid", str(j))
-                bg1, fg1 = _span_color(e1.get("type", ""))
-                bg2, fg2 = _span_color(e2.get("type", ""))
 
                 with st.container(border=True):
-                    # concept_text (if any) shown as a hover tooltip on the chip
-                    e1_title = html_mod.escape(e1.get("concept_text") or "")
-                    e2_title = html_mod.escape(e2.get("concept_text") or "")
-                    e1_title_attr = f' title="concept: {e1_title}"' if e1_title else ""
-                    e2_title_attr = f' title="concept: {e2_title}"' if e2_title else ""
-                    # Display row: E1 chip → relation badge → E2 chip
+                    # Display row: T-number, E1 → relation badge → E2, where an
+                    # argument may itself be a boxed triplet.
+                    header = (
+                        f'<span style="color:#5c6bc0;font-size:10px;'
+                        f'font-weight:600;margin-right:2px">T{j+1}</span>'
+                    )
+                    if _is_hyper(rel):
+                        header += (
+                            '<span style="font-size:10px;color:#3949ab;'
+                            'background:#e8eaf6;border:1px solid #c5cae9;'
+                            'border-radius:3px;padding:1px 5px;margin-right:2px"'
+                            ' title="Hyper-relation: at least one argument is '
+                            'itself a triplet">hyper</span>'
+                        )
                     st.markdown(
-                        f'<div style="display:flex;align-items:center;gap:6px;'
-                        f'flex-wrap:wrap;margin-bottom:4px">'
-                        f'<span style="background:{bg1};color:{fg1};border-radius:4px;'
-                        f'padding:2px 7px;font-size:12px;font-weight:500"{e1_title_attr}>'
-                        f'{html_mod.escape(e1.get("text", ""))}</span>'
-                        f'<span style="font-size:12px;color:#888">→</span>'
-                        f'<span style="background:#f0f0f0;color:#444;border-radius:4px;'
-                        f'padding:2px 7px;font-size:11px;font-weight:500;border:0.5px solid #ccc">'
-                        f'{html_mod.escape(rel["relation"])}</span>'
-                        f'<span style="font-size:12px;color:#888">→</span>'
-                        f'<span style="background:{bg2};color:{fg2};border-radius:4px;'
-                        f'padding:2px 7px;font-size:12px;font-weight:500"{e2_title_attr}>'
-                        f'{html_mod.escape(e2.get("text", ""))}</span>'
-                        f'</div>',
+                        '<div style="display:flex;align-items:center;gap:6px;'
+                        'flex-wrap:wrap;margin-bottom:4px">'
+                        + header
+                        + _endpoint_html(e1, t_num)
+                        + '<span style="font-size:12px;color:#888">→</span>'
+                        + _relation_badge_html(rel.get("relation", ""))
+                        + '<span style="font-size:12px;color:#888">→</span>'
+                        + _endpoint_html(e2, t_num)
+                        + (_property_badge_html(rel["property"])
+                           if rel.get("property") else "")
+                        + '</div>',
                         unsafe_allow_html=True,
                     )
 
@@ -1243,12 +1622,40 @@ def render_relation_page(_unused_model: Dict = None):
                             del st.session_state["re_just_saved"]
                     with c_del:
                         st.write("")
-                        if st.button("Delete", key=f"re_del_{uid}"):
-                            to_delete.append(j)
+                        # A triplet used as an argument cannot go on its own:
+                        # the hyper-relations above it would dangle.
+                        dependents = _dependent_rel_uids(cur_key, RELATION_KIND, uid)
+                        ok_to_delete = True
+                        if dependents:
+                            ok_to_delete = st.checkbox(
+                                f"+{len(dependents)} built on it",
+                                key=f"re_del_conf_{uid}",
+                                help="This triplet is an argument of "
+                                     f"{len(dependents)} other relation(s); "
+                                     "deleting it deletes those too.",
+                            )
+                        if st.button("Delete", key=f"re_del_{uid}",
+                                     disabled=not ok_to_delete) and ok_to_delete:
+                            to_delete.extend([uid] + dependents)
+
+                    cur_prop = rel.get("property", "")
+                    # The stored value is part of the widget key so that saving
+                    # a custom property remounts the picker on the now-known
+                    # option instead of leaving it parked on "Custom".
+                    new_prop, prop_pending = _relation_property_picker(
+                        cur_prop, f"re_relprop_{uid}_{cur_prop or 'none'}",
+                        label="Relation property",
+                    )
 
                     # Detect change → persist + flag → rerun to show indicator
+                    updates = {}
                     if new_type != rel["relation"]:
-                        st.session_state.rel_gold[cur_key][j]["relation"] = new_type
+                        updates["relation"] = new_type
+                    if not prop_pending and new_prop != cur_prop:
+                        updates["property"] = new_prop
+                    if updates:
+                        st.session_state.rel_gold[cur_key][j].update(updates)
+                        _remember_relation_property(updates.get("property", ""))
                         _maybe_autosave_re(model, keys)
                         st.session_state["re_just_saved"] = uid
                         st.rerun()
@@ -1258,8 +1665,9 @@ def render_relation_page(_unused_model: Dict = None):
 
             if to_delete:
                 st.session_state.rel_gold[cur_key] = [
-                    r for k, r in enumerate(rels) if k not in to_delete
+                    r for r in rels if r.get("uid") not in to_delete
                 ]
+                _bump_rel_ver(cur_key)
                 _maybe_autosave_re(model, keys)
                 st.rerun()
 
@@ -1269,8 +1677,14 @@ def render_relation_page(_unused_model: Dict = None):
 
     total_rels = sum(len(v) for v in st.session_state.rel_gold.values())
     sents_with_rels = sum(1 for v in st.session_state.rel_gold.values() if v)
+    hyper = sum(1 for v in st.session_state.rel_gold.values()
+                for r in v if _is_hyper(r))
+    with_prop = sum(1 for v in st.session_state.rel_gold.values()
+                    for r in v if r.get("property"))
     st.caption(
-        f"{total_rels} relation(s) across {sents_with_rels} / {len(keys)} sentences."
+        f"{total_rels} relation(s) across {sents_with_rels} / {len(keys)} "
+        f"sentences" + (f", {hyper} of them hyper-relations" if hyper else "")
+        + (f", {with_prop} with a property" if with_prop else "") + "."
     )
 
     all_spans = [sp for v in st.session_state.get("ent_gold", {}).values() for sp in v]
