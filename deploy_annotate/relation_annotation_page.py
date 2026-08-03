@@ -22,6 +22,18 @@ Integration into streamlit_app_annotate.py
    (keyed by (doc_id, sent_idx), values are lists of sentence dicts).
    If you call _load_sets() before the mode branch both pages share the
    same uploaded file and save directory.
+
+Optional per-sentence input keys
+--------------------------------
+Both are produced by prep scripts and simply absent from older files:
+
+  "relation_hints"  Mark's preliminary "RELATION:<label>" phrases, drawn as a
+                    dotted underline (scripts/prepare_relation_annotation_input.py).
+  "coref"           Coreference glosses, drawn as "It [mountain range] …" after
+                    the mention (scripts/add_coref_annotations.py). Display-only:
+                    the gloss is injected between HTML fragments at render time,
+                    so `text` and every start_char/end_char stay exactly as
+                    uploaded, and nothing about it reaches the export.
 """
 
 from __future__ import annotations
@@ -112,13 +124,21 @@ def _uid() -> str:
 #  HTML rendering                                                     #
 # ------------------------------------------------------------------ #
 
-def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = None) -> str:
+def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = None,
+                       coref: List[Dict] | None = None) -> str:
     """
     Return an HTML string with all spans highlighted in their type colour.
     Overlapping spans: inner-most wins (last boundary wins in tie).
     Mark's relation hints (if given) are underlined on top of that.
     Spans/hints with missing char offsets are skipped rather than crashing,
     as are virtual spans (offsets < 0), which have no place in the sentence.
+
+    `coref` are the precomputed coreference glosses (see
+    scripts/add_coref_annotations.py): each mention gets a dashed underline and
+    its antecedent is rendered right after it as "It [mountain range]". The
+    gloss is inserted between fragments at render time and is never part of
+    `text`, so every start_char/end_char in the sentence keeps pointing at the
+    same character it did in the uploaded file.
     """
     n = len(text)
     # Build a character-level label array (entity type or None)
@@ -147,20 +167,42 @@ def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = 
         for i in range(a, b):
             hint_labels[i] = h.get("label", "")
 
-    # Build fragments: consecutive chars with same (label, hint_label) pair
-    fragments: List[Tuple[str, str | None, str | None]] = []
+    # Coref mentions are numbered rather than labelled by antecedent, so two
+    # different mentions sitting next to each other still break the fragment
+    # run (and so a repeated antecedent does not merge two mentions into one).
+    coref_labels: List[int | None] = [None] * n
+    gloss_by_end: Dict[int, List[Dict]] = {}
+    for ci, c in enumerate(coref or []):
+        if c.get("start_char") is None or c.get("end_char") is None:
+            continue
+        if int(c["start_char"]) < 0 or int(c["end_char"]) < 0:
+            continue
+        if not (c.get("antecedent") or "").strip():
+            continue
+        a = max(0, int(c["start_char"]))
+        b = min(n, int(c["end_char"]))
+        if a >= b:
+            continue
+        for i in range(a, b):
+            coref_labels[i] = ci + 1
+        gloss_by_end.setdefault(b, []).append(c)
+
+    # Build fragments: consecutive chars with the same (label, hint, coref) triple
+    fragments: List[Tuple[str, str | None, str | None, int | None, int]] = []
     i = 0
     while i < n:
         lab = labels[i]
         hlab = hint_labels[i]
+        clab = coref_labels[i]
         j = i + 1
-        while j < n and labels[j] == lab and hint_labels[j] == hlab:
+        while (j < n and labels[j] == lab and hint_labels[j] == hlab
+               and coref_labels[j] == clab):
             j += 1
-        fragments.append((text[i:j], lab, hlab))
+        fragments.append((text[i:j], lab, hlab, clab, j))
         i = j
 
     parts = []
-    for seg, lab, hlab in fragments:
+    for seg, lab, hlab, clab, end in fragments:
         esc = html_mod.escape(seg)
         styles = []
         titles = []
@@ -171,6 +213,11 @@ def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = 
         if hlab is not None:
             styles.append("border-bottom:3px dotted #d84315;")
             titles.append(f"Mark's relation hint: {hlab}")
+        if clab is not None:
+            styles.append("text-decoration:underline;text-decoration-style:dashed;"
+                          "text-decoration-color:#5b6a8a;text-underline-offset:3px;")
+            titles.append("Coreference mention — the bracket after it is the "
+                          "resolved referent")
         if styles:
             parts.append(
                 f'<mark style="{"".join(styles)}" '
@@ -178,6 +225,17 @@ def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = 
             )
         else:
             parts.append(esc)
+        # The gloss goes after the mention's last character, at a fragment
+        # boundary that the coref label itself just created.
+        for c in gloss_by_end.get(end, []):
+            ante = c.get("antecedent", "")
+            conf = (c.get("confidence") or "").lower()
+            tip = f"Automatic coreference gloss ({conf or 'unrated'} confidence) — " \
+                  f"not part of the sentence"
+            parts.append(
+                f'<span class="re-coref-gloss" data-conf="{html_mod.escape(conf)}" '
+                f'title="{html_mod.escape(tip)}">[{html_mod.escape(ante)}]</span>'
+            )
 
     css = """
     <style>
@@ -193,7 +251,22 @@ def _build_entity_html(text: str, spans: List[Dict], hints: List[Dict] | None = 
         padding: 10px 14px;
         color: #0c1222;
       }
-      mark { cursor: default; }
+      /* Entity spans set their own background inline; without this a <mark>
+         carrying only an underline (a relation hint or a coref mention) would
+         pick up the browser's default yellow highlight. */
+      mark { cursor: default; background: transparent; }
+      .re-coref-gloss {
+        font-size: 0.82em;
+        color: #4a5878;
+        background: #eef1fb;
+        border: 1px dashed #b9c4e8;
+        border-radius: 4px;
+        padding: 0 3px;
+        margin: 0 2px 0 3px;
+        cursor: help;
+        vertical-align: baseline;
+      }
+      .re-coref-gloss[data-conf="low"] { opacity: .72; border-style: dotted; }
     </style>
     """
     return css + f'<div class="re-sent">{"".join(parts)}</div>'
@@ -883,6 +956,34 @@ def _get_hints(model: Dict, key: Tuple) -> List[Dict]:
     return []
 
 
+def _get_coref(model: Dict, key: Tuple) -> List[Dict]:
+    """Return the precomputed coreference glosses for a (doc_id, sent_idx) key.
+
+    Written by scripts/add_coref_annotations.py as a per-sentence "coref" list:
+        {"start_char": .., "end_char": .., "text": "They",
+         "antecedent": "additional links", "kind": "pronoun",
+         "confidence": "high", "antecedent_offset": -1}
+    Files produced before coref existed simply have no key, and the page then
+    renders exactly as it did before."""
+    for sent_dict in model.get(key, []):
+        coref = sent_dict.get("coref", [])
+        if coref:
+            return coref
+    return []
+
+
+def _file_has_coref(model: Dict, keys: List[Tuple]) -> bool:
+    """True when the uploaded file carries any coref gloss at all. Drives
+    whether the toggle is offered: it has to be a property of the file, not of
+    the current sentence, or the widget would vanish on every sentence without
+    a gloss and lose the annotator's choice."""
+    cached = st.session_state.get("re_coref_in_file")
+    if cached is None:
+        cached = any(_get_coref(model, k) for k in keys)
+        st.session_state["re_coref_in_file"] = cached
+    return cached
+
+
 def _get_text(model: Dict, key: Tuple) -> str:
     for sent_dict in model.get(key, []):
         t = sent_dict.get("text", "")
@@ -1464,6 +1565,69 @@ def _relation_property_picker(current: str, key_root: str,
     return prop, not prop
 
 
+def _render_sentence(model: Dict, keys: List[Tuple], text: str,
+                     spans: List[Dict], hints: List[Dict],
+                     coref: List[Dict]):
+    """The 'Sentence' block: the highlighted sentence, plus — for files carrying
+    precomputed coreference — the bracket glosses and a breakdown panel.
+
+    The glosses are display-only: `_build_entity_html` injects them between
+    fragments, so no offset in the sentence moves and nothing reaches the
+    export. The toggle is session-wide (like edit mode) and keyed off the file
+    rather than the current sentence, so it does not disappear on sentences that
+    happen to have no anaphor."""
+    show_coref = True
+    if _file_has_coref(model, keys):
+        sent_l, sent_r = st.columns([2, 1])
+        with sent_l:
+            st.markdown("#### Sentence")
+        with sent_r:
+            show_coref = st.toggle(
+                "⇢ Coref", value=True, key="re_show_coref",
+                help="Show the resolved referent in brackets after each "
+                     "referring expression, e.g. \"It [mountain range] …\". "
+                     "Automatic and display-only — the brackets are not part "
+                     "of the sentence and are never exported.",
+            )
+    else:
+        st.markdown("#### Sentence")
+
+    shown_coref = coref if show_coref else None
+    if hasattr(st, "html"):
+        st.html(_build_entity_html(text, spans, hints, shown_coref))
+    else:
+        st.components.v1.html(_build_entity_html(text, spans, hints, shown_coref),
+                              height=200, scrolling=True)
+
+    if not (coref and show_coref):
+        return
+
+    with st.expander(f"⇢ Coreference ({len(coref)})", expanded=False):
+        st.caption("Automatic resolution, not gold — check it against the "
+                   "sentence before relying on it for an argument.")
+        for c in coref:
+            where = c.get("antecedent_offset")
+            if where == 0:
+                src = "same sentence"
+            elif isinstance(where, int):
+                src = f"{abs(where)} sentence(s) {'earlier' if where < 0 else 'later'}"
+            else:
+                src = "—"
+            meta = " · ".join(x for x in (str(c.get("kind", "")),
+                                          str(c.get("confidence", "")), src) if x)
+            st.markdown(
+                f'<div style="padding:2px 0;font-size:12px">'
+                f'<span style="text-decoration:underline;'
+                f'text-decoration-style:dashed;text-decoration-color:#5b6a8a">'
+                f'{html_mod.escape(c.get("text", ""))}</span>'
+                f'<span style="color:#888;margin:0 6px">→</span>'
+                f'<b>{html_mod.escape(c.get("antecedent", ""))}</b>'
+                f'<span style="color:#aaa;margin-left:8px">'
+                f'{html_mod.escape(meta)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+
 def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
                           text: str, username: str):
     """The 'Entities' block: index of the sentence's working entities and,
@@ -1840,6 +2004,9 @@ def render_relation_page(_unused_model: Dict = None):
         # relation state is (re)built by the annotator+file block below, which
         # always triggers too because its pair contains the file name.
         st.session_state.re_entity_types = _collect_entity_types(model)
+        # Whether coref glosses exist is a property of the file, so re-probe it
+        # instead of carrying the previous file's answer over.
+        st.session_state.pop("re_coref_in_file", None)
         # Fresh run ID for this file
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         st.session_state.re_run_id = f"{ts}-{uuid.uuid4().hex[:6]}"
@@ -1968,6 +2135,7 @@ def render_relation_page(_unused_model: Dict = None):
     text = _get_text(model, cur_key)
     spans = _cur_spans(cur_key)
     hints = _get_hints(model, cur_key)
+    coref = _get_coref(model, cur_key)
 
     st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}")
 
@@ -1976,11 +2144,7 @@ def render_relation_page(_unused_model: Dict = None):
 
     # ---- LEFT: sentence + entity index ------------------------------
     with col_left:
-        st.markdown("#### Sentence")
-        if hasattr(st, "html"):
-            st.html(_build_entity_html(text, spans, hints))
-        else:
-            st.components.v1.html(_build_entity_html(text, spans, hints), height=200, scrolling=True)
+        _render_sentence(model, keys, text, spans, hints, coref)
 
         _render_entity_editor(model, keys, cur_key, text, username)
 
