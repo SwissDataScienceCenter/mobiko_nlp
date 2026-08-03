@@ -962,7 +962,11 @@ def _get_coref(model: Dict, key: Tuple) -> List[Dict]:
     Written by scripts/add_coref_annotations.py as a per-sentence "coref" list:
         {"start_char": .., "end_char": .., "text": "They",
          "antecedent": "additional links", "kind": "pronoun",
-         "confidence": "high", "antecedent_offset": -1}
+         "confidence": "high", "antecedent_sentence": 2,
+         "antecedent_offset": -1}
+    "antecedent_sentence" is this page's 1-based sentence number for the
+    referent (null when it was filtered out of the file); "antecedent_offset" is
+    the older relative position in the source document.
     Files produced before coref existed simply have no key, and the page then
     renders exactly as it did before."""
     for sent_dict in model.get(key, []):
@@ -1565,9 +1569,38 @@ def _relation_property_picker(current: str, key_root: str,
     return prop, not prop
 
 
+def _antecedent_source(c: Dict, sent_no: int) -> str:
+    """Where the referent was introduced, for the coreference panel.
+
+    "antecedent_sentence" is the page's own 1-based sentence number — the one in
+    "Sentence 12 / 155" and in the Jump-to box — so the annotator can go
+    straight there. It is null when the referent sits in a sentence that was
+    filtered out of this file, and absent entirely on files written before the
+    field existed; those fall back to the relative "antecedent_offset", which
+    cannot be turned into a number here (it counts positions in the full source
+    document, and this file is a subset with gaps)."""
+    off = c.get("antecedent_offset")
+    if "antecedent_sentence" in c:
+        no = c["antecedent_sentence"]
+        if no is not None:
+            return "same sentence" if no == sent_no else f"sentence {no}"
+        # No page number to give, so say how far back it was in the source
+        # document — enough to find it there if the annotator wants to.
+        if isinstance(off, int) and off:
+            return (f"not in this file ({abs(off)} sentence(s) "
+                    f"{'earlier' if off < 0 else 'later'} in the source)")
+        return "referent not in this file"
+
+    if off == 0:
+        return "same sentence"
+    if isinstance(off, int):
+        return f"{abs(off)} sentence(s) {'earlier' if off < 0 else 'later'} in the source"
+    return ""
+
+
 def _render_sentence(model: Dict, keys: List[Tuple], text: str,
                      spans: List[Dict], hints: List[Dict],
-                     coref: List[Dict]):
+                     coref: List[Dict], sent_no: int):
     """The 'Sentence' block: the highlighted sentence, plus — for files carrying
     precomputed coreference — the bracket glosses and a breakdown panel.
 
@@ -1606,15 +1639,9 @@ def _render_sentence(model: Dict, keys: List[Tuple], text: str,
         st.caption("Automatic resolution, not gold — check it against the "
                    "sentence before relying on it for an argument.")
         for c in coref:
-            where = c.get("antecedent_offset")
-            if where == 0:
-                src = "same sentence"
-            elif isinstance(where, int):
-                src = f"{abs(where)} sentence(s) {'earlier' if where < 0 else 'later'}"
-            else:
-                src = "—"
-            meta = " · ".join(x for x in (str(c.get("kind", "")),
-                                          str(c.get("confidence", "")), src) if x)
+            meta = " · ".join(x for x in (
+                str(c.get("kind", "")), str(c.get("confidence", "")),
+                _antecedent_source(c, sent_no)) if x)
             st.markdown(
                 f'<div style="padding:2px 0;font-size:12px">'
                 f'<span style="text-decoration:underline;'
@@ -2144,7 +2171,7 @@ def render_relation_page(_unused_model: Dict = None):
 
     # ---- LEFT: sentence + entity index ------------------------------
     with col_left:
-        _render_sentence(model, keys, text, spans, hints, coref)
+        _render_sentence(model, keys, text, spans, hints, coref, idx + 1)
 
         _render_entity_editor(model, keys, cur_key, text, username)
 
