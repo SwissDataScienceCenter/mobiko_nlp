@@ -44,8 +44,10 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
 You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM COVERAGE: identify \
 and annotate every possible entity and every valid relation (triplet) in the given sentence. \
 It is far better to over-annotate than to miss entities or relations — the Critic will filter errors later.
+ 
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
 
-Here is the full relation list:
+Here is the established relation list:
 
 1. HAS_PROPERTY
 2. IS_PART_OF
@@ -54,6 +56,18 @@ Here is the full relation list:
 5. HAS_PROCESS
 6. COMPARES_TO
 7. CAUSES
+8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
+
+Our human annotator also used these relations:
+
+ASSOCIATIVE
+INTERACTS_WITH
+CORRELATE_WITH
+DURING
+IS_THE_SAME_AS
+LOCATED_BY
+
+For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
@@ -166,7 +180,9 @@ Your objective is precision: scrutinise every label the Annotator proposes, \
 challenge anything that is incorrect or ambiguous, and surface anything that was missed. \
 Disagreement is expected and productive — correctness matters more than consensus.
 
-Here is the full relation list:
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
+
+Here is the established relation list:
 
 1. HAS_PROPERTY
 2. IS_PART_OF
@@ -175,6 +191,18 @@ Here is the full relation list:
 5. HAS_PROCESS
 6. COMPARES_TO
 7. CAUSES
+8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
+
+Our human annotator also used these relations:
+
+ASSOCIATIVE
+INTERACTS_WITH
+CORRELATE_WITH
+DURING
+IS_THE_SAME_AS
+LOCATED_BY
+
+For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
@@ -409,7 +437,9 @@ the Critic filters errors later.
 
 {_COLD_START_GUIDELINE_NOTE}
 
-Here is the full relation list:
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
+
+Here is the established relation list:
 
 1. HAS_PROPERTY
 2. IS_PART_OF
@@ -418,6 +448,18 @@ Here is the full relation list:
 5. HAS_PROCESS
 6. COMPARES_TO
 7. CAUSES
+8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
+
+Our human annotator also used these relations:
+
+ASSOCIATIVE
+INTERACTS_WITH
+CORRELATE_WITH
+DURING
+IS_THE_SAME_AS
+LOCATED_BY
+
+For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
@@ -509,7 +551,9 @@ a reusable rule ("X is <type A> not <type B> because <cue>"), since that explana
 mined directly into the reconstructed guideline. Do not fabricate a "guideline_reference"; \
 leave it "" whenever the guideline is silent (which is nearly always).
 
-Here is the full relation list:
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
+
+Here is the established relation list:
 
 1. HAS_PROPERTY
 2. IS_PART_OF
@@ -518,6 +562,18 @@ Here is the full relation list:
 5. HAS_PROCESS
 6. COMPARES_TO
 7. CAUSES
+8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
+
+Our human annotator also used these relations:
+
+ASSOCIATIVE
+INTERACTS_WITH
+CORRELATE_WITH
+DURING
+IS_THE_SAME_AS
+LOCATED_BY
+
+For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
@@ -609,7 +665,9 @@ expertise and the tie-breaker below. When a case is genuinely ambiguous and the 
 is silent, that is a signal a rule is MISSING — flag it for human review rather than \
 forcing a confident label.
 
-Here is the full relation list:
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
+
+Here is the established relation list:
 
 1. HAS_PROPERTY
 2. IS_PART_OF
@@ -618,6 +676,18 @@ Here is the full relation list:
 5. HAS_PROCESS
 6. COMPARES_TO
 7. CAUSES
+8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
+
+Our human annotator also used these relations:
+
+ASSOCIATIVE
+INTERACTS_WITH
+CORRELATE_WITH
+DURING
+IS_THE_SAME_AS
+LOCATED_BY
+
+For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
