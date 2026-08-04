@@ -31,7 +31,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Callable, Dict, List, NamedTuple, Optional, Tuple, Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from prompts import _annotator_system_msg, _critic_system_msg, _critic_system_msg_strict, _adjudicator_system_msg, _build_guideline_summary, LOW_CONFIDENCE_THRESHOLD
 from prompts import _annotator_system_msg_coldstart, _critic_system_msg_coldstart, _adjudicator_system_msg_coldstart
@@ -268,6 +268,95 @@ _patch_openai_for_streaming_logprobs()
 # Data structures
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# Entity-type canonicalisation, applied where labels are BORN
+# ─────────────────────────────────────────────────────────────
+# Models drift on label FORMATTING far more than on label CONTENT: they emit
+# BIOTIC_ENTITY, "BIOTIC  ENTITY", "biotic entity". Every such variant scores 0
+# against gold — worth up to 0.035 strict F1, enough to flip a human-parity
+# verdict — and it has been repaired by hand, per file, three times.
+#
+# Fixing it here rather than per file works because every label in the pipeline
+# is born inside one of the pydantic models below. Attaching the validator to
+# each of them covers all construction paths at once: annotator JSON, critic
+# proposals, adjudicator output, precedent reuse, and relation endpoints.
+
+_ENTITY_TYPE_ALIASES: Dict[str, str] = {
+    # v1 -> v2 schema renames. Mirrors SCHEMA_V1_TO_V2 in
+    # evaluation/eval_layer1_output.py — keep the two in sync.
+    "BIOTIC COLLECTIVE ENTITY": "BIOTIC ENTITY",
+    "ABIOTIC COLLECTIVE ENTITY": "ABIOTIC ENTITY",
+    # Observed misspellings. Listed EXPLICITLY rather than fuzzy-matched: a
+    # near-miss repair that guesses would risk assigning the wrong label, which
+    # is worse than scoring 0 on a visibly broken one.
+    "ANTHROGENIC ENTITY": "ANTHROPOGENIC ENTITY",
+    "ANTHROGENIC PROCESS": "ANTHROPOGENIC PROCESS",
+    "ANTHROGENIC PROPERTY": "ANTHROPOGENIC PROPERTY",
+}
+
+# Labels that survive canonicalisation but are still not in the schema, counted
+# per process so a run can report them instead of hiding them.
+_OFF_SCHEMA_LABELS: Dict[str, int] = {}
+
+
+def canonicalize_entity_type(raw: Optional[str]) -> str:
+    """Normalise a label's FORMATTING. Never changes which label was meant.
+
+    "BIOTIC_ENTITY", "biotic  entity", " Biotic-Entity " -> "BIOTIC ENTITY"
+
+    A label that is STILL not in the schema after canonicalisation is returned
+    unchanged and counted in ``_OFF_SCHEMA_LABELS`` — deliberately not dropped.
+    Dropping spans would silently move recall, could orphan relations that
+    reference them, and the human gold itself carries a handful of off-schema
+    labels, so "off-schema" does not imply "wrong". Surface it, don't delete it.
+    """
+    if not raw:
+        return ""
+    text = str(raw).replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip().upper()
+    if not text:
+        return ""
+    text = _ENTITY_TYPE_ALIASES.get(text, text)
+    # Relation pseudo-labels (e.g. "RELATION:CAUSAL") are a different vocabulary
+    # and are not validated against the entity schema.
+    if text.startswith("RELATION"):
+        return text
+    valid = _ALL_ENTITY_TYPES or set(_FALLBACK_ENTITY_TYPES)
+
+    # Missing separator: "QUANTITATIVEPROPERTY" -> "QUANTITATIVE PROPERTY". Only
+    # applied when inserting one space yields EXACTLY ONE schema label, so it is
+    # a deterministic repair rather than a guess.
+    if text not in valid and " " not in text:
+        split = [f"{text[:i]} {text[i:]}" for i in range(1, len(text))
+                 if f"{text[:i]} {text[i:]}" in valid]
+        if len(split) == 1:
+            logger.info("Recovered missing separator: %r -> %r", text, split[0])
+            text = split[0]
+
+    if text not in valid:
+        _OFF_SCHEMA_LABELS[text] = _OFF_SCHEMA_LABELS.get(text, 0) + 1
+        if _OFF_SCHEMA_LABELS[text] == 1:  # log each novel label once per process
+            logger.warning(
+                "Off-schema entity type %r (canonicalised from %r) — kept, not "
+                "dropped. Check the prompt or add it to the schema.", text, raw
+            )
+    return text
+
+
+def off_schema_label_report() -> Dict[str, int]:
+    """Off-schema labels seen so far this process, most frequent first."""
+    return dict(sorted(_OFF_SCHEMA_LABELS.items(), key=lambda kv: -kv[1]))
+
+
+def reset_off_schema_labels() -> None:
+    _OFF_SCHEMA_LABELS.clear()
+
+
+def _canonicalize_label_field(value):
+    """Shared pydantic validator body for any label-bearing string field."""
+    return canonicalize_entity_type(value) if isinstance(value, str) else value
+
+
 class EntityAnnotation(BaseModel):
     text: str
     entity_type: str
@@ -280,6 +369,8 @@ class EntityAnnotation(BaseModel):
     guideline_rule: Optional[str] = None
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
+
+    _canon_entity_type = field_validator("entity_type")(_canonicalize_label_field)
 
 
 _ENTITY_TYPE_VALUE_RE = re.compile(r'"entity_type"\s*:\s*"([^"]*)"')
@@ -408,6 +499,9 @@ class RelationFlat(BaseModel):
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
 
+    _canon_endpoint_types = field_validator("e1_type", "e2_type")(
+        _canonicalize_label_field)
+
     def to_relation_annotation(self) -> RelationAnnotation:
         return RelationAnnotation(
             relation=self.relation,
@@ -433,12 +527,17 @@ class CriticDisagreement(BaseModel):
     severity: str = ""
     explanation: str = ""
 
+    _canon_labels = field_validator("annotator_label", "proposed_label")(
+        _canonicalize_label_field)
+
 
 class CriticMissingAnnotation(BaseModel):
     text: str = ""
     entity_type: str = ""
     guideline_step: str = ""
     reasoning: str = ""
+
+    _canon_entity_type = field_validator("entity_type")(_canonicalize_label_field)
 
 
 class AgreementItem(BaseModel):
@@ -477,12 +576,16 @@ class ConstrainedAdjudication(BaseModel):
 class PrecedentEntry(BaseModel):
     """A single adjudicated entity-type decision stored for cross-sentence reuse."""
     span_text: str                          # normalized span text
-    entity_type: str                        # decided entity type
+    entity_type: str                        # decided entity type (canonicalised)
     rationale: str = ""                     # guideline rule / adjudicator reasoning
     confidence: float = 1.0
     source_sentence: str = ""              # sentence it came from (for traceability)
     times_applied: int = 0                 # incremented when the Annotator reuses it
     status: str = "authoritative"          # "authoritative" | "provisional"
+
+    # A malformed label stored as a precedent would propagate to every later
+    # sentence that reuses it, so canonicalise on the way in too.
+    _canon_entity_type = field_validator("entity_type")(_canonicalize_label_field)
 
 
 class RelationPrecedent(BaseModel):
@@ -863,12 +966,19 @@ _CONSISTENCY_STOPWORDS = {
 _CONSISTENCY_MIN_TOKEN_OVERLAP = 0.5
 
 
+# Must stay identical to SCHEMA_BIODIV_LIST in src/resources_updated/entity_schema.py
+# (that list is authoritative and is what demo_ag2 passes to _init_tool_state).
+# This copy previously read "QUALITATIVE ENTITY" / "QUANTITATIVE ENTITY", which
+# are not labels the schema or the human gold use — the gold has 339 spans typed
+# QUALITATIVE/QUANTITATIVE PROPERTY. Since canonicalize_entity_type() validates
+# against this list whenever _ALL_ENTITY_TYPES is unset, the typo would have
+# flagged every one of those valid labels as off-schema.
 _FALLBACK_ENTITY_TYPES = [
     "ABIOTIC ENTITY", "ABIOTIC PROCESS", "ABIOTIC PROPERTY",
     "ANTHROPOGENIC ENTITY", "ANTHROPOGENIC PROCESS", "ANTHROPOGENIC PROPERTY",
     "BIOTIC ENTITY", "BIOTIC PROCESS", "BIOTIC PROPERTY",
     "CONCEPT", "SPATIAL ENTITY", "SPATIAL PROPERTY", "TEMPORAL ENTITY", "TEMPORAL PROPERTY",
-    "QUALITATIVE ENTITY", "QUANTITATIVE ENTITY"
+    "QUALITATIVE PROPERTY", "QUANTITATIVE PROPERTY",
 ]
 
 

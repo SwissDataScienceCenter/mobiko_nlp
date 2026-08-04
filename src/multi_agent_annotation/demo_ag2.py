@@ -57,6 +57,7 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     guideline_search,
     consistency_check,
     list_entity_types,
+    off_schema_label_report,
 )
 
 # ── Demo sentences ─────────────────────────────
@@ -495,6 +496,26 @@ def main() -> None:
             dependency_max_dep_distance=args.dependency_max_dep_distance,
             dependency_max_candidates=args.dependency_max_candidates,
         )
+
+        # Labels are canonicalised at emit time (canonicalize_entity_type), so
+        # formatting drift — underscores, double spaces, case, a missing
+        # separator — is repaired silently and no longer costs F1. Anything left
+        # here is a label the canonicaliser could NOT repair without guessing
+        # (e.g. a bare "PROCESS" with no modifier). Those spans are kept, not
+        # dropped, so report them loudly: they will score 0 against gold.
+        off_schema = off_schema_label_report()
+        if off_schema:
+            total = sum(off_schema.values())
+            print(f"\n[WARN] {total} span(s) carry {len(off_schema)} label(s) that are "
+                  f"not in the schema and were NOT repairable automatically:")
+            for label, count in off_schema.items():
+                print(f"         {label!r} x{count}")
+            print("       They were kept (dropping would move recall silently and "
+                  "could orphan relations). Each scores 0 against gold — fix the "
+                  "prompt, or add the label to SCHEMA_BIODIV_LIST if it is real.")
+        else:
+            print("\n[OK] All emitted entity labels are schema-valid "
+                  "(canonicaliser repaired any formatting drift).")
 
 
 if __name__ == "__main__":
