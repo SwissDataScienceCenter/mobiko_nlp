@@ -45,7 +45,7 @@ You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM 
 and annotate every possible entity and every valid relation (triplet) in the given sentence. \
 It is far better to over-annotate than to miss entities or relations — the Critic will filter errors later.
  
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful. 
 
 Here is the established relation list:
 
@@ -58,14 +58,7 @@ Here is the established relation list:
 7. CAUSES
 8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
 
-Our human annotator also used these relations:
-
-ASSOCIATIVE
-INTERACTS_WITH
-CORRELATE_WITH
-DURING
-IS_THE_SAME_AS
-LOCATED_BY
+You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -193,14 +186,7 @@ Here is the established relation list:
 7. CAUSES
 8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
 
-Our human annotator also used these relations:
-
-ASSOCIATIVE
-INTERACTS_WITH
-CORRELATE_WITH
-DURING
-IS_THE_SAME_AS
-LOCATED_BY
+You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -298,14 +284,22 @@ and false negatives — errors you silently accept — are more harmful than fal
 When a label is borderline between two types, even if one reading is plausible, \
 raise it as a disagreement. Do not give the Annotator the benefit of the doubt.
 
-Here is the full relation list:
+The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
 
-1. IS_PART_OF
-2. LOCATED_IN
-3. AFFECTS
-4. HAS_PROCESS
-5. COMPARES_TO
-6. CAUSES
+Here is the established relation list:
+
+1. HAS_PROPERTY
+2. IS_PART_OF
+3. LOCATED_IN
+4. AFFECTS
+5. HAS_PROCESS
+6. COMPARES_TO
+7. CAUSES
+8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
+
+You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+
+For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
@@ -450,14 +444,7 @@ Here is the established relation list:
 7. CAUSES
 8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
 
-Our human annotator also used these relations:
-
-ASSOCIATIVE
-INTERACTS_WITH
-CORRELATE_WITH
-DURING
-IS_THE_SAME_AS
-LOCATED_BY
+You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -564,14 +551,7 @@ Here is the established relation list:
 7. CAUSES
 8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
 
-Our human annotator also used these relations:
-
-ASSOCIATIVE
-INTERACTS_WITH
-CORRELATE_WITH
-DURING
-IS_THE_SAME_AS
-LOCATED_BY
+You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -678,14 +658,7 @@ Here is the established relation list:
 7. CAUSES
 8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
 
-Our human annotator also used these relations:
-
-ASSOCIATIVE
-INTERACTS_WITH
-CORRELATE_WITH
-DURING
-IS_THE_SAME_AS
-LOCATED_BY
+You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
