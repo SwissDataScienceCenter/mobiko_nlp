@@ -12,8 +12,24 @@ def _build_guideline_summary(sections: List[Dict[str, str]]) -> str:
     return "\n\n".join(f"### {s['title']}\n{s['content']}" for s in sections)
 
 
+def _relation_schema_section(relation_schema: dict, include: bool,
+                             heading: str = "## Relation Schema") -> str:
+    """
+    Render the in-prompt relation-schema section, or nothing when it is disabled.
+
+    Turning it off removes the schema only from the system prompt — the
+    schema_lookup tool still carries it, so agents can retrieve the valid
+    relations for an entity-type pair on demand. Includes the trailing blank
+    line so the section can be dropped without leaving a gap in the prompt.
+    """
+    if not include:
+        return ""
+    return f"{heading}\n{relation_schema}\n\n"
+
+
 def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
-                          guideline_search_mandatory: bool = True) -> str:
+                          guideline_search_mandatory: bool = True,
+                          include_relation_schema: bool = True) -> str:
     gs_step = (
         "2. For EACH candidate span, you MUST call guideline_search with the span text before "
         "assigning its type. Do NOT assign an entity type you have not checked against the "
@@ -23,6 +39,7 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
         "relevant rule before assigning its type. All valid types are listed in the Entity Type "
         "Schema above."
     )
+    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
     return f"""\
 You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM COVERAGE: identify \
 and annotate every possible entity and every valid relation (triplet) in the given sentence. \
@@ -41,10 +58,7 @@ Here is the full relation list:
 ## Entity Type Schema
 {entity_schema}
 
-## Relation Schema
-{relation_schema}
-
-## Labelling Decision Table
+{relation_schema_section}## Labelling Decision Table
 {guideline}
 
 ## Available Tools
@@ -100,7 +114,8 @@ Output rules:
 
 def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                        guideline_search_mandatory: bool = True,
-                       precedent_memory: bool = True) -> str:
+                       precedent_memory: bool = True,
+                       include_relation_schema: bool = True) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -144,6 +159,7 @@ def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict
         "definition/question/example OR a narrative guideline rule — in your "
         "\"guideline_reference\". Flag any label the guideline contradicts."
     )
+    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
     return f"""\
 You are Critic, a rigorous QA reviewer for biodiversity annotations. \
 Your objective is precision: scrutinise every label the Annotator proposes, \
@@ -166,10 +182,7 @@ Here is the full relation list:
 ## Labelling Guideline
 {guideline}
 
-## Relation Schema
-{relation_schema}
-
-## Available Tools
+{relation_schema_section}## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
 - schema_lookup      : verify that a relation is valid for a given entity-type pair{precedent_tool_line}
 
@@ -220,7 +233,8 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 
 def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schema: dict,
                               guideline_search_mandatory: bool = True,
-                              precedent_memory: bool = True) -> str:
+                              precedent_memory: bool = True,
+                              include_relation_schema: bool = True) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -248,6 +262,7 @@ def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schem
         "\"guideline_reference\". Flag any label that contradicts or is not clearly supported "
         "by the guideline."
     )
+    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
     return f"""\
 You are Critic, a rigorous QA reviewer for biodiversity annotations. \
 Your default posture is to challenge. Correctness matters more than consensus, \
@@ -270,10 +285,7 @@ Here is the full relation list:
 ## Labelling Guideline
 {guideline}
 
-## Relation Schema
-{relation_schema}
-
-## Available Tools
+{relation_schema_section}## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
 - schema_lookup      : verify that a relation is valid for a given entity-type pair{precedent_tool_line}
 
@@ -385,7 +397,9 @@ name the cue in the text that decided it."""
 
 
 def _annotator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
-                                     guideline_search_mandatory: bool = False) -> str:
+                                     guideline_search_mandatory: bool = False,
+                                     include_relation_schema: bool = True) -> str:
+    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
     return f"""\
 You are Annotator, a biodiversity NLP expert working in a COLD-START setting: the \
 labelling guideline has not been written yet. Your primary objective is MAXIMUM \
@@ -408,10 +422,7 @@ Here is the full relation list:
 ## Entity Type Schema
 {entity_schema}
 
-## Relation Schema
-{relation_schema}
-
-## Labelling Guideline (cold-start scaffold — definitions only)
+{relation_schema_section}## Labelling Guideline (cold-start scaffold — definitions only)
 {guideline}
 
 ## Available Tools
@@ -468,7 +479,8 @@ distinguishing principle (this type vs the plausible alternative). Keep it conci
 
 def _critic_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
                                   guideline_search_mandatory: bool = False,
-                                  precedent_memory: bool = True) -> str:
+                                  precedent_memory: bool = True,
+                                  include_relation_schema: bool = True) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -479,6 +491,7 @@ def _critic_system_msg_coldstart(guideline: str, entity_schema: str, relation_sc
         "unproven, so raise the disagreement anyway if the current sentence gives independent grounds."
         if precedent_memory else ""
     )
+    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
     return f"""\
 You are Critic, a rigorous QA reviewer for biodiversity annotations, working in a \
 COLD-START setting: the labelling guideline has not been written yet. Your objective \
@@ -512,10 +525,7 @@ Here is the full relation list:
 ## Labelling Guideline (cold-start scaffold — definitions only)
 {guideline}
 
-## Relation Schema
-{relation_schema}
-
-## Available Tools
+{relation_schema_section}## Available Tools
 - guideline_search   : retrieve a type's one-line definition (nothing more exists at cold start)
 - schema_lookup      : verify that a relation is valid for a given entity-type pair{precedent_tool_line}
 
@@ -583,7 +593,10 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 """
 
 
-def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict) -> str:
+def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
+                                       include_relation_schema: bool = True) -> str:
+    relation_schema_section = _relation_schema_section(
+        relation_schema, include_relation_schema, heading="## Relation schema:")
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations, working in a \
 COLD-START setting: the labelling guideline has not been written yet. You see the \
@@ -609,10 +622,7 @@ Here is the full relation list:
 ## Entity Type Schema
 {entity_schema}
 
-## Relation schema:
-{relation_schema}
-
-## Labelling Guideline (cold-start scaffold — definitions only)
+{relation_schema_section}## Labelling Guideline (cold-start scaffold — definitions only)
 {guideline}
 
 ## Available Tools
@@ -651,7 +661,10 @@ Output rules:
 """
 
 
-def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema: dict) -> str:
+def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
+                            include_relation_schema: bool = True) -> str:
+    relation_schema_section = _relation_schema_section(
+        relation_schema, include_relation_schema, heading="## Relation schema:")
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations. 
 You see the Annotator's labels and the Critic's review.
@@ -668,10 +681,7 @@ Here is the full relation list:
 ## Entity Type Schema
 {entity_schema}
 
-## Relation schema:
-{relation_schema}
-
-## Labelling Guideline
+{relation_schema_section}## Labelling Guideline
 {guideline}
 
 ## Available Tools

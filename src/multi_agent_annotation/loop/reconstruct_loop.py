@@ -151,6 +151,8 @@ def run_annotation(args, guideline: Path, decision_tbl: Path,
         base_cmd += ["--num-sentences", str(num_sentences)]
     if args.strict_critic:
         base_cmd += ["--strict-critic"]
+    if args.no_relation_schema_in_prompt:
+        base_cmd += ["--no-relation-schema-in-prompt"]
     if args.cold_start:
         base_cmd += ["--cold-start"]
     if args.tool_choice:
@@ -766,6 +768,9 @@ def main() -> None:
                    choices=["lexical", "embedding"])
     p.add_argument("--guideline-search", choices=["mandatory", "optional"], default="optional")
     p.add_argument("--strict-critic", action="store_true")
+    p.add_argument("--no-relation-schema-in-prompt", action="store_true",
+                   help="Omit the '## Relation Schema' section from the agent system prompts "
+                        "in every iteration's annotation pass (schema_lookup still serves it).")
     p.add_argument("--cold-start", action="store_true",
                    help="Use cold-start prompts in the annotation subprocess: agents "
                         "disambiguate from domain expertise + explicit reasoning instead of "

@@ -1941,6 +1941,7 @@ class MultiAgentAnnotator:
         request_timeout: int = 600,
         strict_critic: bool = False,
         guideline_search_mandatory: bool = True,
+        include_relation_schema: bool = True,
         tool_choice: Optional[str] = None,
         annotator_temperature: Optional[float] = None,
         critic_temperature: Optional[float] = None,
@@ -2086,6 +2087,11 @@ class MultiAgentAnnotator:
             "mandatory" if guideline_search_mandatory else "optional",
         )
         logger.info(
+            "relation schema in prompts: %s",
+            "included" if include_relation_schema
+            else "omitted (schema_lookup tool only)",
+        )
+        logger.info(
             "tool_choice: %s",
             tool_choice if tool_choice else "auto (server default)",
         )
@@ -2123,7 +2129,8 @@ class MultiAgentAnnotator:
             name="Annotator",
             system_message=_annotator_prompt_fn(
                 annotator_guideline, entity_schema_str, relation_schema,
-                guideline_search_mandatory=guideline_search_mandatory),
+                guideline_search_mandatory=guideline_search_mandatory,
+                include_relation_schema=include_relation_schema),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
             is_termination_msg=annotator_is_done,
@@ -2134,7 +2141,8 @@ class MultiAgentAnnotator:
             system_message=_critic_prompt_fn(
                 critic_guideline, entity_schema_str, relation_schema,
                 guideline_search_mandatory=guideline_search_mandatory,
-                precedent_memory=use_precedent_memory),
+                precedent_memory=use_precedent_memory,
+                include_relation_schema=include_relation_schema),
             llm_config=critic_llm,
             human_input_mode="NEVER",
             is_termination_msg=critic_is_done,
@@ -2142,7 +2150,9 @@ class MultiAgentAnnotator:
 
         self.adjudicator = ConversableAgent(
             name="Adjudicator",
-            system_message=_adjudicator_prompt_fn(critic_guideline, entity_schema_str, relation_schema),
+            system_message=_adjudicator_prompt_fn(
+                critic_guideline, entity_schema_str, relation_schema,
+                include_relation_schema=include_relation_schema),
             llm_config=adjudicator_llm,
             human_input_mode="NEVER",
             is_termination_msg=adjudicator_is_done,

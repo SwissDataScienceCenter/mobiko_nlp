@@ -146,6 +146,10 @@ def main() -> None:
                         default="optional",
                         help="Whether agents MUST call guideline_search before deciding.")
     parser.add_argument("--strict-critic", action="store_true")
+    parser.add_argument("--no-relation-schema-in-prompt", action="store_true",
+                        help="Omit the '## Relation Schema' section from the agent system "
+                             "prompts. The schema is still loaded from --schema and remains "
+                             "available through the schema_lookup tool.")
     parser.add_argument("--cold-start", action="store_true",
                         help="Use cold-start prompts: agents disambiguate from domain "
                              "expertise + explicit reasoning instead of citing the guideline "
@@ -195,6 +199,7 @@ def main() -> None:
         request_timeout=args.timeout,
         strict_critic=args.strict_critic,
         guideline_search_mandatory=(args.guideline_search == "mandatory"),
+        include_relation_schema=not args.no_relation_schema_in_prompt,
         tool_choice=args.tool_choice,
         annotator_temperature=args.annotator_temp,
         critic_temperature=args.critic_temp,

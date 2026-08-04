@@ -132,7 +132,9 @@ Skip this if you're happy for the loop to generate them automatically.
 
 Annotation passthrough flags also exist: `--guideline-search {mandatory,optional}`,
 `--guideline-search-backend {lexical,embedding}`, `--strict-critic`,
-`--tool-choice`, `--precedent-memory`, `--timeout`.
+`--no-relation-schema-in-prompt`, `--tool-choice`, `--precedent-memory`, `--timeout`.
+(`--no-relation-schema-in-prompt` drops the `## Relation Schema` section from the agent
+system prompts; the schema is still loaded from `--schema` and served by `schema_lookup`.)
 
 ### Stopping-rule flags (§11.3)
 

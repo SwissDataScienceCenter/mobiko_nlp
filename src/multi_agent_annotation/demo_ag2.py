@@ -245,6 +245,7 @@ def run_live(
     request_timeout: int = 600,
     strict_critic: bool = False,
     guideline_search_mandatory: bool = True,
+    include_relation_schema: bool = True,
     tool_choice: str | None = None,
     annotator_max_tokens: int | None = None,
     critic_max_tokens: int | None = None,
@@ -270,6 +271,7 @@ def run_live(
         request_timeout=request_timeout,
         strict_critic=strict_critic,
         guideline_search_mandatory=guideline_search_mandatory,
+        include_relation_schema=include_relation_schema,
         tool_choice=tool_choice,
         annotator_max_tokens=annotator_max_tokens,
         critic_max_tokens=critic_max_tokens,
@@ -327,7 +329,7 @@ def main() -> None:
         "--max-rounds", type=int, default=2,
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled_swissai-qwen3-35B-vllm"),
+        "--output", type=Path, default=Path("./data/auto_annotated/datademo_manually_labeled_qwen3-35B-vllm_v2_dep_no_relation_schema"),
         help="Output JSONL file for full run.",
     )
     parser.add_argument(
@@ -372,6 +374,14 @@ def main() -> None:
              "('optional', default). The full guideline is already injected into the system "
              "prompt, so 'optional' avoids redundant tool calls/latency; use 'mandatory' only "
              "if you specifically want forced per-span guideline retrieval.",
+    )
+    parser.add_argument(
+        "--no-relation-schema-in-prompt", action="store_true",
+        help="Drop the '## Relation Schema' section from all three system prompts. The schema "
+             "is still loaded from --schema and still served by the schema_lookup tool, so "
+             "agents can retrieve the valid relations for an entity-type pair on demand — this "
+             "only stops the whole schema from being pasted into every prompt (ablation / "
+             "context-budget flag). Default: the schema is included.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -475,6 +485,7 @@ def main() -> None:
             request_timeout=args.timeout,
             strict_critic=args.strict_critic,
             guideline_search_mandatory=(args.guideline_search == "mandatory"),
+            include_relation_schema=not args.no_relation_schema_in_prompt,
             tool_choice=args.tool_choice,
             annotator_max_tokens=annotator_max_tokens,
             critic_max_tokens=critic_max_tokens,
