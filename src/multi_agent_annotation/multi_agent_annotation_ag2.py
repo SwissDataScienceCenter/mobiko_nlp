@@ -483,6 +483,12 @@ class DeliberationRecord(BaseModel):
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
     precedents_added: List[str] = Field(default_factory=list)     # new entries added to store
+    # Provenance: what produced this record. Stamped PER RECORD, not per file,
+    # because --resume appends to an existing output, so one file can legitimately
+    # hold records written under different configs in different sessions — a
+    # run-level sidecar would describe only the last invocation and silently
+    # misrepresent the rest. See MultiAgentAnnotator._build_run_meta.
+    run_meta: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -980,6 +986,35 @@ _FALLBACK_ENTITY_TYPES = [
     "CONCEPT", "SPATIAL ENTITY", "SPATIAL PROPERTY", "TEMPORAL ENTITY", "TEMPORAL PROPERTY",
     "QUALITATIVE PROPERTY", "QUANTITATIVE PROPERTY",
 ]
+
+
+def _file_sha256(path: Optional[Path]) -> Optional[str]:
+    """Content hash of an input file, so a report can be tied to exact bytes."""
+    if not path:
+        return None
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with Path(path).open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as exc:
+        logger.warning("Could not hash input %s: %s", path, exc)
+        return None
+
+
+def _git_commit() -> Optional[str]:
+    """Short HEAD sha of the checkout this ran from. None outside a repo."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def _guideline_sections_hash(sections: List[Dict[str, str]]) -> str:
@@ -2064,8 +2099,10 @@ class MultiAgentAnnotator:
         dependency_model: str = "en_core_web_trf",
         dependency_max_dep_distance: int = 4,
         dependency_max_candidates: int = 12,
+        input_path: Optional[Path] = None,
     ):
         self.max_rounds = max_rounds
+        self._input_path = Path(input_path) if input_path else None
         self.use_precedent_memory = use_precedent_memory
         self.precedent_store_path = Path(precedent_store_path) if precedent_store_path else None
 
@@ -2296,6 +2333,77 @@ class MultiAgentAnnotator:
         _register_tools_on_agents(self.critic,     self.critic_executor,    critic_tools)
         _register_tools_on_agents(self.adjudicator, self.adj_executor,      critic_tools)
 
+        # Built LAST so it captures EFFECTIVE config, not requested config.
+        self.run_meta = self._build_run_meta(
+            annotator_model=annotator_model,
+            critic_model=critic_model,
+            adjudicator_model=adjudicator_model,
+            requested_hints=use_dependency_relation_hints,
+            include_relation_schema=include_relation_schema,
+            tool_choice=tool_choice,
+            annotator_temperature=annotator_temperature,
+            max_rounds=max_rounds,
+            strict_critic=strict_critic,
+            cold_start=cold_start,
+            use_precedent_memory=use_precedent_memory,
+            dependency_model=dependency_model,
+        )
+
+    def _build_run_meta(self, **cfg) -> Dict[str, Any]:
+        """Provenance stamped onto every record this instance produces.
+
+        Two fields deserve explanation:
+
+        hints_effective vs hints_requested — use_dependency_relation_hints can be
+        overridden by the DEPENDENCY_RELATION_HINTS env var, and is force-disabled
+        if spaCy or the dependency_relations module is unavailable. The EFFECTIVE
+        value is the experimental arm; the requested one is what the caller asked
+        for. Recording only one of them has already made an arm unverifiable.
+
+        input_sha256 — ties a report to exact bytes. A raw run file was once
+        edited 16 minutes after being scored, which no mtime check catches once
+        the file is copied or moved.
+        """
+        eff_hints = bool(self.use_dependency_relation_hints)
+        meta: Dict[str, Any] = {
+            "input_path": str(self._input_path) if self._input_path else None,
+            "input_sha256": _file_sha256(self._input_path),
+            # ── the experimental arm ──
+            "use_dependency_relation_hints": eff_hints,
+            "hints_requested": bool(cfg.get("requested_hints")),
+            "include_relation_schema": bool(cfg.get("include_relation_schema")),
+            # ── models, as keys AND as resolved ids ──
+            "annotator_model": cfg.get("annotator_model"),
+            "critic_model": cfg.get("critic_model"),
+            "adjudicator_model": cfg.get("adjudicator_model"),
+            "resolved_models": {
+                role: (MODEL_ENDPOINTS.get(cfg.get(f"{role}_model")) or {}).get("model")
+                for role in ("annotator", "critic", "adjudicator")
+            },
+            # ── decoding: determines whether logprob headroom exists at all,
+            #    i.e. whether the RQ2 uncertainty signal is measurable ──
+            "annotator_temperature": cfg.get("annotator_temperature"),
+            "tool_choice": cfg.get("tool_choice"),
+            # ── everything else that changes behaviour ──
+            "max_rounds": cfg.get("max_rounds"),
+            "strict_critic": bool(cfg.get("strict_critic")),
+            "cold_start": bool(cfg.get("cold_start")),
+            "use_precedent_memory": bool(cfg.get("use_precedent_memory")),
+            "dependency_model": cfg.get("dependency_model") if eff_hints else None,
+            # ── code + resources ──
+            "git_commit": _git_commit(),
+            "guideline_sections_hash": _GUIDELINE_SECTIONS_HASH,
+            "schema_entity_types": len(_ALL_ENTITY_TYPES) or None,
+        }
+        if eff_hints != bool(cfg.get("requested_hints")):
+            logger.warning(
+                "Dependency hints requested=%s but EFFECTIVE=%s — the arm is %s. "
+                "Both values are stamped into every record.",
+                cfg.get("requested_hints"), eff_hints,
+                "ON" if eff_hints else "OFF",
+            )
+        return meta
+
     def annotate_sentence(
         self,
         sentence: str,
@@ -2312,7 +2420,8 @@ class MultiAgentAnnotator:
         2. Adjudicator receives the full Annotator↔Critic transcript
            and produces the final labels.
         """
-        record = DeliberationRecord(sentence=sentence)
+        record = DeliberationRecord(sentence=sentence,
+                                    run_meta=dict(getattr(self, "run_meta", {}) or {}))
         _sentence_t0 = time.perf_counter()
 
         # ── Build task message ────────────────────────────────

@@ -56,7 +56,7 @@ from eval_layer2_correlation import (
     _normalize,
 )
 from eval_layer1_output import sentence_f1
-from eval_utils import _spearman_rho, permutation_p_rho, fmt_p
+from eval_utils import _spearman_rho, permutation_p_rho, fmt_p, stamp_provenance
 
 N_BOOT = 2000
 SEED = 42
@@ -355,6 +355,7 @@ def main():
 
     if args.output:
         with args.output.open("w", encoding="utf8") as f:
+            stamp_provenance(report, args.agent_jsonl)
             json.dump(report, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
 

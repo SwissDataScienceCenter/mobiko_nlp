@@ -34,6 +34,8 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
+
+from eval_utils import stamp_provenance
 from typing import Any, Dict, List, Optional
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -229,6 +231,7 @@ def main():
 
     if args.output:
         with args.output.open("w", encoding="utf-8") as f:
+            stamp_provenance(result, args.agent_jsonl)
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"\n  Saved to {args.output}")
 

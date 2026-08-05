@@ -39,7 +39,7 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from eval_utils import bootstrap_ci, two_sample_bootstrap_p, fmt_ci, fmt_p
+from eval_utils import bootstrap_ci, two_sample_bootstrap_p, fmt_ci, fmt_p, stamp_provenance
 from deliberation_history import (
     load_records,
     try_parse_json,
@@ -284,6 +284,7 @@ def main():
             "guideline_recommendations": build_guideline_recommendations(report),
         }
         with args.output.open("w", encoding="utf8") as f:
+            stamp_provenance(out, args.agent_jsonl)
             json.dump(out, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
 

@@ -56,6 +56,8 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+from eval_utils import stamp_provenance
 from statistics import mean, pstdev
 from typing import Any, Dict, List, Tuple
 
@@ -409,6 +411,7 @@ def main():
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("w") as f:
+            stamp_provenance(out, args.agent_jsonl)
             json.dump(out, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
 

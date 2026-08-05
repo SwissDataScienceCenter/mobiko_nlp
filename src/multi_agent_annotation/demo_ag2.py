@@ -255,6 +255,7 @@ def run_live(
     dependency_model: str = "en_core_web_trf",
     dependency_max_dep_distance: int = 4,
     dependency_max_candidates: int = 12,
+    input_path: Path | None = None,
 ) -> None:
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
@@ -281,6 +282,7 @@ def run_live(
         dependency_model=dependency_model,
         dependency_max_dep_distance=dependency_max_dep_distance,
         dependency_max_candidates=dependency_max_candidates,
+        input_path=input_path,
     )
 
     records = annotator.annotate_batch(sentences, output_path=output_path, resume=resume, max_retries=max_retries)
@@ -472,6 +474,7 @@ def main() -> None:
         run_live(
             sentences=sentences,
             schema_path=schema_path,
+            input_path=(None if args.use_demo_sentences else args.input.resolve()),
             seeds_path=seeds_path,
             annotator_model=args.annotator_model,
             critic_model=args.critic_model,

@@ -22,6 +22,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+from eval_utils import stamp_provenance
 from typing import Any, Dict
 
 # Resolve flat imports: deliberation_history is at the package root; its
@@ -114,6 +116,7 @@ def main():
 
     if args.output:
         with args.output.open("w", encoding="utf8") as f:
+            stamp_provenance(report, args.agent_jsonl)
             json.dump(report, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
 

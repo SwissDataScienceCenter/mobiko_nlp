@@ -82,7 +82,16 @@ def two_sample_bootstrap_p(
 # ─────────────────────────────────────────────────────────────
 
 def _spearman_rho(x: List[float], y: List[float]) -> Optional[float]:
-    """Spearman rank correlation (handles ties via average ranks)."""
+    """
+    Spearman rank correlation = Pearson correlation of the average ranks.
+
+    NOTE: do NOT use the 1 - 6*sum(d^2)/(n(n^2-1)) shortcut here. That identity
+    only holds when there are NO ties, and several of our signals are binary or
+    near-constant (human_type_disagree 0/1, flagged_for_review 0/1,
+    rounds_used ~ always 2). With that much tying the shortcut is badly biased:
+    on a binary target with ~10% positives it returns rho ~ +0.36 for pure
+    noise. Pearson-on-ranks is tie-correct and matches scipy.stats.spearmanr.
+    """
     n = len(x)
     if n != len(y) or n < 3:
         return None
@@ -102,9 +111,14 @@ def _spearman_rho(x: List[float], y: List[float]) -> Optional[float]:
         return ranks
 
     rx, ry = _rank(x), _rank(y)
-    d_sq = sum((a - b) ** 2 for a, b in zip(rx, ry))
-    rho = 1 - (6 * d_sq) / (n * (n * n - 1))
-    return round(rho, 6)
+    mx = sum(rx) / n
+    my = sum(ry) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx)
+    vy = sum((b - my) ** 2 for b in ry)
+    if vx <= 0 or vy <= 0:          # a constant input has no rank variance
+        return None
+    return round(cov / math.sqrt(vx * vy), 6)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -264,3 +278,64 @@ def fmt_p(p: Optional[float]) -> str:
     if p < 0.05:
         return f"{p:.4f} *"
     return f"{p:.4f}"
+
+# ─────────────────────────────────────────────────────────────
+# Provenance
+# ─────────────────────────────────────────────────────────────
+
+def _sha256(path) -> Optional[str]:
+    import hashlib
+    from pathlib import Path as _P
+    try:
+        h = hashlib.sha256()
+        with _P(path).open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def stamp_provenance(report: dict, agent_jsonl, **extra) -> dict:
+    """Record WHICH BYTES this report scored, under report["provenance"].
+
+    None of the eval scripts previously recorded their input, so a report could
+    not be tied back to the file it came from. That is not hypothetical: one raw
+    run file was edited 16 minutes AFTER its reports were written, and the
+    reports silently described a file that no longer existed. Separately, three
+    byte-identical copies of one run now exist under names making contradictory
+    claims about the experimental arm — a filename cannot be trusted as identity,
+    only a hash can.
+
+    Cheap enough to call unconditionally: one hash of a few-MB file per report.
+    """
+    from pathlib import Path as _P
+    import datetime as _dt
+    p = _P(agent_jsonl) if agent_jsonl else None
+    prov = {
+        "agent_jsonl": str(p) if p else None,
+        "agent_jsonl_sha256": _sha256(p) if p else None,
+        "agent_jsonl_mtime": (
+            _dt.datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
+            if p and p.exists() else None
+        ),
+        "scored_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    # The run's own provenance, if the pipeline stamped it (records written after
+    # 2026-08-04 carry run_meta). Copied from the first record so a report says
+    # which experimental arm produced the data, not just which file.
+    try:
+        import json as _json
+        with _P(agent_jsonl).open() as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("{"):
+                    rm = (_json.loads(line) or {}).get("run_meta")
+                    if rm:
+                        prov["run_meta"] = rm
+                    break
+    except Exception:
+        pass
+    prov.update(extra)
+    report["provenance"] = prov
+    return report

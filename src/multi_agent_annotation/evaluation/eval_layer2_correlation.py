@@ -38,6 +38,7 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
         sys.path.insert(0, str(_p))
 
 from eval_utils import (
+    stamp_provenance,
     bootstrap_ci,
     permutation_p_rho,
     fisher_exact_pvalue,
@@ -614,6 +615,7 @@ def main():
             "sentence_correlations": corr["sentence_details"],
         }
         with args.output.open("w") as f:
+            stamp_provenance(out, args.agent_jsonl)
             json.dump(out, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
 

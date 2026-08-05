@@ -59,7 +59,7 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from eval_utils import fmt_ci, fmt_p, two_sample_bootstrap_p
+from eval_utils import fmt_ci, fmt_p, two_sample_bootstrap_p, stamp_provenance
 
 SCHEMA_V1_TO_V2: Dict[str, str] = {
     "BIOTIC COLLECTIVE ENTITY":  "BIOTIC ENTITY",
@@ -647,6 +647,7 @@ def main():
 
     if args.output:
         with args.output.open("w", encoding="utf8") as f:
+            stamp_provenance(results, args.agent_jsonl)
             json.dump(results, f, indent=2, ensure_ascii=False)
         print(f"\n  Results saved to {args.output}")
 
