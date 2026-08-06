@@ -49,6 +49,7 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     load_seeds,
     load_decision_support,
     load_guideline_from_docx,
+    load_guideline_from_md,
     _init_tool_state,
     _DEFAULT_DECISION_SUPPORT,
     _DEFAULT_GUIDELINE,
@@ -160,11 +161,17 @@ def run_dry(schema_path: Path, seeds_path: Path, guideline_search_backend: str =
         if _DEFAULT_DECISION_SUPPORT.exists()
         else []
     )
-    guidance_sections = (
-        load_guideline_from_docx(_DEFAULT_GUIDELINE)
-        if _DEFAULT_GUIDELINE.exists()
-        else []
-    )
+    # Dispatch on suffix: the default guideline is a .md file, and passing it to
+    # the .docx loader raises PackageNotFoundError. Mirrors the same branch in
+    # MultiAgentAnnotator.__init__.
+    if _DEFAULT_GUIDELINE.exists():
+        guidance_sections = (
+            load_guideline_from_docx(_DEFAULT_GUIDELINE)
+            if _DEFAULT_GUIDELINE.suffix.lower() == ".docx"
+            else load_guideline_from_md(_DEFAULT_GUIDELINE)
+        )
+    else:
+        guidance_sections = []
     print(f"[OK] Decision support: {len(decision_support_sections)} sections "
           f"(from {'file' if _DEFAULT_DECISION_SUPPORT.exists() else 'fallback'})")
     print(f"[OK] MoBiKo v2 guidance: {len(guidance_sections)} sections "
