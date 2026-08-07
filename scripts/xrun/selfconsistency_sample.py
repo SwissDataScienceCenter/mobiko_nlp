@@ -49,6 +49,8 @@ from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIOD
 from src.multi_agent_annotation.demo_ag2 import load_sentences  # noqa: E402
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (  # noqa: E402
     MultiAgentAnnotator,
+    _per_entity_type_logprobs,
+    last_content_token_logprobs,
 )
 
 
@@ -70,7 +72,16 @@ def main() -> None:
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--k", type=int, default=10,
                     help="samples per sentence (default 10)")
-    ap.add_argument("--num-sentences", type=int, default=None)
+    ap.add_argument("--num-sentences", type=int, default=None,
+                    help="how many sentences to sample, counting from --start")
+    ap.add_argument("--start", type=int, default=0,
+                    help="0-based offset into the sentence list. Use with "
+                         "--num-sentences to SHARD a run across parallel "
+                         "processes, each with its OWN --output, then cat the "
+                         "shards together. In-process threading is unsafe here: "
+                         "the pipeline's logprob capture is module-global and "
+                         "documented as relying on sequential use, so separate "
+                         "processes are the safe way to parallelise.")
     ap.add_argument("--annotator-temperature", type=float, default=None,
                     help="default None keeps the pipeline's 0.7 — the point is to "
                          "measure the configuration actually used, not a new one")
@@ -84,11 +95,20 @@ def main() -> None:
                     default=_REPO / "src/resources_updated/manual_seeds_filled.py")
     ap.add_argument("--resume", action="store_true",
                     help="skip sentences already in the output file")
+    ap.add_argument("--progress-file", type=Path, default=None,
+                    help="also append [PROG] lines here, so a long run can be "
+                         "watched with `tail -f` without the agent transcript")
     args = ap.parse_args()
 
     sentences = load_sentences(args.input.resolve())
+    _total = len(sentences)
+    if args.start:
+        sentences = sentences[args.start:]
     if args.num_sentences:
         sentences = sentences[: args.num_sentences]
+    if args.start or args.num_sentences:
+        print(f"[OK] shard: sentences {args.start}..{args.start + len(sentences) - 1} "
+              f"of {_total}", flush=True)
 
     done = set()
     if args.resume and args.output.exists():
@@ -122,8 +142,14 @@ def main() -> None:
     # transcript to stdout, so anything interleaved there is unfindable; stderr
     # keeps it separable ("2>progress.log", or grep PROG). flush=True because a
     # single call takes minutes and buffered output would look like a hang.
+    _pf = args.progress_file.open("a", encoding="utf-8") if args.progress_file else None
+
     def prog(msg):
-        print(f"[PROG] {msg}", file=sys.stderr, flush=True)
+        line = f"[PROG] {msg}"
+        print(line, file=sys.stderr, flush=True)
+        if _pf:
+            _pf.write(line + "\n")
+            _pf.flush()
 
     prog(f"annotator={args.annotator_model} t={meta.get('annotator_temperature')} "
          f"K={args.k} sentences={len(todo)} (of {len(sentences)}; "
@@ -151,9 +177,28 @@ def main() -> None:
                         failures += 1
                         samples.append(None)      # keep K aligned; scorer skips None
                     else:
+                        # Capture the REPORTED confidence for this same pass, so one
+                        # dataset holds both measures on the same spans. The pilot
+                        # showed qwen flipping labels on 35% of spans while its
+                        # logprobs read ~1.0000; storing both here lets us check
+                        # that disconnect directly instead of inferring it across
+                        # datasets. Same alignment call the pipeline uses for
+                        # annotator_entity_logprobs.
+                        lp_by_span = {}
+                        _toks = last_content_token_logprobs()
+                        if _toks:
+                            for lp in _per_entity_type_logprobs(_toks, parsed.entities):
+                                alts = lp.get("type_top_alternatives") or []
+                                lp_by_span[lp.get("text", "")] = {
+                                    "type_mean_logprob": lp.get("type_mean_logprob"),
+                                    "type_max_entropy": lp.get("type_max_entropy"),
+                                    "top1_prob": alts[0][1] if alts else None,
+                                }
                         # entity_type is canonicalised by the pydantic validator
-                        samples.append([{"text": e.text, "entity_type": e.entity_type}
-                                        for e in parsed.entities])
+                        samples.append([
+                            dict({"text": e.text, "entity_type": e.entity_type},
+                                 **lp_by_span.get(e.text, {}))
+                            for e in parsed.entities])
                 except Exception as exc:          # never lose the whole run to one call
                     failures += 1
                     samples.append(None)

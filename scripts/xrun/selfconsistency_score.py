@@ -61,9 +61,15 @@ def span_distributions(samples, min_detections):
             if not key or key in seen:
                 continue          # count a span once per sample
             seen.add(key)
-            rec = out.setdefault(key, {"labels": Counter(), "n_detected": 0})
+            rec = out.setdefault(key, {"labels": Counter(), "n_detected": 0,
+                                       "top1": [], "maxent": []})
             rec["labels"][ent.get("entity_type", "")] += 1
             rec["n_detected"] += 1
+            # reported confidence for THIS pass, when the sampler captured it
+            if ent.get("top1_prob") is not None:
+                rec["top1"].append(ent["top1_prob"])
+            if ent.get("type_max_entropy") is not None:
+                rec["maxent"].append(ent["type_max_entropy"])
     for rec in out.values():
         rec["k_usable"] = k
         rec["detection_rate"] = rec["n_detected"] / k if k else 0.0
@@ -74,6 +80,8 @@ def span_distributions(samples, min_detections):
         rec["label_entropy"] = -sum(
             (c / n) * math.log(c / n) for c in rec["labels"].values() if c) if n else 0.0
         rec["usable_for_typing"] = n >= min_detections
+        rec["mean_top1"] = (sum(rec["top1"]) / len(rec["top1"])) if rec["top1"] else None
+        rec["mean_maxent"] = (sum(rec["maxent"]) / len(rec["maxent"])) if rec["maxent"] else None
     return out
 
 
@@ -81,6 +89,7 @@ def score(records, human, min_detections):
     hnorm = {LP.norm(s): a for s, a in human.items()}
     typing_pairs, entropy_pairs, det_pairs = [], [], []
     modal_freqs, n_spans, n_sent = [], 0, 0
+    mech = []      # (flipped_across_samples, mean reported top-1, mean max-entropy)
     for rec in records:
         anns = hnorm.get(LP.norm(rec.get("sentence", "")))
         if not anns or len(anns) < 2:
@@ -98,6 +107,8 @@ def score(records, human, min_detections):
             if not d["usable_for_typing"]:
                 continue
             modal_freqs.append(d["modal_freq"])
+            if d["mean_top1"] is not None:
+                mech.append((d["modal_freq"] < 0.999, d["mean_top1"], d["mean_maxent"]))
             disagreed = bool(info["type_disagreed"])
             typing_pairs.append((d["typing_uncertainty"], disagreed))
             entropy_pairs.append((d["label_entropy"], disagreed))
@@ -106,6 +117,7 @@ def score(records, human, min_detections):
         "n_matched_spans": n_spans,
         "n_typing_spans": len(typing_pairs),
         "modal_freqs": modal_freqs,
+        "mechanism": mech,
         "typing": LP._group_compare(typing_pairs, higher_is_uncertain=True),
         "entropy": LP._group_compare(entropy_pairs, higher_is_uncertain=True),
         "detection": LP._group_compare(det_pairs, higher_is_uncertain=True),
@@ -154,6 +166,40 @@ def report(res, k_hint=None):
         print(f"  {name:28s} {rs:>8s} {ps:>9s} {n:6d}  {target}")
     print()
     print(f"  sentences paired with both humans: {res['n_sentences']}")
+
+    mech = res.get("mechanism") or []
+    if mech:
+        flip = [m for m in mech if m[0]]
+        same = [m for m in mech if not m[0]]
+        print()
+        print("=" * 78)
+        print("  MECHANISM — what did the model REPORT on spans it actually flipped?")
+        print("=" * 78)
+        print("  If the reported top-1 probability is ~1.0 even on spans where the")
+        print("  label demonstrably changed between samples, then token-level logprobs")
+        print("  are not measuring decision uncertainty: the label is already settled")
+        print("  by the reasoning before that token is emitted, so its probability is")
+        print("  ~1.0 whichever label the reasoning happened to land on.")
+        print()
+        print(f"  {'spans':28s} {'n':>5s} {'mean top-1':>11s} {'mean max-entropy':>17s}")
+        for name, grp in (("FLIPPED across samples", flip),
+                          ("unanimous across samples", same)):
+            if not grp:
+                print(f"  {name:28s} {0:5d}          --                --")
+                continue
+            t1 = sum(m[1] for m in grp) / len(grp)
+            me = [m[2] for m in grp if m[2] is not None]
+            ms = f"{sum(me)/len(me):17.5f}" if me else f"{'--':>17s}"
+            print(f"  {name:28s} {len(grp):5d} {t1:11.5f} {ms}")
+        if flip:
+            t1f = sum(m[1] for m in flip) / len(flip)
+            if t1f > 0.99:
+                print()
+                print("  >>> CONFIRMED. Spans the model flipped were reported at top-1 "
+                      f"{t1f:.5f}.")
+                print("      The logprob cannot see this uncertainty. Saturation "
+                      "measures how")
+                print("      early the decision is settled, NOT how certain the model is.")
 
 
 # ── offline self-test: validates the logic with no LLM and no data ──────────
