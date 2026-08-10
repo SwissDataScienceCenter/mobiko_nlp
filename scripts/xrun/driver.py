@@ -9,17 +9,13 @@ ROOT = Path("/home/katinska/mobiko_nlp")
 D = ROOT / "data"
 XR = ROOT / "output/eval_reports/cross_run_comparison"
 
-RUNS = {
-    "qwen35_v2":         D / "auto_annotated/datademo_manually_labeled2.jsonl",
-    "qwen36_35B":        D / "auto_annotated/datademo_manually_labeled_swissai-qwen3-35B-vllm",
-    "qwen36_35B_v3":     D / "auto_annotated/datademo_manually_labeled_qwen3-35B-vllm_v3",
-    "kimi27_v2":         D / "auto_annotated_local/datademo_manually_labeled_rcp-kimi-2.7_v2",
-    "kimi27_v3":         D / "auto_annotated_local/datademo_manually_labeled_rcp-kimi-2.7_v3",
-    "kimi27_dep":        D / "auto_annotated_local/datademo_manually_labeled_rcp-kimi-2.7_v1_dep",
-    "apertus70B_nodep":  D / "auto_annotated/datademo_manually_labeled_swissai-apertus-70B.jsonl",
-    "apertus70B_dep":    D / "auto_annotated/datademo_manually_labeled_dep_apertus70B_dep",
-    "apertus70B_dep_v2": D / "auto_annotated/datademo_manually_labeled_dep_apertus70B_dep_v2.dedup.jsonl",
-}
+# Runs are owned by aggregate.REGISTRY — the single source of truth. This dict
+# used to be maintained by hand and drifted: it silently missed three runs and
+# still pointed apertus70B_dep at a path that no longer exists. Deriving it means
+# adding a run in ONE place updates aggregate.py, matrix.py and this script.
+from aggregate import REGISTRY  # noqa: E402
+
+RUNS = {d: p for _, _, d, p in REGISTRY}
 
 print("=" * 78)
 print("MAPPING CHECK  (parity n must equal layer1.txt Mark eval-sentence count)")
