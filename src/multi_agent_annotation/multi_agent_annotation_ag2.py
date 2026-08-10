@@ -682,6 +682,18 @@ MODEL_ENDPOINTS = {
         "api_key_env": "RCP_API_KEY",
         "model": "moonshotai/Kimi-K2.7-Code",
         "reasoning": True,
+    },
+    "rcp-gpt-oss": {
+        "base_url": "https://inference.rcp.epfl.ch/v1",
+        "api_key_env": "RCP_API_KEY",
+        "model": "openai/gpt-oss-120b",
+        "reasoning": True,
+    },
+    "rcp-deepseek": {
+        "base_url": "https://inference.rcp.epfl.ch/v1",
+        "api_key_env": "RCP_API_KEY",
+        "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "reasoning": True,
     }
 }
 
@@ -989,15 +1001,26 @@ _FALLBACK_ENTITY_TYPES = [
 
 
 def _file_sha256(path: Optional[Path]) -> Optional[str]:
-    """Content hash of an input file, so a report can be tied to exact bytes."""
+    """Content hash of an input, so a report can be tied to exact bytes.
+
+    Handles DIRECTORIES too: load_sentences accepts a directory of .txt files,
+    and the default input is one. Digests the sorted (name, bytes) pairs so the
+    hash covers the whole input set and is stable across filesystem ordering.
+    """
     if not path:
         return None
     try:
         import hashlib
         h = hashlib.sha256()
-        with Path(path).open("rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
+        p = Path(path)
+        if p.is_dir():
+            for f in sorted(p.glob("*.txt")):
+                h.update(f.name.encode())
+                h.update(f.read_bytes())
+        else:
+            with p.open("rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
         return h.hexdigest()
     except OSError as exc:
         logger.warning("Could not hash input %s: %s", path, exc)
@@ -2341,7 +2364,9 @@ class MultiAgentAnnotator:
             requested_hints=use_dependency_relation_hints,
             include_relation_schema=include_relation_schema,
             tool_choice=tool_choice,
-            annotator_temperature=annotator_temperature,
+            annotator_temperature=annotator_temp,
+            critic_temperature=critic_temp,
+            adjudicator_temperature=adjudicator_temp,
             max_rounds=max_rounds,
             strict_critic=strict_critic,
             cold_start=cold_start,
@@ -2383,7 +2408,10 @@ class MultiAgentAnnotator:
             # ── decoding: determines whether logprob headroom exists at all,
             #    i.e. whether the RQ2 uncertainty signal is measurable ──
             "annotator_temperature": cfg.get("annotator_temperature"),
+            "critic_temperature": cfg.get("critic_temperature"),
+            "adjudicator_temperature": cfg.get("adjudicator_temperature"),
             "tool_choice": cfg.get("tool_choice"),
+            "annotator_top_logprobs": ANNOTATOR_TOP_LOGPROBS,
             # ── everything else that changes behaviour ──
             "max_rounds": cfg.get("max_rounds"),
             "strict_critic": bool(cfg.get("strict_critic")),

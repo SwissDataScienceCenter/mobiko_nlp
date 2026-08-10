@@ -88,6 +88,15 @@ REGISTRY = [
     ("Kimi-2.7", "dep", "kimi27_dep",
      D / "auto_annotated_local/datademo_manually_labeled_rcp-kimi-2.7_v1_dep"),
 
+    # openai/gpt-oss-120b via RCP, added 2026-08-06. FIRST RUN WHOSE ARM IS
+    # VERIFIABLE FROM THE DATA: its records carry run_meta with
+    # use_dependency_relation_hints=true and include_relation_schema=true, so
+    # this cell does not rest on a filename (caveat 7). Relation-schema ON is
+    # independently confirmed by its 8 relation types. No no-dep arm exists yet,
+    # so this model contributes no dep contrast.
+    ("GPT-OSS-120B", "dep", "gptoss_dep",
+     D / "auto_annotated_local/datademo_manually_labeled_rcp-gpt-oss_v1_dep"),
+
     ("Qwen3.5 (legacy)", "no-dep", "qwen35_v2",
      D / "auto_annotated/datademo_manually_labeled2.jsonl"),
 ]
@@ -99,7 +108,7 @@ CONDITIONS = ["no-dep", "dep"]
 MODEL_SHORT = {
     "Qwen3.6-35B": "Qwen3.6", "Apertus70B Jul": "ApJul",
     "Apertus70B Aug-noRS": "ApAug", "Kimi-2.7": "Kimi",
-    "Qwen3.5 (legacy)": "Qwen3.5",
+    "GPT-OSS-120B": "GPToss", "Qwen3.5 (legacy)": "Qwen3.5",
 }
 
 RQ2_SIGNALS = [
