@@ -49,6 +49,35 @@ MARK = _REPO / "data/aug_runs/combined_M_D_Mark_postprocessed.jsonl"
 DAV = _REPO / "data/aug_runs/combined_M_D_Davnah_merged_postprocessed.jsonl"
 
 
+def dedupe_records(records):
+    """One record per sentence — the copy with the most usable samples.
+
+    Shard files are opened in APPEND mode under --resume, so a shard launched
+    twice (or whose sentence range moved between launches) can end up holding the
+    same sentence more than once; `cat`-ing the shards then carries the duplicates
+    into the merge. This is not cosmetic: repeated sentences contribute their spans
+    twice, and duplicated observations are not independent, so they inflate n and
+    bias both rho and p. The qwen K=10 run merged 30 records from 28 sentences
+    exactly this way.
+
+    Deduping in the scorer rather than at merge time means any merged file is
+    scored correctly however it was produced — including the ones already written.
+
+    Returns (deduped records in first-seen order, [(sentence, times_seen), ...]).
+    """
+    best, order, seen = {}, [], Counter()
+    for rec in records:
+        key = rec.get("sentence", "")
+        seen[key] += 1
+        usable = sum(1 for s in rec.get("samples", []) if s is not None)
+        if key not in best:
+            best[key] = (usable, rec)
+            order.append(key)
+        elif usable > best[key][0]:
+            best[key] = (usable, rec)
+    return [best[k][1] for k in order], [(k, n) for k, n in seen.items() if n > 1]
+
+
 def span_distributions(samples, min_detections):
     """{normalised span text: {labels: Counter, n_detected, k_usable}}"""
     usable = [s for s in samples if s is not None]
@@ -230,8 +259,18 @@ def self_test():
     # None samples (parse failures) must not count toward K
     d3 = span_distributions([samples[0], None, samples[1]], min_detections=1)
     assert d3["alpha"]["k_usable"] == 2, d3["alpha"]
-    print("self-test OK — span distributions, thresholds, entropy and "
-          "parse-failure handling all behave as specified")
+    # duplicate records collapse to one, keeping the copy with most usable samples
+    full = {"sentence": "s1", "samples": samples}
+    partial = {"sentence": "s1", "samples": samples[:3] + [None] * 7}
+    other = {"sentence": "s2", "samples": samples}
+    ded, dups = dedupe_records([partial, full, other])
+    assert len(ded) == 2, ded
+    assert ded[0]["samples"] is samples, "kept the partial copy over the complete one"
+    assert dups == [("s1", 2)], dups
+    ded2, dups2 = dedupe_records([other, full])   # a clean file is left alone
+    assert len(ded2) == 2 and dups2 == [], (ded2, dups2)
+    print("self-test OK — span distributions, thresholds, entropy, "
+          "parse-failure handling and record dedupe all behave as specified")
 
 
 def main() -> None:
@@ -251,6 +290,15 @@ def main() -> None:
 
     records = [json.loads(l) for l in args.samples.read_text().splitlines()
                if l.strip().startswith("{")]
+    records, dups = dedupe_records(records)
+    if dups:
+        n_dropped = sum(n - 1 for _, n in dups)
+        print(f"!! DROPPED {n_dropped} duplicate record(s) across {len(dups)} "
+              f"sentence(s) — scoring {len(records)} unique sentences.")
+        print("   (a shard file was appended to more than once; see dedupe_records)")
+        for s, n in dups:
+            print(f"     x{n}  {s[:70]!r}")
+        print()
     human, names = L1.load_all_human_annotations([MARK, DAV])
     res = score(records, human, args.min_detections)
     meta = records[0].get("run_meta", {}) if records else {}
