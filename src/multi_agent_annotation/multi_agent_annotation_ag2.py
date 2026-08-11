@@ -35,6 +35,14 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from prompts import _annotator_system_msg, _critic_system_msg, _critic_system_msg_strict, _adjudicator_system_msg, _build_guideline_summary, LOW_CONFIDENCE_THRESHOLD
 from prompts import _annotator_system_msg_coldstart, _critic_system_msg_coldstart, _adjudicator_system_msg_coldstart
+import prompts as _prompts_mobiko
+import prompts_conll as _prompts_conll
+
+# The MoBiKo prompts are domain-specific well beyond the schema string (role
+# framing, inlined relation vocabulary, MoBiKo span-boundary conventions, worked
+# biodiversity examples), so a second corpus needs a parallel module rather than a
+# flag. Both expose the same names; PROMPT_MODULES selects between them.
+PROMPT_MODULES = {"mobiko": _prompts_mobiko, "conll": _prompts_conll}
 
 # Optional dependency-parser relation-candidate net (Option A). Imported lazily
 # — the module itself only loads spaCy when a hinter is actually constructed, so
@@ -2100,6 +2108,7 @@ class MultiAgentAnnotator:
         guideline_path: Optional[Path] = None,
         use_guideline: bool = True,
         use_decision_support: bool = True,
+        prompt_set: str = "mobiko",
         seeds_path: Optional[Path] = None,
         max_rounds: int = 3,
         entity_schema_str: Optional[str] = None,
@@ -2302,15 +2311,24 @@ class MultiAgentAnnotator:
         # an empty guideline would force fabrication or make the Critic rubber-stamp,
         # starving the loop of the disagreement signal it mines. Cold-start takes
         # precedence over strict_critic for the Critic's prompt.
+        try:
+            _P = PROMPT_MODULES[prompt_set]
+        except KeyError:
+            raise ValueError(
+                f"unknown prompt_set {prompt_set!r}; expected one of "
+                f"{sorted(PROMPT_MODULES)}") from None
         if cold_start:
-            _annotator_prompt_fn = _annotator_system_msg_coldstart
-            _critic_prompt_fn = _critic_system_msg_coldstart
-            _adjudicator_prompt_fn = _adjudicator_system_msg_coldstart
-            logger.info("prompt set: COLD-START (expertise-grounded; guideline treated as scaffold)")
+            _annotator_prompt_fn = _P._annotator_system_msg_coldstart
+            _critic_prompt_fn = _P._critic_system_msg_coldstart
+            _adjudicator_prompt_fn = _P._adjudicator_system_msg_coldstart
+            logger.info("prompt set: %s COLD-START (expertise-grounded; guideline treated as scaffold)",
+                        prompt_set)
         else:
-            _annotator_prompt_fn = _annotator_system_msg
-            _critic_prompt_fn = _critic_system_msg_strict if strict_critic else _critic_system_msg
-            _adjudicator_prompt_fn = _adjudicator_system_msg
+            _annotator_prompt_fn = _P._annotator_system_msg
+            _critic_prompt_fn = (_P._critic_system_msg_strict if strict_critic
+                                 else _P._critic_system_msg)
+            _adjudicator_prompt_fn = _P._adjudicator_system_msg
+            logger.info("prompt set: %s%s", prompt_set, " (strict critic)" if strict_critic else "")
 
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
@@ -2403,6 +2421,7 @@ class MultiAgentAnnotator:
             guideline_search_registered=any(
                 t[0] is guideline_search for t in annotator_tools),
             entity_types=list(entity_types_list) if entity_types_list else None,
+            prompt_set=prompt_set,
         )
 
     def _build_run_meta(self, **cfg) -> Dict[str, Any]:
@@ -2436,6 +2455,10 @@ class MultiAgentAnnotator:
             "guideline_path": cfg.get("effective_guideline_path"),
             "guideline_search_registered": cfg.get("guideline_search_registered"),
             "entity_types": cfg.get("entity_types"),
+            # Which prompt templates the agents actually ran with. Two corpora with
+            # structurally parallel but textually different prompts means a run is
+            # only interpretable if this is recorded alongside the scores.
+            "prompt_set": cfg.get("prompt_set"),
             # ── models, as keys AND as resolved ids ──
             "annotator_model": cfg.get("annotator_model"),
             "critic_model": cfg.get("critic_model"),

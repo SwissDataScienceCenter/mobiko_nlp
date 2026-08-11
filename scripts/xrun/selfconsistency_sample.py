@@ -87,6 +87,7 @@ CORPORA = {
         # the scored runs actually use).
         "schema": _REPO / "src/resources_updated/relation_schema_new.py",
         "seeds": _REPO / "src/resources_updated/manual_seeds_filled.py",
+        "prompt_set": "mobiko",
     },
     "conll": {
         "entity_schema": SCHEMA_CONLL_SHORT,
@@ -99,6 +100,9 @@ CORPORA = {
         # reports nothing valid instead of offering biodiversity relations.
         "schema": None,
         "seeds": None,
+        # Parallel prompt templates: newswire framing, no relations, CoNLL
+        # boundary conventions. See prompts_conll.
+        "prompt_set": "conll",
     },
 }
 
@@ -234,6 +238,7 @@ def main() -> None:
         use_decision_support=use_decision_support,
         entity_schema_str=preset["entity_schema"],
         entity_types_list=preset["entity_types"],
+        prompt_set=preset["prompt_set"],
         annotator_temperature=args.annotator_temperature,
         input_path=args.input.resolve(),
     )
@@ -263,7 +268,8 @@ def main() -> None:
          f"guideline_sections={meta.get('guideline_sections')} "
          f"decision_support={meta.get('decision_support_sections')} "
          f"guideline_search={meta.get('guideline_search_registered')} "
-         f"relations={'yes' if schema_path else 'none'}")
+         f"relations={'yes' if schema_path else 'none'} "
+         f"prompts={meta.get('prompt_set')}")
     prog(f"expect {len(todo) * args.k} annotator calls total")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
