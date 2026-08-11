@@ -35,7 +35,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -52,6 +54,36 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (  # noqa: E40
     _per_entity_type_logprobs,
     last_content_token_logprobs,
 )
+
+
+def _acquire_shard_lock(output: Path):
+    """Take an exclusive lock on this shard's output file, or exit.
+
+    Under --resume the output is opened in APPEND mode, so two launches of the
+    same shard each read the same set of already-done sentences and then each
+    append their own copy — writing every sentence twice. That is exactly how the
+    qwen K=10 run came to merge 30 records from 28 sentences, and duplicated
+    sentences are not independent observations: they inflate n and bias rho and p
+    in the scored report. The scorer now dedupes, but silently producing the
+    duplicates and paying for the extra calls is still worth preventing.
+
+    Failing fast here costs one syscall. The returned handle must stay referenced
+    for the life of the process: closing it releases the lock.
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output.with_name(output.name + ".lock")
+    fh = lock_path.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(
+            f"ERROR: another process is already writing {output}\n"
+            f"       (lock held on {lock_path})\n"
+            f"       Two samplers on one shard file append every sentence twice.\n"
+            f"       Wait for the running shard to finish, or pass a different --output.")
+    fh.write(f"pid {os.getpid()}\n")
+    fh.flush()
+    return fh
 
 
 def _label_variants(usable_samples):
@@ -99,6 +131,10 @@ def main() -> None:
                     help="also append [PROG] lines here, so a long run can be "
                          "watched with `tail -f` without the agent transcript")
     args = ap.parse_args()
+
+    # Held for the whole process — see _acquire_shard_lock. Taken before the model
+    # is constructed so a double launch fails instantly instead of after init.
+    _shard_lock = _acquire_shard_lock(args.output)  # noqa: F841
 
     sentences = load_sentences(args.input.resolve())
     _total = len(sentences)

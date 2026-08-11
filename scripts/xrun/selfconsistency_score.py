@@ -35,6 +35,7 @@ import math
 import sys
 from collections import Counter
 from pathlib import Path
+from random import Random
 
 _REPO = Path(__file__).resolve().parent.parent.parent
 for _p in (_REPO / "src" / "multi_agent_annotation",
@@ -47,6 +48,41 @@ import eval_layer1_output as L1  # noqa: E402
 
 MARK = _REPO / "data/aug_runs/combined_M_D_Mark_postprocessed.jsonl"
 DAV = _REPO / "data/aug_runs/combined_M_D_Davnah_merged_postprocessed.jsonl"
+
+
+def auc_lower(flipped, unanimous, n_boot=LP.N_BOOT, seed=LP.SEED):
+    """P(a flipped span is reported LESS confident than a unanimous one), + perm p.
+
+    The mechanism question is a DISCRIMINATION question — can the reported number
+    tell the two groups apart — so score it as one. Comparing group MEANS cannot:
+    on a saturated model both means round to ~1.0 and the difference lands in the
+    4th decimal, which looks like "no signal" whether or not one exists.
+
+    0.5 = the report is uninformative about flipping; 1.0 = perfect separation.
+    Ties score 0.5, so this equals Mann-Whitney U/(n1*n2) under mid-ranks.
+
+    p is a permutation test on the group labels, matching permutation_p_rho's
+    convention (same N_BOOT and SEED) so it sits on the same footing as the rho
+    values printed above it rather than importing a second statistical toolkit.
+    """
+    if not flipped or not unanimous:
+        return None, None
+
+    def _auc(fl, un):
+        wins = sum((1.0 if u > f else 0.5 if u == f else 0.0)
+                   for f in fl for u in un)
+        return wins / (len(fl) * len(un))
+
+    obs = _auc(flipped, unanimous)
+    pool = list(flipped) + list(unanimous)
+    n_f = len(flipped)
+    rng = Random(seed)
+    count = 0
+    for _ in range(n_boot):
+        rng.shuffle(pool)
+        if _auc(pool[:n_f], pool[n_f:]) >= obs:
+            count += 1
+    return obs, (count + 1) / (n_boot + 1)
 
 
 def dedupe_records(records):
@@ -141,12 +177,28 @@ def score(records, human, min_detections):
             disagreed = bool(info["type_disagreed"])
             typing_pairs.append((d["typing_uncertainty"], disagreed))
             entropy_pairs.append((d["label_entropy"], disagreed))
+    # Discrimination of the REPORTED confidence, computed here rather than in
+    # report() so the number lands in the saved JSON and can be cited directly.
+    fl, un = [m for m in mech if m[0]], [m for m in mech if not m[0]]
+    fl_t1, un_t1 = [m[1] for m in fl], [m[1] for m in un]
+    fl_me = [m[2] for m in fl if m[2] is not None]
+    un_me = [m[2] for m in un if m[2] is not None]
+    auc_t1, p_t1 = auc_lower(fl_t1, un_t1)
+    # entropy runs the other way: higher = less certain, so swap the groups
+    auc_me, p_me = auc_lower(un_me, fl_me) if (fl_me and un_me) else (None, None)
     return {
         "n_sentences": n_sent,
         "n_matched_spans": n_spans,
         "n_typing_spans": len(typing_pairs),
         "modal_freqs": modal_freqs,
         "mechanism": mech,
+        "mechanism_auc": {
+            "n_flipped": len(fl), "n_unanimous": len(un),
+            "top1_auc": auc_t1, "top1_perm_p": p_t1,
+            "maxentropy_auc": auc_me, "maxentropy_perm_p": p_me,
+            "top1_mean_gap": ((sum(un_t1) / len(un_t1)) - (sum(fl_t1) / len(fl_t1)))
+                             if (fl_t1 and un_t1) else None,
+        },
         "typing": LP._group_compare(typing_pairs, higher_is_uncertain=True),
         "entropy": LP._group_compare(entropy_pairs, higher_is_uncertain=True),
         "detection": LP._group_compare(det_pairs, higher_is_uncertain=True),
@@ -204,11 +256,14 @@ def report(res, k_hint=None):
         print("=" * 78)
         print("  MECHANISM — what did the model REPORT on spans it actually flipped?")
         print("=" * 78)
-        print("  If the reported top-1 probability is ~1.0 even on spans where the")
-        print("  label demonstrably changed between samples, then token-level logprobs")
-        print("  are not measuring decision uncertainty: the label is already settled")
-        print("  by the reasoning before that token is emitted, so its probability is")
-        print("  ~1.0 whichever label the reasoning happened to land on.")
+        print("  Sampling shows which spans the model is actually unsure about. The")
+        print("  question here is whether the REPORTED confidence knew: can top-1 tell")
+        print("  a span the model flipped from one it repeated K/K?")
+        print()
+        print("  Read AUC, not the group means. On a saturated model both means round")
+        print("  to ~1.0 and their difference sits in the 4th decimal, which reads as")
+        print("  'no signal' whether or not one is there. AUC asks the discrimination")
+        print("  question directly: 0.5 = the report is uninformative, 1.0 = perfect.")
         print()
         print(f"  {'spans':28s} {'n':>5s} {'mean top-1':>11s} {'mean max-entropy':>17s}")
         for name, grp in (("FLIPPED across samples", flip),
@@ -220,15 +275,37 @@ def report(res, k_hint=None):
             me = [m[2] for m in grp if m[2] is not None]
             ms = f"{sum(me)/len(me):17.5f}" if me else f"{'--':>17s}"
             print(f"  {name:28s} {len(grp):5d} {t1:11.5f} {ms}")
-        if flip:
-            t1f = sum(m[1] for m in flip) / len(flip)
-            if t1f > 0.99:
-                print()
-                print("  >>> CONFIRMED. Spans the model flipped were reported at top-1 "
-                      f"{t1f:.5f}.")
-                print("      The logprob cannot see this uncertainty. Saturation "
-                      "measures how")
-                print("      early the decision is settled, NOT how certain the model is.")
+        disc = res.get("mechanism_auc") or {}
+        auc, p = disc.get("top1_auc"), disc.get("top1_perm_p")
+        if auc is not None:
+            auc_e, p_e = disc.get("maxentropy_auc"), disc.get("maxentropy_perm_p")
+            spread = disc.get("top1_mean_gap")
+            print()
+            print(f"  {'discrimination':28s} {'AUC':>11s} {'perm p':>17s}")
+            print(f"  {'reported top-1':28s} {auc:11.3f} {p:17.4f}")
+            if auc_e is not None:
+                print(f"  {'reported max-entropy':28s} {auc_e:11.3f} {p_e:17.4f}")
+            print(f"  {'usable range (mean gap)':28s} {spread:11.5f}")
+            print()
+            if auc >= 0.85:
+                print("  >>> THE REPORT TRACKS THE FLIPS. Reported confidence separates")
+                print("      flipped from unanimous spans well, so for this model the")
+                print("      logprob is a working uncertainty instrument and should agree")
+                print("      with the sampling measure.")
+            elif p < 0.05:
+                print("  >>> SIGNAL PRESENT BUT COMPRESSED. The report does rank flipped")
+                print(f"      spans below unanimous ones (AUC {auc:.3f}, p={p:.4f}), but the")
+                print(f"      whole separation spans {spread:.5f} of probability mass. Squeezed")
+                print("      into that range it survives a rank test against a clean binary")
+                print("      target and dies against a noisy one like human disagreement —")
+                print("      which is how the RQ2 logprob correlation can be null here while")
+                print("      the sampling correlation is not. Report this as limited dynamic")
+                print("      range, NOT as the logprob being blind.")
+            else:
+                print("  >>> THE REPORT IS BLIND TO THE FLIPS. Reported confidence cannot")
+                print(f"      distinguish spans the model flipped (AUC {auc:.3f}, p={p:.4f}).")
+                print("      The label is settled by the reasoning before the token is")
+                print("      emitted, so its probability is ~1.0 whichever way it landed.")
 
 
 # ── offline self-test: validates the logic with no LLM and no data ──────────
@@ -269,8 +346,20 @@ def self_test():
     assert dups == [("s1", 2)], dups
     ded2, dups2 = dedupe_records([other, full])   # a clean file is left alone
     assert len(ded2) == 2 and dups2 == [], (ded2, dups2)
-    print("self-test OK — span distributions, thresholds, entropy, "
-          "parse-failure handling and record dedupe all behave as specified")
+    # AUC: perfect separation, blindness, and the all-ties case a saturated
+    # model produces (every reported value identical -> must read 0.5, not 1.0)
+    a_perf, p_perf = auc_lower([0.1] * 8, [0.9] * 8, n_boot=200)
+    assert a_perf == 1.0, a_perf
+    a_tie, p_tie = auc_lower([0.999] * 8, [0.999] * 8, n_boot=200)
+    assert a_tie == 0.5, a_tie
+    assert p_tie > 0.05, p_tie          # ties carry no evidence of separation
+    a_rev, _ = auc_lower([0.9] * 8, [0.1] * 8, n_boot=200)
+    assert a_rev == 0.0, a_rev          # flipped MORE confident -> 0, not 1
+    # half-tie: 1 of 2 unanimous above the flipped value, 1 equal -> 0.75
+    a_half, _ = auc_lower([0.5], [0.5, 0.9], n_boot=200)
+    assert abs(a_half - 0.75) < 1e-9, a_half
+    print("self-test OK — span distributions, thresholds, entropy, parse-failure "
+          "handling, record dedupe and discrimination AUC all behave as specified")
 
 
 def main() -> None:
