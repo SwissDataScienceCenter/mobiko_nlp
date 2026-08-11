@@ -46,6 +46,11 @@ for _p in (_REPO / "src" / "multi_agent_annotation",
 import eval_logprob_uncertainty as LP  # noqa: E402
 import eval_layer1_output as L1  # noqa: E402
 
+import eval_layer2_correlation as L2  # noqa: E402
+
+# MoBiKo defaults. Overridable with --human so the same scorer runs on any corpus
+# whose annotations are in the per-annotator JSONL shape (CoNLL-MTurk included,
+# where one file carries all annotators via the per-record "annotator" field).
 MARK = _REPO / "data/aug_runs/combined_M_D_Mark_postprocessed.jsonl"
 DAV = _REPO / "data/aug_runs/combined_M_D_Davnah_merged_postprocessed.jsonl"
 
@@ -150,33 +155,77 @@ def span_distributions(samples, min_detections):
     return out
 
 
-def score(records, human, min_detections):
+def _correlate(pairs, target):
+    """Uncertainty vs human disagreement, one dict shape for both target types.
+
+    Binary keeps the existing point-biserial path so published MoBiKo numbers do
+    not move. Graded uses _spearman_rho + permutation_p_rho — the same tie-correct
+    machinery already behind the RQ2 tables, so the two remain comparable. The
+    key names are shared deliberately; "measure" says which was used.
+    """
+    if target != "graded":
+        out = LP._group_compare(pairs, higher_is_uncertain=True)
+        if out is not None:
+            out["measure"] = "point_biserial"
+        return out
+    xs = [float(v) for v, _ in pairs if v is not None]
+    ys = [float(t) for v, t in pairs if v is not None]
+    if len(xs) < 3:
+        return {"point_biserial_rho": None, "point_biserial_p": None,
+                "n": len(xs), "measure": "spearman"}
+    return {
+        "point_biserial_rho": LP._spearman_rho(xs, ys),
+        "point_biserial_p": LP.permutation_p_rho(xs, ys, n_boot=LP.N_BOOT),
+        "n": len(xs),
+        "mean_uncertainty": sum(xs) / len(xs),
+        "mean_target": sum(ys) / len(ys),
+        "measure": "spearman",
+    }
+
+
+def score(records, human, min_detections, target="binary", min_span_annotators=1):
+    """target: 'binary' (MoBiKo, fixed 2 annotators) or 'graded' (variable count).
+
+    See L2.graded_disagreement for why a corpus with a variable annotator count
+    must not use the binary target. min_span_annotators drops spans marked by
+    fewer than that many annotators: on CoNLL 35% of union spans are marked by
+    exactly one of five, and those are largely idiosyncratic rather than
+    contested, so including them changes what "disagreement" means.
+    """
     hnorm = {LP.norm(s): a for s, a in human.items()}
     typing_pairs, entropy_pairs, det_pairs = [], [], []
     modal_freqs, n_spans, n_sent = [], 0, 0
+    n_dropped_singleton = 0
+    ann_counts = Counter()   # annotators per SCORED sentence, not per loaded one
     mech = []      # (flipped_across_samples, mean reported top-1, mean max-entropy)
     for rec in records:
         anns = hnorm.get(LP.norm(rec.get("sentence", "")))
         if not anns or len(anns) < 2:
             continue
         n_sent += 1
+        ann_counts[len(anns)] += 1
         dis = LP.compute_human_span_disagreements(anns)
         dists = span_distributions(rec.get("samples", []), min_detections)
         for key, d in dists.items():
             info = dis.get(key)
             if info is None:
-                continue          # span not located by either human
+                continue          # span not located by any human
+            if info.get("present_in", 0) < min_span_annotators:
+                n_dropped_singleton += 1
+                continue
             n_spans += 1
-            det_pairs.append((1.0 - d["detection_rate"],
-                              bool(info.get("presence_disagreed", False))))
+            grad_type, grad_pres = L2.graded_disagreement(info)
+            det_target = (grad_pres if target == "graded"
+                          else bool(info.get("presence_disagreed", False)))
+            det_pairs.append((1.0 - d["detection_rate"], det_target))
             if not d["usable_for_typing"]:
                 continue
             modal_freqs.append(d["modal_freq"])
             if d["mean_top1"] is not None:
                 mech.append((d["modal_freq"] < 0.999, d["mean_top1"], d["mean_maxent"]))
-            disagreed = bool(info["type_disagreed"])
-            typing_pairs.append((d["typing_uncertainty"], disagreed))
-            entropy_pairs.append((d["label_entropy"], disagreed))
+            typ_target = grad_type if target == "graded" else bool(info["type_disagreed"])
+            typing_pairs.append((d["typing_uncertainty"], typ_target))
+            entropy_pairs.append((d["label_entropy"], typ_target))
     # Discrimination of the REPORTED confidence, computed here rather than in
     # report() so the number lands in the saved JSON and can be cited directly.
     fl, un = [m for m in mech if m[0]], [m for m in mech if not m[0]]
@@ -199,9 +248,13 @@ def score(records, human, min_detections):
             "top1_mean_gap": ((sum(un_t1) / len(un_t1)) - (sum(fl_t1) / len(fl_t1)))
                              if (fl_t1 and un_t1) else None,
         },
-        "typing": LP._group_compare(typing_pairs, higher_is_uncertain=True),
-        "entropy": LP._group_compare(entropy_pairs, higher_is_uncertain=True),
-        "detection": LP._group_compare(det_pairs, higher_is_uncertain=True),
+        "target": target,
+        "annotators_per_scored_sentence": dict(sorted(ann_counts.items())),
+        "min_span_annotators": min_span_annotators,
+        "n_dropped_below_min_annotators": n_dropped_singleton,
+        "typing": _correlate(typing_pairs, target),
+        "entropy": _correlate(entropy_pairs, target),
+        "detection": _correlate(det_pairs, target),
     }
 
 
@@ -358,6 +411,24 @@ def self_test():
     # half-tie: 1 of 2 unanimous above the flipped value, 1 equal -> 0.75
     a_half, _ = auc_lower([0.5], [0.5, 0.9], n_boot=200)
     assert abs(a_half - 0.75) < 1e-9, a_half
+    # graded targets: unanimous span -> 0, evenly split -> 1-1/k, and presence
+    # scaled by how many annotators marked it (this is what the binary flag
+    # cannot express, and why a variable annotator count needs it)
+    gt, gp = L2.graded_disagreement(
+        {"types": {"PER": 5}, "present_in": 5, "total_annotators": 5})
+    assert gt == 0.0 and gp == 0.0, (gt, gp)
+    gt, gp = L2.graded_disagreement(
+        {"types": {"PER": 3, "ORG": 2}, "present_in": 5, "total_annotators": 5})
+    assert abs(gt - 0.4) < 1e-9 and gp == 0.0, (gt, gp)
+    gt, gp = L2.graded_disagreement(
+        {"types": {"PER": 1}, "present_in": 1, "total_annotators": 5})
+    assert gt == 0.0 and abs(gp - 0.8) < 1e-9, (gt, gp)
+    # the binary flag reads the SAME for these two, the graded one does not
+    lo = L2.graded_disagreement({"types": {"PER": 4, "ORG": 1},
+                                 "present_in": 5, "total_annotators": 5})[0]
+    hi = L2.graded_disagreement({"types": {"PER": 3, "ORG": 2},
+                                 "present_in": 5, "total_annotators": 5})[0]
+    assert lo < hi, (lo, hi)
     print("self-test OK — span distributions, thresholds, entropy, parse-failure "
           "handling, record dedupe and discrimination AUC all behave as specified")
 
@@ -367,6 +438,20 @@ def main() -> None:
     ap.add_argument("--samples", type=Path)
     ap.add_argument("--min-detections", type=int, default=5,
                     help="min samples a span must appear in to be scored for typing")
+    ap.add_argument("--human", type=Path, nargs="+", default=[MARK, DAV],
+                    help="human annotation JSONL(s). Default is the two MoBiKo "
+                         "annotators. For CoNLL-MTurk pass the single file that "
+                         "carries all annotators, e.g. "
+                         "data/conll_mturk/sample_n5_w10_400/humans.jsonl")
+    ap.add_argument("--target", choices=("binary", "graded"), default="binary",
+                    help="binary = 'did ANY annotator differ' (correct only at a "
+                         "FIXED annotator count, e.g. MoBiKo's 2). graded = "
+                         "1-modal_share and 1-detection_share, required when the "
+                         "annotator count varies. See L2.graded_disagreement.")
+    ap.add_argument("--min-span-annotators", type=int, default=1,
+                    help="drop spans marked by fewer than this many annotators. "
+                         "On CoNLL 35%% of union spans are marked by exactly one "
+                         "of five; 2 restricts to spans at least two people saw.")
     ap.add_argument("--output", type=Path, default=None)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -388,12 +473,33 @@ def main() -> None:
         for s, n in dups:
             print(f"     x{n}  {s[:70]!r}")
         print()
-    human, names = L1.load_all_human_annotations([MARK, DAV])
-    res = score(records, human, args.min_detections)
+    human, names = L1.load_all_human_annotations(list(args.human))
+    res = score(records, human, args.min_detections,
+                target=args.target, min_span_annotators=args.min_span_annotators)
     meta = records[0].get("run_meta", {}) if records else {}
     print(f"samples: {args.samples}")
     print(f"model:   {meta.get('annotator_model')}  t={meta.get('annotator_temperature')}  "
           f"K={meta.get('selfconsistency_k')}")
+    print(f"human:   {len(names)} annotator(s) from "
+          f"{', '.join(p.name for p in args.human)}")
+    print(f"target:  {args.target}"
+          + (f"   (min {args.min_span_annotators} annotators/span, "
+             f"{res['n_dropped_below_min_annotators']} spans dropped)"
+             if args.min_span_annotators > 1 else ""))
+    # The binary target is only meaningful at a fixed annotator count; warn rather
+    # than silently producing a number confounded with how many people saw each
+    # sentence. This is the failure mode that runs clean and reports nonsense.
+    # Counted over the sentences actually SCORED — the loaded file may contain
+    # singly-annotated sentences that score() already skips, and warning on those
+    # would cry wolf on every MoBiKo run.
+    counts = res["annotators_per_scored_sentence"]
+    if args.target == "binary" and len(counts) > 1:
+        print()
+        print(f"  !! WARNING: annotator count VARIES across scored sentences {counts}")
+        print("     but --target binary was used. Binary disagreement base rates")
+        print("     climb with annotator count, so this correlation is partly")
+        print("     measuring how many people saw each sentence. Use --target graded")
+        print("     and/or restrict the corpus to one annotator count.")
     print()
     report(res)
     if args.output:

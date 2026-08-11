@@ -189,6 +189,38 @@ def compute_human_span_disagreements(
     return results
 
 
+def graded_disagreement(info: Dict[str, Any]) -> Tuple[float, float]:
+    """(type_uncertainty, presence_uncertainty) in [0,1] for one span's info dict.
+
+    The booleans above answer "did ANY annotator differ", which is the right
+    question at a FIXED annotator count and the wrong one otherwise: their base
+    rates climb with the number of annotators, because more annotators means more
+    chances for one to differ and more chances for one to miss the span. Measured
+    on CoNLL-MTurk, binary presence disagreement runs 0% / 54% / 82% / 81% / 90% /
+    98% / 99.8% / 100% for 1..8 annotators — degenerate at the top, where it has
+    no variance left to correlate against.
+
+    These graded forms divide that out:
+        type      1 - modal_label_share among the annotators who marked the span
+        presence  1 - fraction of annotators who marked it at all
+    Both are also the exact functional form of the agent-side sampling measures
+    in selfconsistency_score.py (1 - modal_freq, 1 - detection_rate), so the human
+    and agent sides become the same measure — over annotators, and over samples.
+
+    NOTE this does NOT fully de-confound presence: the span UNION still grows with
+    annotator count, each extra annotator contributing idiosyncratic singletons
+    that score near-maximally by construction (graded presence still runs 0.270 ->
+    0.667 across 2..8 annotators). Grading is necessary, not sufficient — hold the
+    annotator count fixed as well.
+    """
+    type_counts = info.get("types") or {}
+    total = sum(type_counts.values())
+    type_u = 1.0 - (max(type_counts.values()) / total) if total else 0.0
+    n_ann = info.get("total_annotators") or 0
+    pres_u = 1.0 - (info.get("present_in", 0) / n_ann) if n_ann else 0.0
+    return type_u, pres_u
+
+
 # ─────────────────────────────────────────────────────────────
 # Agent disagreement extraction from deliberation messages
 # ─────────────────────────────────────────────────────────────

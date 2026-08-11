@@ -26,11 +26,22 @@ Only the annotator runs. No critic, no adjudicator, no deliberation, so cost is
 K annotator calls per sentence rather than K full records.
 
 Usage:
+    # MoBiKo (default corpus, unchanged behaviour)
     python scripts/xrun/selfconsistency_sample.py \
         --annotator-model qwen3-35B-vllm \
         --input data/manually_labeled_last \
         --output output/selfconsistency/qwen36_35B_K10.jsonl \
         --k 10
+
+    # CoNLL-2003 MTurk: 4-type schema, its own guideline, no relations/seeds
+    python scripts/xrun/selfconsistency_sample.py --corpus conll \
+        --annotator-model qwen3-35B-vllm \
+        --input data/conll_mturk/sample_n5_w10_400/sentences.txt \
+        --output output/selfconsistency/conll_qwen_K10.jsonl \
+        --k 10
+
+    # the guideline-free arm on either corpus
+    ... --corpus conll --no-guideline
 """
 from __future__ import annotations
 
@@ -48,12 +59,48 @@ for _p in (_REPO, _REPO / "src" / "multi_agent_annotation"):
         sys.path.insert(0, str(_p))
 
 from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIODIV_LIST  # noqa: E402
+from src.resources_updated.entity_schema_conll import (  # noqa: E402
+    SCHEMA_CONLL_SHORT, SCHEMA_CONLL_LIST)
 from src.multi_agent_annotation.demo_ag2 import load_sentences  # noqa: E402
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (  # noqa: E402
     MultiAgentAnnotator,
     _per_entity_type_logprobs,
     last_content_token_logprobs,
 )
+
+
+# ── corpus presets ──────────────────────────────────────────────────────────
+# One switch rather than six flags, because every resource here has a MoBiKo
+# default that applies SILENTLY when omitted: entity_types_list falls back to the
+# 15 biodiversity types, and guideline_path=None resolves to the MoBiKo guideline
+# rather than to no guideline. Setting them one at a time means a single forgotten
+# flag produces a run that looks fine and is annotating newswire against a
+# biodiversity schema. Selecting a named corpus sets all of them together.
+CORPORA = {
+    "mobiko": {
+        "entity_schema": SCHEMA_BIODIV_SHORT,
+        "entity_types": SCHEMA_BIODIV_LIST,
+        "guideline": None,            # None -> the pipeline's MoBiKo default
+        "decision_support": True,
+        # entity_schema.py holds the LABEL list; load_schema wants the RELATION
+        # schema, which is relation_schema_new.py (7 relations — the vocabulary
+        # the scored runs actually use).
+        "schema": _REPO / "src/resources_updated/relation_schema_new.py",
+        "seeds": _REPO / "src/resources_updated/manual_seeds_filled.py",
+    },
+    "conll": {
+        "entity_schema": SCHEMA_CONLL_SHORT,
+        "entity_types": SCHEMA_CONLL_LIST,
+        "guideline": _REPO / "src/multi_agent_annotation/CoNLL_label_guidance.md",
+        # MoBiKo's Decision_support.csv is biodiversity-specific; there is no
+        # CoNLL equivalent, and the annotator treats absence as an empty table.
+        "decision_support": False,
+        # CoNLL-2003 annotates no relations. None (not a path) so schema_lookup
+        # reports nothing valid instead of offering biodiversity relations.
+        "schema": None,
+        "seeds": None,
+    },
+}
 
 
 def _acquire_shard_lock(output: Path):
@@ -117,14 +164,21 @@ def main() -> None:
     ap.add_argument("--annotator-temperature", type=float, default=None,
                     help="default None keeps the pipeline's 0.7 — the point is to "
                          "measure the configuration actually used, not a new one")
-    # entity_schema.py holds the LABEL list; load_schema wants the RELATION
-    # schema, which is relation_schema_new.py (7 relations — the vocabulary the
-    # scored runs actually use). demo_ag2 has no defaults for these and requires
-    # them explicitly; defaults here keep the pilot a one-liner.
-    ap.add_argument("--schema", type=Path,
-                    default=_REPO / "src/resources_updated/relation_schema_new.py")
-    ap.add_argument("--seeds", type=Path,
-                    default=_REPO / "src/resources_updated/manual_seeds_filled.py")
+    ap.add_argument("--corpus", choices=sorted(CORPORA), default="mobiko",
+                    help="selects entity schema, guideline, decision support, "
+                         "relation schema and seeds together (see CORPORA). "
+                         "Individual flags below override the preset.")
+    ap.add_argument("--schema", type=Path, default=None,
+                    help="relation schema; defaults to the corpus preset")
+    ap.add_argument("--seeds", type=Path, default=None,
+                    help="relation seeds; defaults to the corpus preset")
+    ap.add_argument("--guideline", type=Path, default=None,
+                    help="guideline .md/.docx; defaults to the corpus preset")
+    ap.add_argument("--no-guideline", action="store_true",
+                    help="run with NO guideline at all. Needed because omitting "
+                         "--guideline means 'use the preset', not 'use none'.")
+    ap.add_argument("--no-decision-support", action="store_true",
+                    help="run with no decision-support table")
     ap.add_argument("--resume", action="store_true",
                     help="skip sentences already in the output file")
     ap.add_argument("--progress-file", type=Path, default=None,
@@ -160,14 +214,26 @@ def main() -> None:
     # guideline (a .md file) requires. Duplicating that here only creates a
     # second copy to drift from the pipeline, which is exactly how this script
     # first broke: it called the .docx loader on a .md path.
+    preset = CORPORA[args.corpus]
+    schema_path = args.schema or preset["schema"]
+    seeds_path = args.seeds or preset["seeds"]
+    guideline_path = args.guideline or preset["guideline"]
+    use_guideline = not args.no_guideline
+    use_decision_support = preset["decision_support"] and not args.no_decision_support
+
     annotator = MultiAgentAnnotator(
         annotator_model=args.annotator_model,
         critic_model=args.annotator_model,          # unused, must be constructible
         adjudicator_model=args.annotator_model,     # unused
-        schema_path=args.schema.resolve(),
-        seeds_path=args.seeds.resolve(),
-        entity_schema_str=SCHEMA_BIODIV_SHORT,
-        entity_types_list=SCHEMA_BIODIV_LIST,
+        # .resolve() only when a path was actually selected: the annotator treats
+        # None as "no relation schema / no seeds", which is what CoNLL needs.
+        schema_path=schema_path.resolve() if schema_path else None,
+        seeds_path=seeds_path.resolve() if seeds_path else None,
+        guideline_path=guideline_path.resolve() if guideline_path else None,
+        use_guideline=use_guideline,
+        use_decision_support=use_decision_support,
+        entity_schema_str=preset["entity_schema"],
+        entity_types_list=preset["entity_types"],
         annotator_temperature=args.annotator_temperature,
         input_path=args.input.resolve(),
     )
@@ -190,6 +256,14 @@ def main() -> None:
     prog(f"annotator={args.annotator_model} t={meta.get('annotator_temperature')} "
          f"K={args.k} sentences={len(todo)} (of {len(sentences)}; "
          f"{len(done)} already done) -> {args.output}")
+    # Echo the EFFECTIVE resources, not the requested ones. Every value here has
+    # a silent MoBiKo fallback, so a run annotating the wrong corpus looks
+    # completely normal unless the config is printed where the log will show it.
+    prog(f"corpus={args.corpus} types={meta.get('entity_types')} "
+         f"guideline_sections={meta.get('guideline_sections')} "
+         f"decision_support={meta.get('decision_support_sections')} "
+         f"guideline_search={meta.get('guideline_search_registered')} "
+         f"relations={'yes' if schema_path else 'none'}")
     prog(f"expect {len(todo) * args.k} annotator calls total")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
