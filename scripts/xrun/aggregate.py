@@ -97,6 +97,24 @@ REGISTRY = [
     ("GPT-OSS-120B", "dep", "gptoss_dep",
      D / "auto_annotated_local/datademo_manually_labeled_rcp-gpt-oss_v1_dep"),
 
+    # deepseek-ai/DeepSeek-V4-Flash-0731 via RCP, added 2026-08-11. Fifth model
+    # family, and the second run whose arm is verifiable from its own run_meta
+    # (use_dependency_relation_hints=true, hints_requested=true).
+    # TWO CAVEATS, both from run_meta rather than the filename:
+    #   1. include_relation_schema=FALSE — so this cell is noRS, like the
+    #      Apertus70B Aug-noRS rows and unlike gptoss_dep (schema ON). A future
+    #      DeepSeek no-dep arm must keep the schema OFF or the contrast is
+    #      confounded the way the July apertus one was.
+    #   2. PARTIAL RUN — 112 of the 155 gold sentences (112 unique, no
+    #      duplicates, one run_meta throughout). It stopped, it was not
+    #      subsampled, so the 112 are the first 112 in input order rather than a
+    #      random draw. n on every paired test here is ~110 instead of ~150,
+    #      which widens its CI by ~15% relative to a full run; the point
+    #      estimates are still on the same gold. Re-run to completion and
+    #      re-score before this row goes in a paper.
+    ("DeepSeek-V4-Flash", "dep", "deepseek_dep",
+     D / "auto_annotated_local/datademo_manually_labeled_rcp-deepseek_v1_dep"),
+
     ("Qwen3.5 (legacy)", "no-dep", "qwen35_v2",
      D / "auto_annotated/datademo_manually_labeled2.jsonl"),
 ]
@@ -108,7 +126,8 @@ CONDITIONS = ["no-dep", "dep"]
 MODEL_SHORT = {
     "Qwen3.6-35B": "Qwen3.6", "Apertus70B Jul": "ApJul",
     "Apertus70B Aug-noRS": "ApAug", "Kimi-2.7": "Kimi",
-    "GPT-OSS-120B": "GPToss", "Qwen3.5 (legacy)": "Qwen3.5",
+    "GPT-OSS-120B": "GPToss", "DeepSeek-V4-Flash": "DSeek",
+    "Qwen3.5 (legacy)": "Qwen3.5",
 }
 
 RQ2_SIGNALS = [
@@ -281,7 +300,55 @@ def table_rq1_text():
     L.append(f"  {'HUMAN CEILING':20s} {'':6s}  --   --  "
              f"{'0.478':>13s}  {'0.478':>13s}  {'0.781':>13s}"
              f"      --   0.000   (by definition)")
+    L += _coverage_warnings()
     return "\n".join(L)
+
+
+def _coverage_warnings():
+    """Flag cells whose n is materially below the rest.
+
+    The printed HUMAN CEILING row is the Mark<->Davnah score on the FULL gold,
+    but a run that covered only part of it is scored against the ceiling on ITS
+    subset, which can differ by more than the gaps in this table (deepseek_dep:
+    0.493 vs 0.478). The gap/CI/t/TOST columns are paired per sentence and are
+    unaffected; the raw F1 and kappa columns are not comparable across rows of
+    very different n. Nothing else in the pipeline surfaces this, so say it here.
+    """
+    ns = {(m, c): r["n"] for m in MODELS for c in CONDITIONS
+          if (r := rq1_cell(m, c)) is not None}
+    if not ns:
+        return []
+    top = max(ns.values())
+    short = {k: n for k, n in ns.items() if n < 0.9 * top}
+    if not short:
+        return []
+    out = ["", "  PARTIAL-COVERAGE WARNING — these cells do not share the ceiling row:"]
+    for (m, c), n in sorted(short.items(), key=lambda kv: kv[1]):
+        own = _own_ceiling(m, c)
+        ceil = f"its own ceiling is {own:.3f} vs the 0.478 printed above" if own \
+            else "its own ceiling could not be read from layer1.json"
+        out.append(f"    {m:20s} {c:6s} n={n:3d} of {top} ({n / top:.0%}) — {ceil}. "
+                   f"Gap/CI/t/TOST are paired and fine; the F1 and kappa columns "
+                   f"are not comparable across rows of very different n.")
+    return out
+
+
+def _own_ceiling(model, cond):
+    """Mark<->Davnah strict F1 on the sentences this cell actually scored, read
+    from the stored layer1 reports (same source as the 0.478 in the ceiling row).
+    Averaged over the cell's runs. None if unreadable."""
+    import json
+    vals = []
+    for d, _ in cell_runs(model, cond):
+        f = XR / d / "layer1.json"
+        if not f.exists():
+            continue
+        try:
+            ih = json.loads(f.read_text())["inter_human"]
+            vals.append(next(iter(ih.values()))["strict"]["f1"])
+        except (KeyError, StopIteration, ValueError, TypeError):
+            continue
+    return float(np.mean(vals)) if vals else None
 
 
 def table_rq2_text():
@@ -357,6 +424,10 @@ def latex_rq1():
             r"\bottomrule", r"\end{tabular}",
             r"% $^{*}$ gap differs from the human ceiling at $p<0.05$ "
             r"(paired $t$, two-sided)."]
+    # The ceiling row is the FULL-gold value; a partial-coverage cell is scored
+    # against the ceiling on its own subset. Carry that into the LaTeX too, so a
+    # table pasted into a paper cannot lose the caveat.
+    out += ["% " + w.strip() for w in _coverage_warnings() if w.strip()]
     return "\n".join(out)
 
 

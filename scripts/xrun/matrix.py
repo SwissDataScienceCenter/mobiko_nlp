@@ -23,7 +23,7 @@ SHORT = {
     "kimi27_dep": "k27dep", "apertus70B_nodep": "apNO",
     "apertus70B_dep": "apD1", "apertus70B_dep_v2": "apD2",
     "apertus70B_nodep_v3": "apNO3", "apertus70B_dep_v3": "apD3", "apertus70B_dep_v3": "apD3",
-    "gptoss_dep": "gptD",
+    "gptoss_dep": "gptD", "deepseek_dep": "dsD",
 }
 # report order: no-dep runs of a model, then its dep runs, models in registry order
 ORDER = [d for _, c, d, _ in REGISTRY if c == "no-dep"] + \
