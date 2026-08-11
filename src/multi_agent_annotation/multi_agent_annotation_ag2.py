@@ -1561,7 +1561,7 @@ def _make_structured_termination_check(
 
 _THIS_DIR = Path(__file__).resolve().parent
 _DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision_support.csv"
-_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo_label_guidance_v3.md"
+_DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo_label_guidance_v4.md"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2098,6 +2098,8 @@ class MultiAgentAnnotator:
         schema_path: Optional[Path] = None,
         decision_support_path: Optional[Path] = None,
         guideline_path: Optional[Path] = None,
+        use_guideline: bool = True,
+        use_decision_support: bool = True,
         seeds_path: Optional[Path] = None,
         max_rounds: int = 3,
         entity_schema_str: Optional[str] = None,
@@ -2173,23 +2175,39 @@ class MultiAgentAnnotator:
         seeds = load_seeds(seeds_path) if seeds_path else {}
 
         # Decision support doc → Annotator system prompt (compact decision table)
-        ds_path = decision_support_path or _DEFAULT_DECISION_SUPPORT
-        decision_support_sections = (
-            load_decision_support(ds_path)
-            if ds_path and ds_path.exists()
-            else []
-        )
+        #
+        # use_decision_support / use_guideline exist because `None` CANNOT mean
+        # "no guideline" here: the `or _DEFAULT_*` fallback below turns None into
+        # the MoBiKo biodiversity documents. On another corpus that silently
+        # injects the wrong domain's guidance and nothing errors — the run just
+        # quietly stops being the experiment you meant to run. An explicit flag is
+        # the only safe way to express absence.
+        if use_decision_support:
+            ds_path = decision_support_path or _DEFAULT_DECISION_SUPPORT
+            decision_support_sections = (
+                load_decision_support(ds_path)
+                if ds_path and ds_path.exists()
+                else []
+            )
+        else:
+            decision_support_sections = []
+            logger.info("Decision support disabled.")
 
         # Narrative guideline → Critic & Adjudicator system prompts (edge cases, tiebreaker)
         # Prefers .md; falls back to .docx if the resolved path has a .docx suffix.
-        gl_path = guideline_path or _DEFAULT_GUIDELINE
-        if gl_path and gl_path.exists():
-            if gl_path.suffix.lower() == ".docx":
-                guidance_sections = load_guideline_from_docx(gl_path)
+        gl_path = None
+        if use_guideline:
+            gl_path = guideline_path or _DEFAULT_GUIDELINE
+            if gl_path and gl_path.exists():
+                if gl_path.suffix.lower() == ".docx":
+                    guidance_sections = load_guideline_from_docx(gl_path)
+                else:
+                    guidance_sections = load_guideline_from_md(gl_path)
             else:
-                guidance_sections = load_guideline_from_md(gl_path)
+                guidance_sections = []
         else:
             guidance_sections = []
+            logger.info("Guideline disabled.")
 
         # guideline_search tool searches across both documents combined
         all_sections = decision_support_sections + guidance_sections
@@ -2352,6 +2370,13 @@ class MultiAgentAnnotator:
         else:
             annotator_tools = [t for t in ANNOTATOR_TOOL_FUNCTIONS if t[0] is not lookup_precedent]
             critic_tools = [t for t in CRITIC_TOOL_FUNCTIONS if t[0] is not lookup_precedent]
+        # No sections to search means guideline_search can only ever return
+        # nothing. Offering it anyway spends tokens on a tool call that cannot
+        # help and invites the model to treat the empty result as evidence.
+        if not all_sections:
+            annotator_tools = [t for t in annotator_tools if t[0] is not guideline_search]
+            critic_tools = [t for t in critic_tools if t[0] is not guideline_search]
+            logger.info("guideline_search not registered: no guideline sections loaded.")
         _register_tools_on_agents(self.annotator,  self.annotator_executor, annotator_tools)
         _register_tools_on_agents(self.critic,     self.critic_executor,    critic_tools)
         _register_tools_on_agents(self.adjudicator, self.adj_executor,      critic_tools)
@@ -2372,6 +2397,12 @@ class MultiAgentAnnotator:
             cold_start=cold_start,
             use_precedent_memory=use_precedent_memory,
             dependency_model=dependency_model,
+            n_guideline_sections=len(guidance_sections),
+            n_decision_support_sections=len(decision_support_sections),
+            effective_guideline_path=str(gl_path) if gl_path else None,
+            guideline_search_registered=any(
+                t[0] is guideline_search for t in annotator_tools),
+            entity_types=list(entity_types_list) if entity_types_list else None,
         )
 
     def _build_run_meta(self, **cfg) -> Dict[str, Any]:
@@ -2397,6 +2428,14 @@ class MultiAgentAnnotator:
             "use_dependency_relation_hints": eff_hints,
             "hints_requested": bool(cfg.get("requested_hints")),
             "include_relation_schema": bool(cfg.get("include_relation_schema")),
+            # EFFECTIVE, not requested: which guidance the run actually had, and
+            # from where. "guideline-free" is a claim about the run that must be
+            # checkable from the output, not taken on trust from the launch command.
+            "guideline_sections": cfg.get("n_guideline_sections"),
+            "decision_support_sections": cfg.get("n_decision_support_sections"),
+            "guideline_path": cfg.get("effective_guideline_path"),
+            "guideline_search_registered": cfg.get("guideline_search_registered"),
+            "entity_types": cfg.get("entity_types"),
             # ── models, as keys AND as resolved ids ──
             "annotator_model": cfg.get("annotator_model"),
             "critic_model": cfg.get("critic_model"),
