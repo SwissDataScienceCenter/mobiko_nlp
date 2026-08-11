@@ -692,6 +692,8 @@ TEMPORAL PROPERTY (DEFINITION: A temporal descriptor or metric, e.g., annual, de
 QUANTITATIVE PROPERTY (DEFINITION: A measurable attribute that can be expressed as a quantity, e.g., rate, mean, percentage, index)
 
 QUALITATIVE PROPERTY (DEFINITION: A non-numeric attribute that describes a quality or category, e.g., high/low, present/absent, increasing/decreasing, good/poor)
+
+CONCEPT (DEFINITION: An abstract concept or theoretical construct used in discourse (not directly a material object or process), e.g., biodiversity, resilience)
 """
 
 SCHEMA_BIODIV_LIST = [
