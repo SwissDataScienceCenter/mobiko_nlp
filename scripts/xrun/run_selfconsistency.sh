@@ -28,6 +28,14 @@ OUTDIR="${OUTDIR:-output/selfconsistency}"
 PYTHON="${PYTHON:-python3}"
 RESUME="${RESUME:-1}"
 PLAN="${PLAN:-0}"
+# Corpus preset: selects entity schema, guideline, decision support, relation
+# schema, seeds and prompt templates together (see src/multi_agent_annotation/
+# corpora.py). Without this the sampler silently uses MoBiKo's schema and prompts,
+# so a CoNLL input would be annotated with biodiversity types.
+CORPUS="${CORPUS:-mobiko}"
+GUIDELINE="${GUIDELINE:-}"                  # override the preset's guideline
+NO_GUIDELINE="${NO_GUIDELINE:-0}"           # 1 = run with no guideline at all
+NO_DECISION_SUPPORT="${NO_DECISION_SUPPORT:-0}"
 
 # Repo root from this script's location, so it works from any CWD and on any
 # checkout (this is run on a different machine from where it was written).
@@ -46,6 +54,27 @@ if (( K < 5 )); then
   exit 2
 fi
 
+CORPUS_ARGS=(--corpus "$CORPUS")
+[[ -n "$GUIDELINE" ]] && CORPUS_ARGS+=(--guideline "$GUIDELINE")
+[[ "$NO_GUIDELINE" == "1" ]] && CORPUS_ARGS+=(--no-guideline)
+[[ "$NO_DECISION_SUPPORT" == "1" ]] && CORPUS_ARGS+=(--no-decision-support)
+
+# Soft guard on the single most damaging misconfiguration: the input belongs to
+# one corpus and CORPUS names the other. The run would complete normally and
+# annotate the text against the wrong schema with the wrong prompts, and nothing
+# downstream would flag it. Heuristic on the path, so it warns rather than blocks.
+case "$INPUT" in
+  *conll*) INPUT_LOOKS=conll ;;
+  *)       INPUT_LOOKS=mobiko ;;
+esac
+if [[ "$INPUT_LOOKS" != "$CORPUS" ]]; then
+  echo "  !! WARNING: CORPUS=$CORPUS but the input path looks like '$INPUT_LOOKS':" >&2
+  echo "     $INPUT" >&2
+  echo "     If that is wrong, the text will be annotated against the other" >&2
+  echo "     corpus's schema and prompts, and the run will still look normal." >&2
+  echo >&2
+fi
+
 MERGED="$OUTDIR/${TAG}_K${K}.jsonl"
 REPORT="$OUTDIR/${TAG}_K${K}_report.json"
 
@@ -55,6 +84,7 @@ echo "======================================================================"
 echo "  repo        $ROOT"
 echo "  python      $PYTHON"
 echo "  model       $MODEL"
+echo "  corpus      $CORPUS  (${CORPUS_ARGS[*]})"
 echo "  input       $INPUT"
 echo "  K           $K samples per sentence"
 echo "  sentences   $SENTENCES  ($SHARDS shards x $PER_SHARD)"
@@ -91,6 +121,7 @@ for (( i=0; i<SHARDS; i++ )); do
   shard_out+=("$out"); shard_log+=("$log")
   "$PYTHON" scripts/xrun/selfconsistency_sample.py \
       --annotator-model "$MODEL" \
+      "${CORPUS_ARGS[@]}" \
       --input "$INPUT" \
       --output "$out" \
       --k "$K" \
