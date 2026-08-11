@@ -322,14 +322,15 @@ def _coverage_warnings():
     short = {k: n for k, n in ns.items() if n < 0.9 * top}
     if not short:
         return []
-    out = ["", "  PARTIAL-COVERAGE WARNING — these cells do not share the ceiling row:"]
+    out = ["", "  PARTIAL-COVERAGE NOTE — these cells score materially fewer sentences.",
+           "  Their own Mark<->Davnah ceiling is shown; where it differs from the 0.478",
+           "  in the row above, the F1/kappa columns are not comparable across rows:"]
     for (m, c), n in sorted(short.items(), key=lambda kv: kv[1]):
         own = _own_ceiling(m, c)
-        ceil = f"its own ceiling is {own:.3f} vs the 0.478 printed above" if own \
-            else "its own ceiling could not be read from layer1.json"
+        ceil = (f"own ceiling {own:.3f} ({'same as' if abs(own - 0.478) < 0.005 else 'DIFFERS from'}"
+                f" the ceiling row)") if own else "own ceiling unreadable from layer1.json"
         out.append(f"    {m:20s} {c:6s} n={n:3d} of {top} ({n / top:.0%}) — {ceil}. "
-                   f"Gap/CI/t/TOST are paired and fine; the F1 and kappa columns "
-                   f"are not comparable across rows of very different n.")
+                   f"Gap/CI/t/TOST are paired per sentence and unaffected either way.")
     return out
 
 
