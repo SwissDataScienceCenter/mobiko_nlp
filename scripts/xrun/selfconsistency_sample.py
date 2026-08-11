@@ -58,9 +58,7 @@ for _p in (_REPO, _REPO / "src" / "multi_agent_annotation"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIODIV_LIST  # noqa: E402
-from src.resources_updated.entity_schema_conll import (  # noqa: E402
-    SCHEMA_CONLL_SHORT, SCHEMA_CONLL_LIST)
+from src.multi_agent_annotation.corpora import CORPORA, resolve as resolve_corpus  # noqa: E402
 from src.multi_agent_annotation.demo_ag2 import load_sentences  # noqa: E402
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (  # noqa: E402
     MultiAgentAnnotator,
@@ -69,42 +67,6 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (  # noqa: E40
 )
 
 
-# ── corpus presets ──────────────────────────────────────────────────────────
-# One switch rather than six flags, because every resource here has a MoBiKo
-# default that applies SILENTLY when omitted: entity_types_list falls back to the
-# 15 biodiversity types, and guideline_path=None resolves to the MoBiKo guideline
-# rather than to no guideline. Setting them one at a time means a single forgotten
-# flag produces a run that looks fine and is annotating newswire against a
-# biodiversity schema. Selecting a named corpus sets all of them together.
-CORPORA = {
-    "mobiko": {
-        "entity_schema": SCHEMA_BIODIV_SHORT,
-        "entity_types": SCHEMA_BIODIV_LIST,
-        "guideline": None,            # None -> the pipeline's MoBiKo default
-        "decision_support": True,
-        # entity_schema.py holds the LABEL list; load_schema wants the RELATION
-        # schema, which is relation_schema_new.py (7 relations — the vocabulary
-        # the scored runs actually use).
-        "schema": _REPO / "src/resources_updated/relation_schema_new.py",
-        "seeds": _REPO / "src/resources_updated/manual_seeds_filled.py",
-        "prompt_set": "mobiko",
-    },
-    "conll": {
-        "entity_schema": SCHEMA_CONLL_SHORT,
-        "entity_types": SCHEMA_CONLL_LIST,
-        "guideline": _REPO / "src/multi_agent_annotation/CoNLL_label_guidance.md",
-        # MoBiKo's Decision_support.csv is biodiversity-specific; there is no
-        # CoNLL equivalent, and the annotator treats absence as an empty table.
-        "decision_support": False,
-        # CoNLL-2003 annotates no relations. None (not a path) so schema_lookup
-        # reports nothing valid instead of offering biodiversity relations.
-        "schema": None,
-        "seeds": None,
-        # Parallel prompt templates: newswire framing, no relations, CoNLL
-        # boundary conventions. See prompts_conll.
-        "prompt_set": "conll",
-    },
-}
 
 
 def _acquire_shard_lock(output: Path):
@@ -218,29 +180,18 @@ def main() -> None:
     # guideline (a .md file) requires. Duplicating that here only creates a
     # second copy to drift from the pipeline, which is exactly how this script
     # first broke: it called the .docx loader on a .md path.
-    preset = CORPORA[args.corpus]
-    schema_path = args.schema or preset["schema"]
-    seeds_path = args.seeds or preset["seeds"]
-    guideline_path = args.guideline or preset["guideline"]
-    use_guideline = not args.no_guideline
-    use_decision_support = preset["decision_support"] and not args.no_decision_support
+    corpus_kwargs = resolve_corpus(
+        args.corpus, schema=args.schema, seeds=args.seeds, guideline=args.guideline,
+        no_guideline=args.no_guideline, no_decision_support=args.no_decision_support)
+    schema_path = corpus_kwargs["schema_path"]   # for the progress line below
 
     annotator = MultiAgentAnnotator(
         annotator_model=args.annotator_model,
         critic_model=args.annotator_model,          # unused, must be constructible
         adjudicator_model=args.annotator_model,     # unused
-        # .resolve() only when a path was actually selected: the annotator treats
-        # None as "no relation schema / no seeds", which is what CoNLL needs.
-        schema_path=schema_path.resolve() if schema_path else None,
-        seeds_path=seeds_path.resolve() if seeds_path else None,
-        guideline_path=guideline_path.resolve() if guideline_path else None,
-        use_guideline=use_guideline,
-        use_decision_support=use_decision_support,
-        entity_schema_str=preset["entity_schema"],
-        entity_types_list=preset["entity_types"],
-        prompt_set=preset["prompt_set"],
         annotator_temperature=args.annotator_temperature,
         input_path=args.input.resolve(),
+        **corpus_kwargs,
     )
     meta = dict(annotator.run_meta)
     meta["selfconsistency_k"] = args.k

@@ -40,6 +40,7 @@ if load_dotenv is not None:
     load_dotenv(os.getenv("MOBIKO_ENV_FILE") or _REPO_ROOT / ".env", override=False)
 
 from src.resources_updated.entity_schema import SCHEMA_BIODIV_SHORT, SCHEMA_BIODIV_LIST
+from src.multi_agent_annotation.corpora import add_corpus_args, resolve as resolve_corpus
 import src.multi_agent_annotation.multi_agent_annotation_ag2 as _ann_mod
 from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     MultiAgentAnnotator,
@@ -263,17 +264,24 @@ def run_live(
     dependency_max_dep_distance: int = 4,
     dependency_max_candidates: int = 12,
     input_path: Path | None = None,
+    corpus_kwargs: dict | None = None,
 ) -> None:
+    # Defaults to MoBiKo so existing callers that never heard of corpora keep
+    # their exact previous behaviour.
+    corpus_kwargs = dict(corpus_kwargs or resolve_corpus("mobiko"))
+    # schema/seeds are also accepted as positional args by long-standing callers;
+    # those win, since they were resolved from the CLI in main().
+    corpus_kwargs["schema_path"] = schema_path
+    corpus_kwargs["seeds_path"] = seeds_path
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
         critic_model=critic_model,
         adjudicator_model=adjudicator_model,
-        schema_path=schema_path,
-        # Defaults point to docs in src/multi_agent_annotation/ — no explicit paths needed
-        seeds_path=seeds_path,
+        # schema_path/seeds_path/guideline_path/use_guideline/use_decision_support/
+        # entity_schema_str/entity_types_list/prompt_set all come from the corpus
+        # preset, so switching corpus cannot leave one of them on MoBiKo's default.
+        **corpus_kwargs,
         max_rounds=max_rounds,
-        entity_schema_str=SCHEMA_BIODIV_SHORT,
-        entity_types_list=SCHEMA_BIODIV_LIST,
         precedent_store_path=precedent_store_path,
         guideline_search_backend=guideline_search_backend,
         use_precedent_memory=use_precedent_memory,
@@ -323,6 +331,9 @@ def main() -> None:
         "--seeds", type=Path,
         help="Path to seed examples .py or .json file.",
     )
+    # --corpus/--guideline/--no-guideline/--no-decision-support, defined once in
+    # corpora.py so this script and selfconsistency_sample.py cannot drift.
+    add_corpus_args(parser)
     parser.add_argument(
         "--annotator-model", type=str, default="qwen3-35B-vllm",
     )
@@ -461,8 +472,14 @@ def main() -> None:
         run_fix_offsets(args.output)
         return
 
-    schema_path = args.schema.resolve()
-    seeds_path  = args.seeds.resolve()
+    # The corpus preset supplies schema/seeds/guideline/entity types/prompts as a
+    # set. --schema and --seeds still override, which is how the MoBiKo runs that
+    # pass them explicitly keep working unchanged.
+    corpus_kwargs = resolve_corpus(
+        args.corpus, schema=args.schema, seeds=args.seeds, guideline=args.guideline,
+        no_guideline=args.no_guideline, no_decision_support=args.no_decision_support)
+    schema_path = corpus_kwargs["schema_path"]
+    seeds_path = corpus_kwargs["seeds_path"]
 
     if args.dry_run:
         run_dry(schema_path, seeds_path, guideline_search_backend=args.guideline_search_backend)
@@ -482,6 +499,7 @@ def main() -> None:
             sentences=sentences,
             schema_path=schema_path,
             input_path=(None if args.use_demo_sentences else args.input.resolve()),
+            corpus_kwargs=corpus_kwargs,
             seeds_path=seeds_path,
             annotator_model=args.annotator_model,
             critic_model=args.critic_model,
