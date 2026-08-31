@@ -61,10 +61,10 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
 
 from eval_utils import fmt_ci, fmt_p, two_sample_bootstrap_p, stamp_provenance
 
-SCHEMA_V1_TO_V2: Dict[str, str] = {
-    "BIOTIC COLLECTIVE ENTITY":  "BIOTIC ENTITY",
-    "ABIOTIC COLLECTIVE ENTITY": "ABIOTIC ENTITY",
-}
+# Text and label normalisation are shared with the pipeline and with
+# eval_layer2_correlation via label_norm, so RQ1 and RQ2 cannot drift apart on
+# what a label is. The alias table that used to live here moved with them.
+from label_norm import normalize_text, normalize_label  # noqa: E402
 
 N_BOOT = 5000
 SEED = 42
@@ -75,23 +75,23 @@ RELATION_PREFIX = "RELATION"
 # Data loading
 # ─────────────────────────────────────────────────────────────
 
-def _normalize(text: str) -> str:
-    return " ".join((text or "").lower().split())
+# Kept as module-local names because xrun_analysis and the audit scripts import
+# them; both now delegate to the one definition in label_norm.
+_normalize = normalize_text
 
 
-def _normalize_label(label: str) -> str:
-    upper = (label or "").strip().upper()
-    return SCHEMA_V1_TO_V2.get(upper, upper)
+def _normalize_label(label: str, canon: bool = True) -> str:
+    return normalize_label(label, canon=canon)
 
 
-def _norm_entity(e: dict) -> Optional[dict]:
+def _norm_entity(e: dict, canon: bool = True) -> Optional[dict]:
     """
     Normalize an entity from any source to {text, type, start_char, end_char}.
     Accepts offset keys start/end (agent) or start_char/end_char (human native).
     Drops RELATION-typed pseudo-spans. start_char/end_char may be None when the
     source has no offsets (then offset modes skip it; text modes still work).
     """
-    etype = _normalize_label(e.get("entity_type", e.get("type", "")))
+    etype = _normalize_label(e.get("entity_type", e.get("type", "")), canon)
     if etype.startswith(RELATION_PREFIX):
         return None
     start = e.get("start_char", e.get("start"))
@@ -104,8 +104,11 @@ def _norm_entity(e: dict) -> Optional[dict]:
     }
 
 
-def load_agent_records(path: Path) -> List[dict]:
-    """Return [{sentence, entities:[norm], relations:[...]}] from agent JSONL."""
+def load_agent_records(path: Path, canon: bool = True) -> List[dict]:
+    """Return [{sentence, entities:[norm], relations:[...]}] from agent JSONL.
+
+    canon=False reports labels as the model shipped them; see label_norm.
+    """
     records = []
     with path.open("r", encoding="utf8") as f:
         for line in f:
@@ -113,7 +116,7 @@ def load_agent_records(path: Path) -> List[dict]:
             if not line or not line.startswith("{"):
                 continue
             rec = json.loads(line)
-            ents = [_norm_entity(e) for e in rec.get("final_entities", [])]
+            ents = [_norm_entity(e, canon) for e in rec.get("final_entities", [])]
             records.append({
                 "sentence": rec.get("sentence", ""),
                 "entities": [e for e in ents if e],
@@ -122,7 +125,7 @@ def load_agent_records(path: Path) -> List[dict]:
     return records
 
 
-def load_human_annotations(path: Path) -> Dict[str, Dict[str, dict]]:
+def load_human_annotations(path: Path, canon: bool = True) -> Dict[str, Dict[str, dict]]:
     """{sentence_key: {annotator: {entities:[norm], relations:[...]}}} for one file."""
     raw = path.read_text(encoding="utf8").strip()
 
@@ -135,7 +138,7 @@ def load_human_annotations(path: Path) -> Dict[str, Dict[str, dict]]:
         if doc and "sentences" in doc:
             data: Dict[str, Dict[str, dict]] = {}
             for s in doc["sentences"]:
-                ents = [_norm_entity(sp) for sp in s.get("spans", [])]
+                ents = [_norm_entity(sp, canon) for sp in s.get("spans", [])]
                 data[_normalize(s["text"])] = {
                     path.stem: {
                         "entities": [e for e in ents if e],
@@ -151,7 +154,7 @@ def load_human_annotations(path: Path) -> Dict[str, Dict[str, dict]]:
         if not line:
             continue
         obj = json.loads(line)
-        ents = [_norm_entity(e) for e in obj.get("entities", [])]
+        ents = [_norm_entity(e, canon) for e in obj.get("entities", [])]
         annotator = obj.get("annotator", path.stem)
         data[_normalize(obj["sentence"])][annotator] = {
             "entities": [e for e in ents if e],
@@ -160,12 +163,13 @@ def load_human_annotations(path: Path) -> Dict[str, Dict[str, dict]]:
     return dict(data)
 
 
-def load_all_human_annotations(paths: List[Path]) -> Tuple[Dict[str, Dict[str, dict]], List[str]]:
+def load_all_human_annotations(paths: List[Path], canon: bool = True
+                               ) -> Tuple[Dict[str, Dict[str, dict]], List[str]]:
     """Merge per-annotator files. Returns (merged, ordered_annotator_names)."""
     merged: Dict[str, Dict[str, dict]] = defaultdict(dict)
     names: List[str] = []
     for path in paths:
-        loaded = load_human_annotations(path)
+        loaded = load_human_annotations(path, canon=canon)
         for sent, annotators in loaded.items():
             merged[sent].update(annotators)
             for a in annotators:

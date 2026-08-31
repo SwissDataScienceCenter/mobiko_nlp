@@ -188,8 +188,9 @@ class Rel:
     prop: str
 
 
-def _norm_text(t: str) -> str:
-    return " ".join((t or "").lower().split())
+# Relation LABELS keep their own vocabulary (_norm_label below); span text
+# does not, so it uses the shared normaliser.
+from label_norm import normalize_text as _norm_text
 
 
 def _norm_label(label: str) -> str:

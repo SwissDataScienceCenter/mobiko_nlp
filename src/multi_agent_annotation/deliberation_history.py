@@ -27,6 +27,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Text and label normalisation come from the one shared leaf module, so the
+# pipeline, Layer 1, Layer 2 and the difficulty analyses all key spans and
+# labels the same way. label_norm imports nothing from the package.
+from label_norm import normalize_text, canonicalize_entity_type
+
 
 # ───────────────────────── parsing helpers ─────────────────────────
 
@@ -71,12 +76,17 @@ def try_parse_json(text: str) -> Optional[dict]:
     return last
 
 
-def norm(text: str) -> str:
-    return " ".join((text or "").lower().split())
+norm = normalize_text
 
 
 def label_of(e: dict) -> str:
-    return (e.get("entity_type") or e.get("type") or "").strip().upper()
+    """Canonicalised label for an entity dict.
+
+    Canonicalised rather than raw-uppercased because callers test membership
+    against the schema (``label_of(e) in HARD_TYPES``), which a shipped
+    "BIOTIC_ENTITY" would silently fail.
+    """
+    return canonicalize_entity_type(e.get("entity_type") or e.get("type") or "")
 
 
 def overlaps(a: str, b: str) -> bool:
@@ -187,18 +197,18 @@ def agent_disagreed_spans(rec: dict) -> Dict[str, Dict[str, Any]]:
             matched = next((s for s in annotator_spans if overlaps(target, s)), target)
             slot = spans.setdefault(matched, {
                 "agent_disagreed": True,
-                "annotator_type": (d.get("annotator_label") or "").strip().upper(),
+                "annotator_type": canonicalize_entity_type(d.get("annotator_label")),
                 "critic_type": None, "severity": None,
             })
             slot["agent_disagreed"] = True
-            slot["critic_type"] = (d.get("proposed_label") or "").strip().upper()
+            slot["critic_type"] = canonicalize_entity_type(d.get("proposed_label"))
             slot["severity"] = (d.get("severity") or "").lower()
         for miss in cr["missing"]:
             text = norm(miss.get("text", ""))
             if text:
                 slot = spans.setdefault(text, {
                     "agent_disagreed": True, "annotator_type": "(missing)",
-                    "critic_type": (miss.get("entity_type") or "").strip().upper(),
+                    "critic_type": canonicalize_entity_type(miss.get("entity_type")),
                     "severity": "missing",
                 })
                 slot["agent_disagreed"] = True
@@ -252,7 +262,7 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
             agr_by_round[k] += len(cr["agreements"])
             miss_by_round[k] += len(cr["missing"])
             for miss in cr["missing"]:
-                mt = (miss.get("entity_type") or "").strip().upper()
+                mt = canonicalize_entity_type(miss.get("entity_type"))
                 if mt:
                     missing_types[mt] += 1
             for d in cr["disagreements"]:
@@ -287,8 +297,8 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
             next_ents = annotator_rounds[1]
             for d in critic_rounds[0]["disagreements"]:
                 target = norm(d.get("target", ""))
-                proposed = (d.get("proposed_label") or "").strip().upper()
-                annot = (d.get("annotator_label") or "").strip().upper()
+                proposed = canonicalize_entity_type(d.get("proposed_label"))
+                annot = canonicalize_entity_type(d.get("annotator_label"))
                 present, new_label = False, None
                 for span, lab in next_ents.items():
                     if overlaps(target, span):
@@ -402,7 +412,7 @@ def correlate_with_human_difficulty(
     # (the renamed function's default "exact" = surface form + type).
     def _typed(ents):
         return [{"text": e.get("text", ""),
-                 "type": e.get("entity_type", e.get("type", "")).strip().upper()}
+                 "type": canonicalize_entity_type(e.get("entity_type", e.get("type", "")))}
                 for e in ents]
 
     rows = []

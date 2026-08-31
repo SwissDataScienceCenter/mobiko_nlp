@@ -48,10 +48,10 @@ from eval_utils import (
 )
 from deliberation_history import agent_disagreed_spans, record_signals
 
-SCHEMA_V1_TO_V2: Dict[str, str] = {
-    "BIOTIC COLLECTIVE ENTITY":  "BIOTIC ENTITY",
-    "ABIOTIC COLLECTIVE ENTITY": "ABIOTIC ENTITY",
-}
+# One definition of text and label normalisation, shared with eval_layer1_output
+# and the pipeline. RQ2 previously scored labels as shipped while RQ1 scored them
+# canonicalised; importing from here is what stops that recurring.
+from label_norm import normalize_text, normalize_label, canonicalize_entity_type
 
 
 # ─────────────────────────────────────────────────────────────
@@ -132,14 +132,10 @@ def load_all_human_annotations(paths: List[Path]) -> Dict[str, Dict[str, dict]]:
     return dict(merged)
 
 
-def _normalize(text: str) -> str:
-    return " ".join(text.lower().split())
-
-
-def _normalize_label(label: str) -> str:
-    """Map V1 schema labels to V2 equivalents for human annotations."""
-    upper = label.strip().upper()
-    return SCHEMA_V1_TO_V2.get(upper, upper)
+# Module-local names kept for importers (eval_logprob_uncertainty, the audit
+# scripts); both delegate to label_norm.
+_normalize = normalize_text
+_normalize_label = normalize_label
 
 
 # ─────────────────────────────────────────────────────────────
@@ -164,7 +160,8 @@ def compute_human_span_disagreements(
         seen_texts: Set[str] = set()
         for ent in ann_data.get("entities", []):
             text = _normalize(ent.get("text", ""))
-            etype = (ent.get("entity_type") or ent.get("type", "")).strip().upper()
+            etype = canonicalize_entity_type(
+                ent.get("entity_type") or ent.get("type", ""))
             if text and etype:
                 span_info[text][etype] += 1
                 if text not in seen_texts:

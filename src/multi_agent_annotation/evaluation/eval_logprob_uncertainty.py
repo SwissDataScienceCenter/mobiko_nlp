@@ -56,6 +56,7 @@ from eval_layer2_correlation import (
     _normalize,
 )
 from eval_layer1_output import sentence_f1
+from label_norm import canonicalize_entity_type
 from eval_utils import _spearman_rho, permutation_p_rho, fmt_p, stamp_provenance
 
 N_BOOT = 2000
@@ -63,9 +64,14 @@ SEED = 42
 
 
 def _typed(ents: List[dict]) -> List[dict]:
-    """Normalize any entity dict to {text, type} for text+type scoring."""
+    """Normalize any entity dict to {text, type} for text+type scoring.
+
+    Labels are canonicalised, matching RQ1 and the pipeline's emit-time
+    convention. This path previously uppercased only, so a shipped
+    "BIOTIC_ENTITY" scored 0 against gold here while scoring correctly in RQ1.
+    """
     return [{"text": e.get("text", ""),
-             "type": (e.get("entity_type") or e.get("type") or "").strip().upper()}
+             "type": canonicalize_entity_type(e.get("entity_type") or e.get("type") or "")}
             for e in ents]
 
 

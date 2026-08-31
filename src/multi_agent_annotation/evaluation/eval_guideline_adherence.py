@@ -36,6 +36,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from eval_utils import stamp_provenance
+from label_norm import canonicalize_entity_type
 from typing import Any, Dict, List, Optional
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -126,7 +127,7 @@ def evaluate(records: List[dict], ds: Dict[str, set]) -> Dict[str, Any]:
 
     for rec in records:
         for e in annotator_entities(rec):
-            etype = (e.get("entity_type") or "").strip().upper()
+            etype = canonicalize_entity_type(e.get("entity_type"))
             if not etype:
                 continue
             n_entities += 1

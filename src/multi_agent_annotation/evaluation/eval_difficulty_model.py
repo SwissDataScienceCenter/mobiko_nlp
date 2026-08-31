@@ -58,6 +58,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from eval_utils import stamp_provenance
+from label_norm import canonicalize_entity_type
 from statistics import mean, pstdev
 from typing import Any, Dict, List, Tuple
 
@@ -105,7 +106,7 @@ def load_all_human_annotations(paths: List[Path]) -> Dict[str, Dict[str, dict]]:
         for s in doc.get("sentences", []):
             sent = s["text"].strip()
             ents = [
-                {"text": sp.get("text", ""), "type": (sp.get("type") or "").strip().upper()}
+                {"text": sp.get("text", ""), "type": canonicalize_entity_type(sp.get("type"))}
                 for sp in s.get("spans", [])
                 if not str(sp.get("type", "")).startswith("RELATION")
             ]
@@ -144,8 +145,8 @@ def _resolution_direction(rec: dict) -> Dict[str, int]:
     nxt = ann[1]
     for d in crit[0]["disagreements"]:
         target = norm(d.get("target", ""))
-        proposed = (d.get("proposed_label") or "").strip().upper()
-        annot = (d.get("annotator_label") or "").strip().upper()
+        proposed = canonicalize_entity_type(d.get("proposed_label"))
+        annot = canonicalize_entity_type(d.get("annotator_label"))
         present, new_label = False, None
         for span, lab in nxt.items():
             if overlaps(target, span):
@@ -173,7 +174,7 @@ def _label_churn(rec: dict) -> Tuple[float, float, int]:
         for d in cr["disagreements"]:
             tgt = norm(d.get("target", ""))
             match = next((s for s in span_labels if overlaps(tgt, s)), tgt)
-            prop = (d.get("proposed_label") or "").strip().upper()
+            prop = canonicalize_entity_type(d.get("proposed_label"))
             if prop:
                 span_labels.setdefault(match, set()).add(prop)
     for e in rec.get("final_entities", []):

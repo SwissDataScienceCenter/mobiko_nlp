@@ -40,6 +40,7 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
         sys.path.insert(0, str(_p))
 
 from eval_utils import bootstrap_ci, two_sample_bootstrap_p, fmt_ci, fmt_p, stamp_provenance
+from label_norm import canonicalize_entity_type
 from deliberation_history import (
     load_records,
     try_parse_json,
@@ -119,7 +120,7 @@ def analyze_flagged_items(
         # entity_type}. Map to text+type (renamed compute_entity_metrics "exact").
         def _typed(ents):
             return [{"text": e.get("text", ""),
-                     "type": e.get("entity_type", e.get("type", "")).strip().upper()}
+                     "type": canonicalize_entity_type(e.get("entity_type", e.get("type", "")))}
                     for e in ents]
 
         flagged_f1s, unflagged_f1s = [], []

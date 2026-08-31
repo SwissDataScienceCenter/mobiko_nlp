@@ -51,6 +51,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from eval_utils import stamp_provenance
+from label_norm import canonicalize_entity_type
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -97,7 +98,7 @@ def load_human_spans(path: Path) -> Dict[str, List[dict]]:
     for s in doc.get("sentences", []):
         spans = [
             {"start_char": sp["start_char"], "end_char": sp["end_char"],
-             "type": (sp.get("type") or "").strip().upper(), "text": sp.get("text", "")}
+             "type": canonicalize_entity_type(sp.get("type")), "text": sp.get("text", "")}
             for sp in s.get("spans", [])
             if sp.get("start_char") is not None
             and not str(sp.get("type", "")).startswith("RELATION")
@@ -141,7 +142,7 @@ def span_churn_map(rec: dict) -> Dict[str, int]:
         for d in cr["disagreements"]:
             tgt = norm(d.get("target", ""))
             match = next((s for s in m if overlaps(tgt, s)), tgt)
-            prop = (d.get("proposed_label") or "").strip().upper()
+            prop = canonicalize_entity_type(d.get("proposed_label"))
             if prop:
                 m[match].add(prop)
     for e in rec.get("final_entities", []):
