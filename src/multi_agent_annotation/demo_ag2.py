@@ -259,6 +259,8 @@ def run_live(
     annotator_max_tokens: int | None = None,
     critic_max_tokens: int | None = None,
     adjudicator_max_tokens: int | None = None,
+    single_pass: bool = False,
+    annotator_prompt: str = "auto",
     use_dependency_relation_hints: bool = False,
     dependency_model: str = "en_core_web_trf",
     dependency_max_dep_distance: int = 4,
@@ -282,6 +284,8 @@ def run_live(
         # preset, so switching corpus cannot leave one of them on MoBiKo's default.
         **corpus_kwargs,
         max_rounds=max_rounds,
+        single_pass=single_pass,
+        annotator_prompt=annotator_prompt,
         precedent_store_path=precedent_store_path,
         guideline_search_backend=guideline_search_backend,
         use_precedent_memory=use_precedent_memory,
@@ -334,6 +338,23 @@ def main() -> None:
     # --corpus/--guideline/--no-guideline/--no-decision-support, defined once in
     # corpora.py so this script and selfconsistency_sample.py cannot drift.
     add_corpus_args(parser)
+    parser.add_argument(
+        "--single-pass", action="store_true",
+        help="Run the Annotator ONCE and take its output as final: no Critic, no "
+             "Adjudicator. Uses a prompt written for a system running alone rather "
+             "than the pipeline Annotator's coverage-first prompt. This is the "
+             "control arm for whether deliberation helps; combine with "
+             "--no-guideline to vary that dimension too.")
+    parser.add_argument(
+        "--annotator-prompt", choices=("auto", "pipeline", "solo"), default="auto",
+        help="Which annotator prompt to render. 'pipeline' is the coverage-first "
+             "prompt that tells the annotator to over-annotate because the Critic "
+             "will filter; 'solo' is written for a system whose output is final. "
+             "'auto' (default) picks solo with --single-pass and pipeline without. "
+             "State it explicitly when the choice matters to the experiment: "
+             "--single-pass --annotator-prompt pipeline is permitted but warns, "
+             "because it scores a component told to over-produce for a reviewer "
+             "that never runs.")
     parser.add_argument(
         "--annotator-model", type=str, default="qwen3-35B-vllm",
     )
@@ -500,6 +521,8 @@ def main() -> None:
             schema_path=schema_path,
             input_path=(None if args.use_demo_sentences else args.input.resolve()),
             corpus_kwargs=corpus_kwargs,
+            single_pass=args.single_pass,
+            annotator_prompt=args.annotator_prompt,
             seeds_path=seeds_path,
             annotator_model=args.annotator_model,
             critic_model=args.critic_model,

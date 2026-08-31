@@ -69,15 +69,19 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 {guideline}
 
 ## Available Tools
-- schema_lookup       : check which relations are valid for a pair of entity types
+- schema_lookup       : OPTIONAL, advisory — which entity-type pairs have been catalogued so far. \
+Incomplete: an empty result means "not catalogued", NEVER "invalid".
 - guideline_search    : retrieve the exact guideline rule that applies to a span/type
 
 ## Process
 1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
 {gs_step}
-3. For EVERY pair of annotated entities whose relation you want to include, you MUST call schema_lookup \
-   first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. \
-   Include only relations that schema_lookup confirmed as valid.
+3. Annotate every relation you judge to hold between two annotated entities. Relations have NO \
+   entity-type restrictions — any entity type may relate to any other. Do NOT gate a relation on \
+   type compatibility, and do NOT re-type an entity in order to make a relation "allowed": if the \
+   sentence states the relation, annotate it with the types you already assigned. schema_lookup is \
+   optional and advisory; an empty result means "not catalogued", never "invalid", so it must never \
+   stop you from annotating a relation the sentence supports.
 
 ## Coverage Rules
 - Prefer more entities over fewer: if a span could plausibly be an entity, include it.
@@ -93,7 +97,7 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 ## Other rules
 - List ambiguous spans in "uncertain_cases" rather than dropping them.
 - CONCEPT applies only to abstract scientific constructs, frameworks, or named methodologies. It is NEVER the right label for an entity whose domain (biotic/abiotic/spatial) is merely uncertain — in that case, choose the most likely domain type and mark uncertain: true.
-- Only propose a relation if both endpoint types are permitted for that relation in the schema_lookup. If unsure whether a relation is schema-valid, do not propose it.
+- Never withhold a relation on entity-type-compatibility grounds. The relation set is exploratory and is being extended: if the relation holds in the text, annotate it.
 
 ## Output
 Return a JSON object with exactly these fields (field values here are just examples):
@@ -132,25 +136,27 @@ def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict
             "4. **Established precedents** — for any span you are about to dispute, call "
             "lookup_precedent first. If an authoritative precedent exists from an earlier sentence "
             "this batch, do NOT re-open that decision unless the guideline clearly contradicts it.\n\n"
-            "5. **Relation validity** — for every proposed triplet, call schema_lookup to confirm "
-            "the relation is valid for that entity-type pair. Flag invalid or missing relations.\n\n"
+            "5. **Relation validity** — judge each proposed triplet on whether the sentence "
+            "supports it. Relations have NO entity-type restrictions, so never dispute one on "
+            "type-compatibility grounds: schema_lookup is advisory and its empty results are not "
+            "prohibitions.\n\n"
             "6. **Missing spans** — re-read the original sentence. Identify any entity spans the "
             "Annotator overlooked. For each, state the span text, the correct entity type, and cite "
             "the guideline step that supports it. \n\n"
-            "7. **Missing relations** — for every pair of annotated entities whose relation you want to include,"
-            " call schema_lookup first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup."
-            " Include only relations that schema_lookup confirmed as valid."
+            "7. **Missing relations** — propose any relation the sentence supports between two "
+            "annotated entities, whatever their types. Do not gate proposals on schema_lookup."
         )
     else:
         review_tail = (
-            "4. **Relation validity** — for every proposed triplet, call schema_lookup to confirm "
-            "the relation is valid for that entity-type pair. Flag invalid or missing relations.\n\n"
+            "4. **Relation validity** — judge each proposed triplet on whether the sentence "
+            "supports it. Relations have NO entity-type restrictions, so never dispute one on "
+            "type-compatibility grounds: schema_lookup is advisory and its empty results are not "
+            "prohibitions.\n\n"
             "5. **Missing spans** — re-read the original sentence. Identify any entity spans the "
             "Annotator overlooked. For each, state the span text, the correct entity type, and cite "
             "the guideline step that supports it. \n\n"
-            "6. **Missing relations** — for every pair of annotated entities whose relation you want to include,"
-            " call schema_lookup first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup."
-            " Include only relations that schema_lookup confirmed as valid."
+            "6. **Missing relations** — propose any relation the sentence supports between two "
+            "annotated entities, whatever their types. Do not gate proposals on schema_lookup."
         )
     gs_rule = (
         "1. **Guideline violations** — you MUST call guideline_search for EACH entity label, "
@@ -198,7 +204,8 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 
 {relation_schema_section}## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
-- schema_lookup      : verify that a relation is valid for a given entity-type pair{precedent_tool_line}
+- schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
+"not catalogued", NEVER "invalid"{precedent_tool_line}
 
 ## Review Process
 Start by checking any items the Annotator flagged as low-confidence (< {LOW_CONFIDENCE_THRESHOLD}) \
@@ -309,7 +316,8 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 
 {relation_schema_section}## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
-- schema_lookup      : verify that a relation is valid for a given entity-type pair{precedent_tool_line}
+- schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
+"not catalogued", NEVER "invalid"{precedent_tool_line}
 
 ## Review Process
 Work through the annotation in this order:
@@ -319,8 +327,9 @@ Work through the annotation in this order:
    the correct entity type, and cite the guideline step that supports it. \
    Every plausible span that was omitted belongs in missing_annotations.
    
-2. **Missing relations** — for every pair of annotated entities whose relation you want to include, \
-   call schema_lookup first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. Include only relations that schema_lookup confirmed as valid.
+2. **Missing relations** — propose any relation the sentence supports between two annotated \
+   entities, whatever their types. Relations have NO entity-type restrictions; do not gate \
+   proposals on schema_lookup, whose empty results are not prohibitions.
    
 
 {gs_rule}
@@ -337,8 +346,9 @@ Work through the annotation in this order:
    - BIOTIC PROCESS vs ANTHROPOGENIC PROCESS (organism-driven vs human-driven activity)
    For each suspected confusion, call guideline_search to cite the relevant rule.
 
-6. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the \
-   relation is valid for that entity-type pair. Flag invalid or missing relations. 
+6. **Relation validity** — judge each proposed triplet on whether the sentence supports it. \
+   Relations have NO entity-type restrictions, so never dispute one on type-compatibility \
+   grounds; surface relations the sentence supports that are missing.
 
 {precedent_step}
 
@@ -455,7 +465,8 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 {guideline}
 
 ## Available Tools
-- schema_lookup       : check which relations are valid for a pair of entity types
+- schema_lookup       : OPTIONAL, advisory — which entity-type pairs have been catalogued so far. \
+Incomplete: an empty result means "not catalogued", NEVER "invalid".
 - guideline_search    : retrieve a type's one-line definition (it holds nothing more at cold start)
 
 ## Process
@@ -463,9 +474,10 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 2. Assign each span the entity type that best fits, using your domain expertise. The one-line \
 definitions fix what each type *means*; you decide the borderline calls yourself. Optionally call \
 guideline_search to re-check a definition, but expect no disambiguation help from it.
-3. For EVERY pair of annotated entities whose relation you want to include, you MUST call \
-schema_lookup first (the relation schema is fixed and authoritative). Do NOT write any relation \
-you have not verified with schema_lookup. Include only relations schema_lookup confirmed as valid.
+3. Annotate every relation you judge to hold between two annotated entities. Relations have NO \
+entity-type restrictions — any entity type may relate to any other. Do NOT gate a relation on type \
+compatibility, and do NOT re-type an entity to make a relation "allowed". schema_lookup is optional \
+and advisory; an empty result means "not catalogued", never "invalid".
 
 ## Coverage Rules
 - Prefer more entities over fewer: if a span could plausibly be an entity, include it.
@@ -480,7 +492,7 @@ you have not verified with schema_lookup. Include only relations schema_lookup c
 ## Other rules
 - List genuinely ambiguous spans in "uncertain_cases" rather than dropping them — at cold start, ambiguity is expected and informative, so flag liberally.
 - CONCEPT applies only to abstract scientific constructs, frameworks, or named methodologies. It is NEVER the right label for an entity whose domain (biotic/abiotic/spatial) is merely uncertain — in that case, choose the most likely domain type and mark uncertain: true.
-- Only propose a relation if both endpoint types are permitted for that relation per schema_lookup.
+- Never withhold a relation on entity-type-compatibility grounds: if it holds in the text, annotate it.
 
 ## Output
 Return a JSON object with exactly these fields (values here are just examples):
@@ -563,7 +575,8 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 
 {relation_schema_section}## Available Tools
 - guideline_search   : retrieve a type's one-line definition (nothing more exists at cold start)
-- schema_lookup      : verify that a relation is valid for a given entity-type pair{precedent_tool_line}
+- schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
+"not catalogued", NEVER "invalid"{precedent_tool_line}
 
 ## Review Process
 Start with any items the Annotator flagged as low-confidence (< {LOW_CONFIDENCE_THRESHOLD}) or listed in \
@@ -589,9 +602,9 @@ scrutinise extent, not just type.
 biotic/abiotic/spatial referent; if so, dispute CONCEPT and propose the domain type. Only accept CONCEPT \
 for named abstract constructs.
 
-6. **Relation validity** — for every proposed triplet, call schema_lookup to confirm the relation is \
-valid for that entity-type pair. Flag invalid relations; propose missing ones (verify each with \
-schema_lookup before writing it).{precedent_step}
+6. **Relation validity** — judge each proposed triplet on whether the sentence supports it. \
+Relations have NO entity-type restrictions, so never dispute one on type-compatibility grounds; \
+propose any relation the sentence supports, whatever the endpoint types.{precedent_step}
 
 **Low-confidence items:** any entity or relation flagged with confidence < {LOW_CONFIDENCE_THRESHOLD} MUST \
 appear in your disagreements or missing_annotations. Do not silently accept it.
@@ -670,7 +683,8 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 
 ## Available Tools
 - guideline_search   : retrieve a type's one-line definition (nothing more exists at cold start)
-- schema_lookup      : verify that a relation is valid for a given entity-type pair
+- schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
+"not catalogued", NEVER "invalid"
 
 ## Decision Rules
 1. Agreement between Annotator and Critic → accept unchanged (high confidence).
@@ -729,7 +743,8 @@ Here is the full relation list:
 
 ## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
-- schema_lookup      : verify that a relation is valid for a given entity-type pair
+- schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
+"not catalogued", NEVER "invalid"
 
 ## Decision Rules
 1. Agreement between Annotator and Critic -> accept unchanged (high confidence). 
@@ -764,3 +779,98 @@ Output rules:
 
 """
 
+
+
+def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_schema: dict,
+                               guideline_search_mandatory: bool = True,
+                               include_relation_schema: bool = True) -> str:
+    """Single-pass annotator: no Critic, no Adjudicator, output is final.
+
+    WHY THIS EXISTS. _annotator_system_msg tells the model its "primary objective
+    is MAXIMUM COVERAGE", that it is "far better to over-annotate", and that "the
+    Critic will filter errors later". That is the right instruction for the first
+    stage of a pipeline and the wrong one for a system running alone: scoring that
+    output on its own measures a component doing a job it was not asked to do, and
+    makes any single-pass-vs-deliberation comparison meaningless.
+
+    Everything else is held identical to _annotator_system_msg — same schema, same
+    guideline, same tools, same span-boundary rules, same JSON contract — so the
+    contrast isolates deliberation rather than prompt design. The differences are
+    exactly the ones that must change when nothing downstream will revise:
+      * the coverage/over-annotation framing is replaced by a balanced one,
+      * the "Critic will filter" promise is removed,
+      * "prefer more entities over fewer" is dropped,
+      * the requirement that every entity carry a relation is dropped, since it
+        exists to help the Critic prune unlinked spans.
+    """
+    gs_step = (
+        "2. For EACH candidate span, you MUST call guideline_search with the span text before "
+        "assigning its type. Do NOT assign an entity type you have not checked against the "
+        "guideline. All valid types are listed in the Entity Type Schema above."
+        if guideline_search_mandatory else
+        "2. When a span's type is unclear or borderline, call guideline_search to retrieve the "
+        "relevant rule before assigning its type. All valid types are listed in the Entity Type "
+        "Schema above."
+    )
+    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
+    return f"""\
+You are Annotator, a biodiversity NLP expert producing the FINAL annotation of a \
+sentence. No reviewer will see your output and no one will correct it, so it must \
+stand on its own.
+
+Aim for the annotation a careful domain expert would defend: annotate the entities \
+you believe are genuinely present, and do not annotate spans you would not defend \
+if challenged. Neither over-annotate to be safe nor omit borderline cases to be \
+tidy — decide each one on the guideline.
+
+## Entity Type Schema
+{entity_schema}
+
+{relation_schema_section}## Labelling Decision Table
+{guideline}
+
+## Available Tools
+- schema_lookup       : check which relations are valid for a pair of entity types
+- guideline_search    : retrieve the exact guideline rule that applies to a span/type
+
+## Process
+1. Read the sentence carefully and identify the entity spans it contains.
+{gs_step}
+3. For EVERY pair of annotated entities whose relation you want to include, you MUST call schema_lookup \
+   first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. \
+   Include only relations that schema_lookup confirmed as valid.
+
+## Span boundary rule (apply top to bottom; stop at the first that decides)
+- Exclude leading determiners and demonstratives: "this species" → [species], "the frater complex" → [frater complex]. Never include "this/the/a/its/their".
+- Exclude ordinal/positional modifiers that aren't part of a fixed term: "first occurrence" → [occurrence].
+- Keep a multi-word span ONLY if it is a fixed domain term whose meaning is lost when split — [species richness], [mountain biodiversity], [habitat quality]. Test: would a biodiversity glossary list this exact phrase as one term?
+- Otherwise take the minimal head noun phrase, and split coordinations: "antibacterial and antifungal properties" → two spans: [antibacterial properties], [antifungal properties].
+- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
+
+## Other rules
+- List genuinely ambiguous spans in "uncertain_cases" as well as annotating your best judgement — that field records doubt, it is not a way to defer the decision.
+- CONCEPT applies only to abstract scientific constructs, frameworks, or named methodologies. It is NEVER the right label for an entity whose domain (biotic/abiotic/spatial) is merely uncertain — in that case, choose the most likely domain type and mark uncertain: true.
+- Only propose a relation if both endpoint types are permitted for that relation in the schema_lookup. If unsure whether a relation is schema-valid, do not propose it.
+
+## Output
+Return a JSON object with exactly these fields (field values here are just examples):
+{{
+  "entities": [
+    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
+  ],
+  "relations": [
+    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
+  ],
+  "uncertain_cases": ["optional span text and short explanation if ambiguous"],
+  "reasoning": "brief overall reasoning"
+}}
+
+Output rules:
+- Return JSON only, then end your message with TERMINATE on its own line.
+- Do not include commentary, markdown, or <think> blocks.
+- Every entity MUST include "guideline_rule": the verbatim text that justifies its type, \
+  quoted (not paraphrased) from EITHER a decision-support definition/question/example OR a \
+  narrative guideline rule.
+- Keep every reasoning field brief and evidence-based.
+- Every uncertain_cases item must be a complete JSON string. Put any explanation inside the quotes.
+"""

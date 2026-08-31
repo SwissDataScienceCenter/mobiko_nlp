@@ -34,6 +34,7 @@ The relation_schema arguments are retained so this module is a drop-in for
 prompts.py. With the CoNLL preset the schema is empty and the section renders as
 nothing.
 """
+import re
 from typing import Dict, List
 
 # Held identical to prompts.py on purpose: the critic reviews low-confidence items
@@ -376,3 +377,39 @@ def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relati
     return _COLD_START_GUIDELINE_NOTE + "\n\n" + _adjudicator_system_msg(
         guideline, entity_schema, relation_schema,
         include_relation_schema=include_relation_schema)
+
+
+def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_schema: dict,
+                               guideline_search_mandatory: bool = True,
+                               include_relation_schema: bool = True) -> str:
+    """Single-pass annotator for CoNLL: no Critic, no Adjudicator, output is final.
+
+    Same reasoning as prompts._annotator_system_msg_solo -- the pipeline annotator
+    is told to favour coverage because something downstream prunes, which makes it
+    the wrong prompt for a system running alone. Built from this module's own
+    annotator message so the CoNLL boundary rules and category confusions are
+    preserved, with only the coverage framing replaced.
+    """
+    base = _annotator_system_msg(guideline, entity_schema, relation_schema,
+                                 guideline_search_mandatory=guideline_search_mandatory,
+                                 include_relation_schema=include_relation_schema)
+    # Replace against the RENDERED text: the source f-string uses line-continuation
+    # backslashes, so the opening paragraph is one long line at runtime and a
+    # multi-line match silently fails.
+    base = re.sub(
+        r"You are Annotator, a named-entity annotation expert working on English "
+        r"newswire\. Your primary objective is MAXIMUM COVERAGE.*?Critic will filter "
+        r"errors later\.",
+        "You are Annotator, a named-entity annotation expert working on English newswire, "
+        "producing the FINAL annotation of a sentence. No reviewer will see your output and "
+        "no one will correct it, so it must stand on its own. Annotate the named entities you "
+        "believe are genuinely present, and do not annotate spans you would not defend if "
+        "challenged.",
+        base, flags=re.S)
+    base = base.replace(
+        "## Coverage Rules\n"
+        "- Prefer more entities over fewer: if a span could plausibly be a named entity, include it.\n"
+        "- Every mention counts. If the same name appears twice in the sentence, annotate both.",
+        "## Coverage Rules\n"
+        "- Every mention counts. If the same name appears twice in the sentence, annotate both.")
+    return base
