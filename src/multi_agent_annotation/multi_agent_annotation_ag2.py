@@ -39,6 +39,20 @@ from prompts import _annotator_system_msg_coldstart, _critic_system_msg_coldstar
 import prompts as _prompts_mobiko
 import prompts_conll as _prompts_conll
 
+# Label and text normalisation live in one leaf module shared with the eval
+# stack, so the pipeline's emit-time canonicaliser and the scorers cannot
+# disagree about what a label is. _ALL_ENTITY_TYPES is mutated in place here.
+from label_norm import (  # noqa: F401
+    canonicalize_entity_type,
+    off_schema_label_report,
+    reset_off_schema_labels,
+    normalize_text,
+    _ALL_ENTITY_TYPES,
+    _ENTITY_TYPE_ALIASES,
+    _FALLBACK_ENTITY_TYPES,
+    _OFF_SCHEMA_LABELS,
+)
+
 # The MoBiKo prompts are domain-specific well beyond the schema string (role
 # framing, inlined relation vocabulary, MoBiKo span-boundary conventions, worked
 # biodiversity examples), so a second corpus needs a parallel module rather than a
@@ -290,75 +304,8 @@ _patch_openai_for_streaming_logprobs()
 # each of them covers all construction paths at once: annotator JSON, critic
 # proposals, adjudicator output, precedent reuse, and relation endpoints.
 
-_ENTITY_TYPE_ALIASES: Dict[str, str] = {
-    # v1 -> v2 schema renames. Mirrors SCHEMA_V1_TO_V2 in
-    # evaluation/eval_layer1_output.py — keep the two in sync.
-    "BIOTIC COLLECTIVE ENTITY": "BIOTIC ENTITY",
-    "ABIOTIC COLLECTIVE ENTITY": "ABIOTIC ENTITY",
-    # Observed misspellings. Listed EXPLICITLY rather than fuzzy-matched: a
-    # near-miss repair that guesses would risk assigning the wrong label, which
-    # is worse than scoring 0 on a visibly broken one.
-    "ANTHROGENIC ENTITY": "ANTHROPOGENIC ENTITY",
-    "ANTHROGENIC PROCESS": "ANTHROPOGENIC PROCESS",
-    "ANTHROGENIC PROPERTY": "ANTHROPOGENIC PROPERTY",
-}
-
-# Labels that survive canonicalisation but are still not in the schema, counted
-# per process so a run can report them instead of hiding them.
-_OFF_SCHEMA_LABELS: Dict[str, int] = {}
-
-
-def canonicalize_entity_type(raw: Optional[str]) -> str:
-    """Normalise a label's FORMATTING. Never changes which label was meant.
-
-    "BIOTIC_ENTITY", "biotic  entity", " Biotic-Entity " -> "BIOTIC ENTITY"
-
-    A label that is STILL not in the schema after canonicalisation is returned
-    unchanged and counted in ``_OFF_SCHEMA_LABELS`` — deliberately not dropped.
-    Dropping spans would silently move recall, could orphan relations that
-    reference them, and the human gold itself carries a handful of off-schema
-    labels, so "off-schema" does not imply "wrong". Surface it, don't delete it.
-    """
-    if not raw:
-        return ""
-    text = str(raw).replace("_", " ").replace("-", " ")
-    text = re.sub(r"\s+", " ", text).strip().upper()
-    if not text:
-        return ""
-    text = _ENTITY_TYPE_ALIASES.get(text, text)
-    # Relation pseudo-labels (e.g. "RELATION:CAUSAL") are a different vocabulary
-    # and are not validated against the entity schema.
-    if text.startswith("RELATION"):
-        return text
-    valid = _ALL_ENTITY_TYPES or set(_FALLBACK_ENTITY_TYPES)
-
-    # Missing separator: "QUANTITATIVEPROPERTY" -> "QUANTITATIVE PROPERTY". Only
-    # applied when inserting one space yields EXACTLY ONE schema label, so it is
-    # a deterministic repair rather than a guess.
-    if text not in valid and " " not in text:
-        split = [f"{text[:i]} {text[i:]}" for i in range(1, len(text))
-                 if f"{text[:i]} {text[i:]}" in valid]
-        if len(split) == 1:
-            logger.info("Recovered missing separator: %r -> %r", text, split[0])
-            text = split[0]
-
-    if text not in valid:
-        _OFF_SCHEMA_LABELS[text] = _OFF_SCHEMA_LABELS.get(text, 0) + 1
-        if _OFF_SCHEMA_LABELS[text] == 1:  # log each novel label once per process
-            logger.warning(
-                "Off-schema entity type %r (canonicalised from %r) — kept, not "
-                "dropped. Check the prompt or add it to the schema.", text, raw
-            )
-    return text
-
-
-def off_schema_label_report() -> Dict[str, int]:
-    """Off-schema labels seen so far this process, most frequent first."""
-    return dict(sorted(_OFF_SCHEMA_LABELS.items(), key=lambda kv: -kv[1]))
-
-
-def reset_off_schema_labels() -> None:
-    _OFF_SCHEMA_LABELS.clear()
+# canonicalize_entity_type / off_schema_label_report / the alias table now
+# live in label_norm.py and are imported above.
 
 
 def _canonicalize_label_field(value):
@@ -897,7 +844,7 @@ def load_guideline_from_docx(path: Path) -> List[Dict[str, str]]:
 
 _SCHEMA: Dict[str, List[List[str]]] = {}
 _TYPE_PAIR_TO_RELATIONS: Dict[Tuple[str, str], List[str]] = {}
-_ALL_ENTITY_TYPES: set = set()
+# _ALL_ENTITY_TYPES is imported from label_norm and mutated in place.
 _GUIDELINE_SECTIONS: List[Dict[str, str]] = []
 _SEED_EXAMPLES: Dict[str, List[dict]] = {}
 _PRECEDENT_STORE: Optional["PrecedentStore"] = None   # set per MultiAgentAnnotator instance
@@ -919,20 +866,9 @@ _CONSISTENCY_STOPWORDS = {
 _CONSISTENCY_MIN_TOKEN_OVERLAP = 0.5
 
 
-# Must stay identical to SCHEMA_BIODIV_LIST in src/resources_updated/entity_schema.py
-# (that list is authoritative and is what demo_ag2 passes to _init_tool_state).
-# This copy previously read "QUALITATIVE ENTITY" / "QUANTITATIVE ENTITY", which
-# are not labels the schema or the human gold use — the gold has 339 spans typed
-# QUALITATIVE/QUANTITATIVE PROPERTY. Since canonicalize_entity_type() validates
-# against this list whenever _ALL_ENTITY_TYPES is unset, the typo would have
-# flagged every one of those valid labels as off-schema.
-_FALLBACK_ENTITY_TYPES = [
-    "ABIOTIC ENTITY", "ABIOTIC PROCESS", "ABIOTIC PROPERTY",
-    "ANTHROPOGENIC ENTITY", "ANTHROPOGENIC PROCESS", "ANTHROPOGENIC PROPERTY",
-    "BIOTIC ENTITY", "BIOTIC PROCESS", "BIOTIC PROPERTY",
-    "CONCEPT", "SPATIAL ENTITY", "SPATIAL PROPERTY", "TEMPORAL ENTITY", "TEMPORAL PROPERTY",
-    "QUALITATIVE PROPERTY", "QUANTITATIVE PROPERTY",
-]
+# _FALLBACK_ENTITY_TYPES is imported from label_norm; it must stay identical to
+# SCHEMA_BIODIV_LIST in src/resources_updated/entity_schema.py, which
+# tests/test_entity_type_canonicalisation.py asserts.
 
 
 def _file_sha256(path: Optional[Path]) -> Optional[str]:
@@ -962,17 +898,55 @@ def _file_sha256(path: Optional[Path]) -> Optional[str]:
         return None
 
 
-def _git_commit() -> Optional[str]:
-    """Short HEAD sha of the checkout this ran from. None outside a repo."""
+CODE_VERSION_ENV = "MOBIKO_CODE_VERSION"
+
+
+def resolve_code_version() -> Optional[str]:
+    """Ask git for the version of this checkout, marking a dirty tree.
+
+    Returns e.g. "a6367af" or "a6367af-dirty", or None outside a repo. Only
+    TRACKED modifications count as dirty: untracked scratch files do not change
+    what ran, modified sources do. A bare sha on a modified tree names code that
+    was not the code executed, which is worse than admitting the gap.
+
+    Call this at LAUNCH, on the machine holding the checkout, and export the
+    result as MOBIKO_CODE_VERSION. See _git_commit.
+    """
+    import subprocess
+    here = Path(__file__).resolve().parent
     try:
-        import subprocess
-        out = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, timeout=5,
-        )
-        return out.stdout.strip() or None
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here,
+                             capture_output=True, text=True, timeout=5)
+        sha = rev.stdout.strip()
+        if not sha:
+            return None
+        st = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                            cwd=here, capture_output=True, text=True, timeout=10)
+        return f"{sha}-dirty" if st.stdout.strip() else sha
     except Exception:
         return None
+
+
+def _git_commit() -> Tuple[Optional[str], str]:
+    """(code version, how we got it) for run_meta.
+
+    Resolution order matters. Compute nodes receive a copy of the source WITHOUT
+    a .git directory, so asking git on the node returns None exactly where
+    provenance matters most — which is how one run shipped with a null commit
+    while carrying an otherwise complete run_meta. The launcher stamps
+    MOBIKO_CODE_VERSION on the machine that has the checkout; git is only the
+    fallback for local runs.
+
+    The source is returned alongside the value so an unknown version is VISIBLE
+    in the record rather than indistinguishable from a field nobody wrote.
+    """
+    stamped = (os.getenv(CODE_VERSION_ENV) or "").strip()
+    if stamped:
+        return stamped, "launcher"
+    discovered = resolve_code_version()
+    if discovered:
+        return discovered, "git"
+    return None, "unavailable"
 
 
 def _guideline_sections_hash(sections: List[Dict[str, str]]) -> str:
@@ -2399,6 +2373,7 @@ class MultiAgentAnnotator:
         )
 
     def _build_run_meta(self, **cfg) -> Dict[str, Any]:
+        _code_version, _code_version_source = _git_commit()
         """Provenance stamped onto every record this instance produces.
 
         Two fields deserve explanation:
@@ -2463,7 +2438,8 @@ class MultiAgentAnnotator:
             "use_precedent_memory": bool(cfg.get("use_precedent_memory")),
             "dependency_model": cfg.get("dependency_model") if eff_hints else None,
             # ── code + resources ──
-            "git_commit": _git_commit(),
+            "git_commit": _code_version,
+            "code_version_source": _code_version_source,
             "guideline_sections_hash": _GUIDELINE_SECTIONS_HASH,
             "schema_entity_types": len(_ALL_ENTITY_TYPES) or None,
         }
