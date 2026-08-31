@@ -20,6 +20,7 @@ All three agents share registered tools:
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import math
@@ -628,82 +629,8 @@ ADJUDICATOR_REQUIRED_KEYS = {
 # LLM config builders for SDSC endpoints
 # ─────────────────────────────────────────────────────────────
 
-MODEL_ENDPOINTS = {
-    "qwen3-4B": {
-        "base_url": "https://qwen3-4b-instruct.runai-mobiko-anisia.inference.compute.datascience.ch/v1",
-        "api_key": "EMPTY",
-        "model": "Qwen/Qwen3-4B-Instruct-2507",
-    },
-    "qwen3-32B": {
-        "base_url": "https://openwebui-runai-codev-llm.inference.compute.datascience.ch/api",
-        "api_key_env": "OPEN_WEB_UI_API_KEY",
-        "model": "Qwen/Qwen3-32B-AWQ",
-    },
-    "qwen3-32B-vllm": {
-        "base_url": "https://vllm-gateway-runai-codev-llm.inference.compute.datascience.ch/v1",
-        "api_key_env": "OPEN_WEB_UI_API_KEY",
-        "model": "Qwen/Qwen3-32B-AWQ",
-    },
-    "gpt4o": {
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY",
-        "model": "gpt-4o",
-    },
-    "qwen3-35B-vllm": {
-        "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-        "api_key_env": "OPEN_WEB_UI_API_KEY",
-        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
-    },
-    "gemma4-26B": {
-        "base_url": "https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-        "api_key_env": "OPEN_WEB_UI_API_KEY",
-        "model": "google/gemma-4-26B-A4B-it",
-    },
-    "swissai-qwen3.5-27B": {
-        "base_url": "https://api.swissai.svc.cscs.ch/v1",
-        "api_key_env": "SWISSAI_API_KEY",
-        "model": "Qwen/Qwen3.5-27B",
-    },
-    "swissai-gemma-31B": {
-        "base_url": "https://api.swissai.svc.cscs.ch/v1",
-        "api_key_env": "SWISSAI_API_KEY",
-        "model": "google/gemma-4-31B-it-bdoan",
-    },
-    "swissai-apertus-70B": {
-        "base_url": "https://api.swissai.svc.cscs.ch/v1",
-        "api_key_env": "SWISSAI_API_KEY",
-        "model": "swiss-ai/Apertus-v1.5-70B",
-    },
-    "swissai-llama-3.3-70B": {
-        "base_url": "https://api.swissai.svc.cscs.ch/v1",
-        "api_key_env": "SWISSAI_API_KEY",
-        "model": "meta-llama/Llama-3.3-70B-Instruct",
-    },
-    "rcp-qwen3.6-35B": {
-        "base_url": "https://inference.rcp.epfl.ch/v1",
-        "api_key_env": "RCP_API_KEY",
-        "model": "Qwen/Qwen3.6-35B-A3B",
-        "reasoning": True,
-    },
-    "rcp-kimi-2.7": {
-        "base_url": "https://inference.rcp.epfl.ch/v1",
-        "api_key_env": "RCP_API_KEY",
-        "model": "moonshotai/Kimi-K2.7-Code",
-        "reasoning": True,
-    },
-    "rcp-gpt-oss": {
-        "base_url": "https://inference.rcp.epfl.ch/v1",
-        "api_key_env": "RCP_API_KEY",
-        "model": "openai/gpt-oss-120b",
-        "reasoning": True,
-    },
-    "rcp-deepseek": {
-        "base_url": "https://inference.rcp.epfl.ch/v1",
-        "api_key_env": "RCP_API_KEY",
-        "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "reasoning": True,
-    }
-}
+# Single source of truth, shared with entity_extraction — see that module.
+from src.resources_updated.model_endpoints import MODEL_ENDPOINTS  # noqa: E402,F401
 
 
 # Asymmetric model allocation: Annotator/Critic handle high-volume grunt work
@@ -2109,6 +2036,8 @@ class MultiAgentAnnotator:
         use_guideline: bool = True,
         use_decision_support: bool = True,
         prompt_set: str = "mobiko",
+        single_pass: bool = False,
+        annotator_prompt: str = "auto",
         seeds_path: Optional[Path] = None,
         max_rounds: int = 3,
         entity_schema_str: Optional[str] = None,
@@ -2311,6 +2240,37 @@ class MultiAgentAnnotator:
         # an empty guideline would force fabrication or make the Critic rubber-stamp,
         # starving the loop of the disagreement signal it mines. Cold-start takes
         # precedence over strict_critic for the Critic's prompt.
+        # Single-pass mode: the Annotator runs once and its output IS the final
+        # annotation. Needed as the control arm for "does deliberation help" --
+        # scoring the pipeline's own Annotator instead measures a component told to
+        # over-produce for a downstream Critic, which is not a single-pass system.
+        self.single_pass = single_pass
+        # Which annotator prompt to render, stated rather than inferred.
+        #   auto     -> solo when single_pass, pipeline otherwise (the sane default)
+        #   pipeline -> the coverage-first prompt ("over-annotate, the Critic will
+        #               filter"). Correct as stage one of a pipeline.
+        #   solo     -> written for a system running alone; output is final.
+        # Combining single_pass with the pipeline prompt is ALLOWED but warned
+        # about: it reproduces the flawed measurement of scoring a component that
+        # was told to over-produce, which is not a single-pass system.
+        if annotator_prompt not in ("auto", "pipeline", "solo"):
+            raise ValueError(
+                f"annotator_prompt must be auto|pipeline|solo, got {annotator_prompt!r}")
+        _use_solo = (annotator_prompt == "solo"
+                     or (annotator_prompt == "auto" and single_pass))
+        if _use_solo and cold_start:
+            raise ValueError(
+                "annotator_prompt=solo is incompatible with cold_start: there is no "
+                "cold-start variant of the solo prompt. Write one before combining them.")
+        if single_pass and not _use_solo:
+            logger.warning(
+                "single_pass with the PIPELINE annotator prompt: the annotator is being "
+                "told to over-annotate because a Critic will filter, but no Critic will "
+                "run. This is not a valid single-pass control arm.")
+        if _use_solo and not single_pass:
+            logger.warning(
+                "solo annotator prompt with the FULL pipeline: the Critic and Adjudicator "
+                "will review output produced without the coverage-first instruction.")
         try:
             _P = PROMPT_MODULES[prompt_set]
         except KeyError:
@@ -2324,11 +2284,14 @@ class MultiAgentAnnotator:
             logger.info("prompt set: %s COLD-START (expertise-grounded; guideline treated as scaffold)",
                         prompt_set)
         else:
-            _annotator_prompt_fn = _P._annotator_system_msg
+            _annotator_prompt_fn = (_P._annotator_system_msg_solo if _use_solo
+                                    else _P._annotator_system_msg)
             _critic_prompt_fn = (_P._critic_system_msg_strict if strict_critic
                                  else _P._critic_system_msg)
             _adjudicator_prompt_fn = _P._adjudicator_system_msg
-            logger.info("prompt set: %s%s", prompt_set, " (strict critic)" if strict_critic else "")
+            logger.info("prompt set: %s%s%s", prompt_set,
+                        " (strict critic)" if strict_critic else "",
+                        " [SINGLE-PASS: annotator only]" if single_pass else "")
 
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
@@ -2422,6 +2385,17 @@ class MultiAgentAnnotator:
                 t[0] is guideline_search for t in annotator_tools),
             entity_types=list(entity_types_list) if entity_types_list else None,
             prompt_set=prompt_set,
+            single_pass=single_pass,
+            # Which annotator prompt actually rendered, by name and by hash of the
+            # exact system message the agent received. run_meta is built after the
+            # agents exist, so this is the text that ran -- not the flag that was
+            # requested. "single_pass=true" with the coverage-first prompt would be
+            # a silently invalid control arm, and only the hash catches that.
+            annotator_prompt=("solo" if _use_solo else "pipeline"),
+            annotator_prompt_requested=annotator_prompt,
+            annotator_prompt_fn=_annotator_prompt_fn.__name__,
+            annotator_prompt_sha=hashlib.sha256(
+                self.annotator.system_message.encode("utf-8")).hexdigest()[:16],
         )
 
     def _build_run_meta(self, **cfg) -> Dict[str, Any]:
@@ -2459,6 +2433,14 @@ class MultiAgentAnnotator:
             # structurally parallel but textually different prompts means a run is
             # only interpretable if this is recorded alongside the scores.
             "prompt_set": cfg.get("prompt_set"),
+            # Whether the Critic and Adjudicator ran at all. A single-pass run and
+            # a full run are different systems, not different settings, so this
+            # must be recoverable from the output.
+            "single_pass": bool(cfg.get("single_pass")),
+            "annotator_prompt": cfg.get("annotator_prompt"),
+            "annotator_prompt_requested": cfg.get("annotator_prompt_requested"),
+            "annotator_prompt_fn": cfg.get("annotator_prompt_fn"),
+            "annotator_prompt_sha": cfg.get("annotator_prompt_sha"),
             # ── models, as keys AND as resolved ids ──
             "annotator_model": cfg.get("annotator_model"),
             "critic_model": cfg.get("critic_model"),
@@ -2584,6 +2566,14 @@ class MultiAgentAnnotator:
                         _toks, parsed_ann.entities
                     )
 
+            # ── Single-pass: stop before the Critic is ever consulted ──
+            # Placed here rather than after the loop so no Critic or Adjudicator
+            # call is made at all -- this arm must cost one annotator call per
+            # sentence, otherwise it is not the control it claims to be.
+            if self.single_pass:
+                logger.info("  single-pass: skipping Critic and Adjudicator")
+                break
+
             # ── Critic turn ───────────────────────────────────
             # On re-reviews, give the Critic its own prior verdict so it stays
             # consistent and does not flip-flop on unchanged spans.
@@ -2650,6 +2640,39 @@ class MultiAgentAnnotator:
                 "Done: 0 entities, 0 relations, agreement=None "
                 "(annotator_parse_failed)"
             )
+            return record
+
+        if self.single_pass:
+            # Same post-processing the adjudicated path applies, so the two arms
+            # differ only in deliberation. Skipping the nested-entity rule here
+            # would hand the full pipeline a precision advantage produced by a
+            # deterministic filter rather than by the Critic.
+            audit = self._base_adjudication_audit("single-pass: no Critic or Adjudicator")
+            ents = list(last_annotator_out.entities)
+            rels = [r for r in getattr(last_annotator_out, "relations", [])]
+            ents, rels = MultiAgentAnnotator._remove_nested_entities(ents, rels, audit)
+            record.final_entities = ents
+            record.final_relations = [
+                r.to_relation_annotation() if hasattr(r, "to_relation_annotation") else r
+                for r in rels
+            ]
+            _fill_char_offsets(sentence, record.final_entities, record.final_relations)
+            record.flagged_for_human_review = list(
+                getattr(last_annotator_out, "uncertain_cases", []) or [])
+            record.adjudication_status = "single_pass"
+            record.adjudication_audit = audit
+            record.agreement_score = None
+            record.rounds_used = 1
+            record.timing = {"total_s": time.perf_counter() - _sentence_t0,
+                             "phase1_s": time.perf_counter() - _phase1_t0,
+                             "phase2_s": 0.0, "rounds": 1}
+            record.token_usage = {"annotator": annotator_tokens,
+                                  "critic": critic_tokens,
+                                  "adjudicator": {"prompt_tokens": 0,
+                                                  "completion_tokens": 0,
+                                                  "total_tokens": 0}}
+            logger.info("Done (single-pass): %d entities, %d relations",
+                        len(record.final_entities), len(record.final_relations))
             return record
 
         if last_critic_out is None:

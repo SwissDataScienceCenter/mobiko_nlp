@@ -5,6 +5,7 @@ import threading
 from openai import OpenAI
 import regex as re
 import os
+import sys
 from pathlib import Path
 
 try:
@@ -40,49 +41,52 @@ def remove_thinking_blocks(content: str | None) -> str:
     return cleaned
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from src.resources_updated.model_endpoints import MODEL_ENDPOINTS  # noqa: E402
+
+
 @dataclass
 class ModelConfig:
     """Configuration for a specific model."""
     base_url: str
     api_key: str
     model_name: str
+    # Environment variable holding the key. Needed because the endpoints span
+    # four providers with four different key variables; resolving only
+    # OPENAI_API_KEY / OPEN_WEB_UI_API_KEY made every RCP and SwissAI model
+    # unreachable from this pipeline.
+    api_key_env: str = ""
 
 
 class ModelRegistry:
     """Registry of available model configurations."""
 
+    # Built from the SHARED endpoint table, so this pipeline and the multi-agent
+    # pipeline can be run on the same model without editing code. They previously
+    # kept separate lists and had already drifted apart.
     CONFIGS: Dict[str, ModelConfig] = {
-        "qwen3-4B": ModelConfig(
-            base_url="https://qwen3-4b-instruct-runai-mobiko-anisia.inference.compute.datascience.ch/v1",
-            api_key="EMPTY",
-            model_name="Qwen/Qwen3-4B-Instruct-2507"
-        ),
+        # Entries carry EITHER a literal api_key (local vLLM endpoints that accept
+        # any value) OR an api_key_env naming the variable to read. Both are
+        # honoured; dropping the literal would break the keyless local models.
+        name: ModelConfig(base_url=cfg["base_url"],
+                          api_key=cfg.get("api_key", ""),
+                          model_name=cfg["model"],
+                          api_key_env=cfg.get("api_key_env", ""))
+        for name, cfg in MODEL_ENDPOINTS.items()
+    }
+    # Endpoints local to this pipeline that the multi-agent table does not carry.
+    CONFIGS.update({
         "medgemma-4b": ModelConfig(
             base_url="http://medgemma-4b-it.runai-mobiko-anisia.inference.compute.datascience.ch",
             api_key="EMPTY",
-            model_name="google/medgemma-4b-it"
-        ),
+            model_name="google/medgemma-4b-it"),
         "biomistral-7b-awq": ModelConfig(
             base_url="https://mistral-7b-awq.runai-mobiko-anisia.inference.compute.datascience.ch/v1",
             api_key="EMPTY",
-            model_name="BioMistral/BioMistral-7B-AWQ-QGS128-W4-GEMM"
-        ),
-        "gpt4o": ModelConfig(
-            base_url="https://api.openai.com/v1",
-            api_key=None,  # Will use OPENAI_API_KEY env var
-            model_name="gpt-4o"
-        ),
-        "qwen3-35B-vllm": ModelConfig(
-            base_url="https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-            api_key=None,
-            model_name="Qwen/Qwen3.6-35B-A3B-FP8",
-        ),
-        "gemma4-26B": ModelConfig(
-            base_url="https://vllm-gateway-runai-sharedllm-ralf.inference.compute.datascience.ch/v1",
-            api_key=None,
-            model_name="google/gemma-4-26B-A4B-it",
-        )
-    }
+            model_name="BioMistral/BioMistral-7B-AWQ-QGS128-W4-GEMM"),
+    })
 
     @classmethod
     def get_config(cls, model_type: str) -> ModelConfig:
@@ -121,14 +125,15 @@ class LLMClient:
             # API key resolution (matches old get_openai_client)
             api_key = (
                 self.config.api_key
+                or (os.getenv(self.config.api_key_env) if self.config.api_key_env else None)
                 or os.getenv("OPENAI_API_KEY")
                 or os.getenv("OPEN_WEB_UI_API_KEY")
             )
 
             if not api_key:
+                want = self.config.api_key_env or "OPENAI_API_KEY / OPEN_WEB_UI_API_KEY"
                 raise ValueError(
-                    f"API key required for model '{self.model_type}'. "
-                    "Set OPENAI_API_KEY or OPEN_WEB_UI_API_KEY."
+                    f"API key required for model '{self.model_type}'. Set {want}."
                 )
 
             self._local.client = OpenAI(

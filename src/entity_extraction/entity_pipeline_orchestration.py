@@ -13,7 +13,7 @@ import torch
 import spacy  # just for validation of model existence
 from nltk.tokenize import sent_tokenize
 
-from llm.client import LLMClientFactory
+from llm.client import LLMClientFactory, ModelRegistry
 from llm.strategies import (
     call_llm_batch_two_path,
     run_C1_vanilla,
@@ -296,7 +296,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--in_bioc_dir", required=False, default=None,
                     help="Folder with BioC JSON files. Passage text is used as input.")
     ap.add_argument("--out_jsonl", required=True, help="Output JSONL (one object per document)")
-    ap.add_argument("--model_type", choices=["qwen3-4B", "qwen3-32B", "gpt4o", "biomistral-7b-awq", "qwen3-35B-vllm", "qwen3-32B-vllm"],
+    # choices come from the registry, which is built from the shared endpoint
+    # table. The hardcoded list this replaces had drifted: it offered two names
+    # absent from the registry (they raised at runtime) and omitted every RCP
+    # model, so this pipeline could not be run on the models the multi-agent
+    # experiments use.
+    ap.add_argument("--model_type", choices=sorted(ModelRegistry.CONFIGS),
                     default="gpt4o", help="LLM model to use")
     ap.add_argument("--use_chunks", action="store_true", help="Use noun phrase chunks as candidates")
     ap.add_argument("--max_sents_per_doc", type=int, default=999999, help="Cap sentences per doc (debug)")
