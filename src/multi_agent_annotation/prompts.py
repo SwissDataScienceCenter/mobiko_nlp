@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, Dict, List, Optional, Tuple, Any
 
 
@@ -788,89 +789,50 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
 
     WHY THIS EXISTS. _annotator_system_msg tells the model its "primary objective
     is MAXIMUM COVERAGE", that it is "far better to over-annotate", and that "the
-    Critic will filter errors later". That is the right instruction for the first
-    stage of a pipeline and the wrong one for a system running alone: scoring that
-    output on its own measures a component doing a job it was not asked to do, and
-    makes any single-pass-vs-deliberation comparison meaningless.
+    Critic will filter errors later". That is right for stage one of a pipeline and
+    wrong for a system running alone: scoring such output on its own measures a
+    component doing a job it was not asked to do, which makes any
+    single-pass-vs-deliberation comparison meaningless.
 
-    Everything else is held identical to _annotator_system_msg — same schema, same
-    guideline, same tools, same span-boundary rules, same JSON contract — so the
-    contrast isolates deliberation rather than prompt design. The differences are
-    exactly the ones that must change when nothing downstream will revise:
-      * the coverage/over-annotation framing is replaced by a balanced one,
-      * the "Critic will filter" promise is removed,
-      * "prefer more entities over fewer" is dropped,
-      * the requirement that every entity carry a relation is dropped, since it
-        exists to help the Critic prune unlinked spans.
+    DERIVED FROM the pipeline prompt rather than copied, so the two cannot drift.
+    An earlier hand-copied version silently contradicted the live prompt on
+    relation policy -- it required schema_lookup verification and type
+    compatibility while the pipeline prompt had moved to "relations have NO
+    entity-type restrictions, never withhold on compatibility grounds". That
+    difference had nothing to do with deliberation and would have confounded the
+    ablation.
+
+    ONLY Critic-dependent instructions are replaced:
+      * the MAXIMUM COVERAGE / over-annotate / "Critic will filter" framing,
+      * "err on the side of inclusion" in the reading step,
+      * "prefer more entities over fewer".
+    Everything else is inherited verbatim, INCLUDING the whole relation section
+    (the relation list, the exploratory framing, the advisory schema_lookup, the
+    no-type-restrictions rule) and the rule that an unlinked entity is probably a
+    false positive -- that one is a precision heuristic which stands on its own
+    and mentions no reviewer, so removing it would change entity behaviour beyond
+    the variable under test.
     """
-    gs_step = (
-        "2. For EACH candidate span, you MUST call guideline_search with the span text before "
-        "assigning its type. Do NOT assign an entity type you have not checked against the "
-        "guideline. All valid types are listed in the Entity Type Schema above."
-        if guideline_search_mandatory else
-        "2. When a span's type is unclear or borderline, call guideline_search to retrieve the "
-        "relevant rule before assigning its type. All valid types are listed in the Entity Type "
-        "Schema above."
-    )
-    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
-    return f"""\
-You are Annotator, a biodiversity NLP expert producing the FINAL annotation of a \
-sentence. No reviewer will see your output and no one will correct it, so it must \
-stand on its own.
+    base = _annotator_system_msg(
+        guideline, entity_schema, relation_schema,
+        guideline_search_mandatory=guideline_search_mandatory,
+        include_relation_schema=include_relation_schema)
 
-Aim for the annotation a careful domain expert would defend: annotate the entities \
-you believe are genuinely present, and do not annotate spans you would not defend \
-if challenged. Neither over-annotate to be safe nor omit borderline cases to be \
-tidy — decide each one on the guideline.
+    base = re.sub(
+        r"You are Annotator, a biodiversity NLP expert\. Your primary objective is "
+        r"MAXIMUM COVERAGE:.*?the Critic will filter errors later\.",
+        "You are Annotator, a biodiversity NLP expert producing the FINAL annotation "
+        "of a sentence. No reviewer will see your output and no one will correct it, "
+        "so it must stand on its own. Aim for the annotation a careful domain expert "
+        "would defend: annotate what you believe is genuinely present, and do not "
+        "annotate spans you would not defend if challenged.",
+        base, count=1, flags=re.S)
 
-## Entity Type Schema
-{entity_schema}
+    base = base.replace(
+        "1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.",
+        "1. Read the sentence carefully and identify the meaningful spans it contains.")
 
-{relation_schema_section}## Labelling Decision Table
-{guideline}
+    base = base.replace(
+        "- Prefer more entities over fewer: if a span could plausibly be an entity, include it.\n", "")
 
-## Available Tools
-- schema_lookup       : check which relations are valid for a pair of entity types
-- guideline_search    : retrieve the exact guideline rule that applies to a span/type
-
-## Process
-1. Read the sentence carefully and identify the entity spans it contains.
-{gs_step}
-3. For EVERY pair of annotated entities whose relation you want to include, you MUST call schema_lookup \
-   first. Do NOT write any relation in your JSON output that you have not verified with schema_lookup. \
-   Include only relations that schema_lookup confirmed as valid.
-
-## Span boundary rule (apply top to bottom; stop at the first that decides)
-- Exclude leading determiners and demonstratives: "this species" → [species], "the frater complex" → [frater complex]. Never include "this/the/a/its/their".
-- Exclude ordinal/positional modifiers that aren't part of a fixed term: "first occurrence" → [occurrence].
-- Keep a multi-word span ONLY if it is a fixed domain term whose meaning is lost when split — [species richness], [mountain biodiversity], [habitat quality]. Test: would a biodiversity glossary list this exact phrase as one term?
-- Otherwise take the minimal head noun phrase, and split coordinations: "antibacterial and antifungal properties" → two spans: [antibacterial properties], [antifungal properties].
-- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
-
-## Other rules
-- List genuinely ambiguous spans in "uncertain_cases" as well as annotating your best judgement — that field records doubt, it is not a way to defer the decision.
-- CONCEPT applies only to abstract scientific constructs, frameworks, or named methodologies. It is NEVER the right label for an entity whose domain (biotic/abiotic/spatial) is merely uncertain — in that case, choose the most likely domain type and mark uncertain: true.
-- Only propose a relation if both endpoint types are permitted for that relation in the schema_lookup. If unsure whether a relation is schema-valid, do not propose it.
-
-## Output
-Return a JSON object with exactly these fields (field values here are just examples):
-{{
-  "entities": [
-    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
-  ],
-  "relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
-  ],
-  "uncertain_cases": ["optional span text and short explanation if ambiguous"],
-  "reasoning": "brief overall reasoning"
-}}
-
-Output rules:
-- Return JSON only, then end your message with TERMINATE on its own line.
-- Do not include commentary, markdown, or <think> blocks.
-- Every entity MUST include "guideline_rule": the verbatim text that justifies its type, \
-  quoted (not paraphrased) from EITHER a decision-support definition/question/example OR a \
-  narrative guideline rule.
-- Keep every reasoning field brief and evidence-based.
-- Every uncertain_cases item must be a complete JSON string. Put any explanation inside the quotes.
-"""
+    return base
