@@ -332,6 +332,104 @@ class EntityAnnotation(BaseModel):
 _ENTITY_TYPE_VALUE_RE = re.compile(r'"entity_type"\s*:\s*"([^"]*)"')
 
 
+def _label_value_re(key: str) -> "re.Pattern":
+    """Regex for the VALUES of one JSON label field.
+
+    Anchored on the opening quote, so ``"label"`` does not also match
+    ``"annotator_label"`` or ``"proposed_label"`` — which matters, because the
+    Critic emits all three in the same object.
+    """
+    return re.compile(r'"' + re.escape(key) + r'"\s*:\s*"([^"]*)"')
+
+
+def _token_char_spans(tokens: List["TokenLP"]):
+    """Reconstruct the generated text, with each token's char span kept."""
+    spans, pos, parts = [], 0, []
+    for t in tokens:
+        start = pos
+        pos += len(t.token)
+        parts.append(t.token)
+        spans.append((start, pos, t.logprob, t.top))
+    return "".join(parts), spans
+
+
+def _label_token_stats(spans, vstart: int, vend: int) -> Dict[str, Any]:
+    """Logprob/entropy of the tokens covering one label value's char range."""
+    val_toks = [(lp, top) for (st, en, lp, top) in spans if en > vstart and st < vend]
+    lps = [lp for lp, _ in val_toks]
+    mean_lp = (sum(lps) / len(lps)) if lps else None
+    ent_top = [(h, top) for h, top in
+               ((_token_entropy(top), top) for _, top in val_toks) if h is not None]
+    mean_ent = max_ent = None
+    top_alts = None
+    if ent_top:
+        hs = [h for h, _ in ent_top]
+        mean_ent = sum(hs) / len(hs)
+        max_ent, max_top = max(ent_top, key=lambda x: x[0])
+        top_alts = [(tk, round(math.exp(clp), 4)) for tk, clp in
+                    sorted(max_top, key=lambda c: c[1], reverse=True)[:3]]
+    return {"type_mean_logprob": mean_lp, "type_mean_entropy": mean_ent,
+            "type_max_entropy": max_ent, "type_top_alternatives": top_alts}
+
+
+def _per_label_logprobs(
+    tokens: List["TokenLP"],
+    items: List[Any],
+    value_key: str,
+    text_attr: str,
+    role: str,
+) -> List[Dict[str, Any]]:
+    """Align streamed tokens to the i-th ``"<value_key>": "..."`` occurrence.
+
+    The same positional trick ``_per_entity_type_logprobs`` uses, generalised to
+    the Critic's schema, which carries its type decisions under three different
+    keys (``label`` on agreements, ``proposed_label`` on disagreements,
+    ``entity_type`` on missing annotations). Searching per key keeps the mapping
+    valid regardless of the order the model emits the top-level arrays in, since
+    only within-array order has to hold.
+
+    ``role`` marks which bucket an item came from, because a Critic that
+    *agreed* and a Critic that *proposed a different label* are different acts
+    and must not be pooled without saying so.
+    """
+    if not tokens or not items:
+        return []
+    full, spans = _token_char_spans(tokens)
+    matches = list(_label_value_re(value_key).finditer(full))
+    out = []
+    for i, item in enumerate(items):
+        stats = ({"type_mean_logprob": None, "type_mean_entropy": None,
+                  "type_max_entropy": None, "type_top_alternatives": None}
+                 if i >= len(matches)
+                 else _label_token_stats(spans, matches[i].start(1), matches[i].end(1)))
+        out.append({
+            "text": getattr(item, text_attr, "") or "",
+            "entity_type": getattr(item, value_key, "") or "",
+            "role": role,
+            **stats,
+        })
+    return out
+
+
+def _per_critic_label_logprobs(
+    tokens: List["TokenLP"], parsed: "CriticOutput",
+) -> List[Dict[str, Any]]:
+    """Per-span token uncertainty for every type decision the Critic made.
+
+    Covers agreements as well as disputes deliberately. Scoring only the spans
+    the Critic argued about would condition on the outcome: the PRESENCE of a
+    value would already encode the Critic's verdict, and any correlation with
+    human disagreement would be partly that artefact rather than a measurement.
+    """
+    return (
+        _per_label_logprobs(tokens, parsed.agreements, "label", "target", "agreement")
+        + _per_label_logprobs(tokens, parsed.disagreements, "proposed_label",
+                              "target", "disagreement")
+        + _per_label_logprobs(tokens, parsed.missing_annotations, "entity_type",
+                              "text", "missing")
+    )
+
+
 def _per_entity_type_logprobs(
     tokens: List["TokenLP"],
     entities: List["EntityAnnotation"],
@@ -435,6 +533,19 @@ class DeliberationRecord(BaseModel):
     # "type_mean_entropy", "type_max_entropy", "type_top_alternatives"}. Isolates
     # the entity_type value tokens; entropy fields are the informative signal.
     annotator_entity_logprobs: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # The Critic's and Adjudicator's own token probabilities on the SAME spans.
+    # The Annotator's are a single-model signal available before any
+    # deliberation happens; these are the only ones that can show the
+    # deliberation itself carrying uncertainty information. Each entry is
+    # tagged with the role that produced it (agreement / disagreement /
+    # missing for the Critic), so the two acts are never pooled silently.
+    critic_mean_logprob: Optional[float] = None
+    critic_mean_entropy: Optional[float] = None
+    critic_entity_logprobs: List[Dict[str, Any]] = Field(default_factory=list)
+    adjudicator_mean_logprob: Optional[float] = None
+    adjudicator_mean_entropy: Optional[float] = None
+    adjudicator_entity_logprobs: List[Dict[str, Any]] = Field(default_factory=list)
     timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
@@ -589,6 +700,17 @@ _DEFAULT_ADJUDICATOR_MODEL: str = os.getenv("ADJUDICATOR_MODEL", "qwen3-32B-vllm
 # Top-k candidate logprobs requested at each token position, for type-token
 # predictive entropy. 0 (or empty) disables; OpenAI/vLLM cap is 20.
 ANNOTATOR_TOP_LOGPROBS: Optional[int] = int(os.getenv("ANNOTATOR_TOP_LOGPROBS", "20")) or None
+
+# The Critic and Adjudicator make type decisions too, and until now their token
+# probabilities were simply never requested — the capture machinery is global,
+# but only the Annotator's turn asked for logprobs and only its turn was
+# harvested. That left the paper unable to ask whether DELIBERATION produces
+# uncertainty a single model does not: every signal that predicts human
+# disagreement came from the Annotator's first pass, which is a single-model
+# signal. Default these on; set to 0 to disable per role.
+CRITIC_TOP_LOGPROBS: Optional[int] = int(os.getenv("CRITIC_TOP_LOGPROBS", "20")) or None
+ADJUDICATOR_TOP_LOGPROBS: Optional[int] = int(
+    os.getenv("ADJUDICATOR_TOP_LOGPROBS", "20")) or None
 
 
 def _env_enable_thinking() -> Optional[bool]:
@@ -2173,8 +2295,8 @@ class MultiAgentAnnotator:
         # Bump these for reasoning models (e.g. Kimi) whose chain-of-thought eats
         # the default budget before the final answer is emitted.
         annotator_llm = build_llm_config(annotator_model, temperature=annotator_temp, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ANNOTATOR_TOP_LOGPROBS, max_tokens=annotator_max_tokens)
-        critic_llm = build_llm_config(critic_model, temperature=critic_temp, timeout=request_timeout, tool_choice=tool_choice, max_tokens=critic_max_tokens)
-        adjudicator_llm = build_llm_config(adjudicator_model, temperature=adjudicator_temp, timeout=request_timeout, tool_choice=tool_choice, max_tokens=adjudicator_max_tokens)
+        critic_llm = build_llm_config(critic_model, temperature=critic_temp, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=CRITIC_TOP_LOGPROBS, max_tokens=critic_max_tokens)
+        adjudicator_llm = build_llm_config(adjudicator_model, temperature=adjudicator_temp, timeout=request_timeout, tool_choice=tool_choice, logprobs=True, top_logprobs=ADJUDICATOR_TOP_LOGPROBS, max_tokens=adjudicator_max_tokens)
         critic_mode_label = "strict" if strict_critic else "default"
         _mt = lambda v: f", max_tokens={v}" if v is not None else ""
         logger.info(
@@ -2431,6 +2553,8 @@ class MultiAgentAnnotator:
             "adjudicator_temperature": cfg.get("adjudicator_temperature"),
             "tool_choice": cfg.get("tool_choice"),
             "annotator_top_logprobs": ANNOTATOR_TOP_LOGPROBS,
+            "critic_top_logprobs": CRITIC_TOP_LOGPROBS,
+            "adjudicator_top_logprobs": ADJUDICATOR_TOP_LOGPROBS,
             # ── everything else that changes behaviour ──
             "max_rounds": cfg.get("max_rounds"),
             "strict_critic": bool(cfg.get("strict_critic")),
@@ -2583,6 +2707,21 @@ class MultiAgentAnnotator:
             if parsed_crit is not None:
                 last_critic_out = parsed_crit
 
+            # Per-span label-token confidence for the Critic's FIRST review, to
+            # match annotator_entity_logprobs (also round 0). Later rounds see a
+            # revised annotation, so pooling rounds would compare a first
+            # opinion against a second one. The capture buffer still holds this
+            # turn's tokens; the next Annotator turn resets it.
+            if record.critic_mean_logprob is None:
+                record.critic_mean_logprob = crit_record.get("mean_logprob")
+                record.critic_mean_entropy = crit_record.get("mean_entropy")
+            if not record.critic_entity_logprobs and parsed_crit is not None:
+                _ctoks = last_content_token_logprobs()
+                if _ctoks:
+                    record.critic_entity_logprobs = _per_critic_label_logprobs(
+                        _ctoks, parsed_crit
+                    )
+
             if (
                 last_critic_out is not None
                 and not last_critic_out.disagreements
@@ -2676,11 +2815,21 @@ class MultiAgentAnnotator:
 
         self.adjudicator.reset()
         self.adj_executor.reset()
+        # The Adjudicator issues the labels that actually ship and get scored,
+        # so its uncertainty is the one attached to the final decision. It runs
+        # through initiate_chat rather than _run_agent_turn, so the capture
+        # buffer has to be reset here explicitly.
+        reset_logprob_capture()
         adj_result = self.adjudicator.initiate_chat(
             recipient=self.adj_executor,
             message=adjudicator_msg,
             max_turns=self._adjudicator_max_turns(),
         )
+        # Read the buffer NOW: the retry paths below issue further calls that
+        # would overwrite it before parsed_adj exists.
+        record.adjudicator_mean_logprob = last_content_mean_logprob()
+        record.adjudicator_mean_entropy = last_content_mean_entropy()
+        _adj_toks = last_content_token_logprobs()
         phase2_s = round(time.perf_counter() - _phase2_t0, 2)
         logger.info("  Adjudicator done in %.1fs", phase2_s)
         adjudicator_tokens = self._sum_usage(getattr(adj_result, "cost", {}))
@@ -2703,6 +2852,11 @@ class MultiAgentAnnotator:
                 parsed_adj = AdjudicatorOutput.model_validate(adj_output)
             except ValidationError as e:
                 logger.warning(f"AdjudicatorOutput validation error: {e}")
+
+        if parsed_adj is not None and _adj_toks and not record.adjudicator_entity_logprobs:
+            record.adjudicator_entity_logprobs = _per_entity_type_logprobs(
+                _adj_toks, parsed_adj.final_entities
+            )
 
         if parsed_adj is None:
             raw_adjudicator = self._last_agent_content(adj_messages, "Adjudicator")

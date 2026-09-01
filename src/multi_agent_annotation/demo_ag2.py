@@ -254,7 +254,7 @@ def run_live(
     request_timeout: int = 600,
     strict_critic: bool = False,
     guideline_search_mandatory: bool = True,
-    include_relation_schema: bool = True,
+    include_relation_schema: bool = False,
     tool_choice: str | None = None,
     annotator_max_tokens: int | None = None,
     critic_max_tokens: int | None = None,
