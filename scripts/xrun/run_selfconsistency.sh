@@ -19,14 +19,14 @@ set -uo pipefail
 
 # ── config (override by env var) ────────────────────────────────────────────
 MODEL="${MODEL:-rcp-kimi-2.7}"
-TAG="${TAG:-rcp-kimi-2.7}"
+TAG="${TAG:-rcp-kimi-2.7_v3}"
 K="${K:-10}"
 SENTENCES="${SENTENCES:-28}"      # total sentences across all shards
 SHARDS="${SHARDS:-4}"             # parallel processes
 INPUT="${INPUT:-data/manually_labeled_last}"
-OUTDIR="${OUTDIR:-output/selfconsistency}"
+OUTDIR="${OUTDIR:-output/selfconsistency_clean}"
 PYTHON="${PYTHON:-python3}"
-RESUME="${RESUME:-1}"
+RESUME="${RESUME:-0}"
 PLAN="${PLAN:-0}"
 # Corpus preset: selects entity schema, guideline, decision support, relation
 # schema, seeds and prompt templates together (see src/multi_agent_annotation/
@@ -36,6 +36,7 @@ CORPUS="${CORPUS:-mobiko}"
 GUIDELINE="${GUIDELINE:-}"                  # override the preset's guideline
 NO_GUIDELINE="${NO_GUIDELINE:-0}"           # 1 = run with no guideline at all
 NO_DECISION_SUPPORT="${NO_DECISION_SUPPORT:-0}"
+NO_RELATION_SCHEMA="${NO_RELATION_SCHEMA:-0}"   # 1 = no relation schema in the prompt
 
 # Repo root from this script's location, so it works from any CWD and on any
 # checkout (this is run on a different machine from where it was written).
@@ -58,6 +59,7 @@ CORPUS_ARGS=(--corpus "$CORPUS")
 [[ -n "$GUIDELINE" ]] && CORPUS_ARGS+=(--guideline "$GUIDELINE")
 [[ "$NO_GUIDELINE" == "1" ]] && CORPUS_ARGS+=(--no-guideline)
 [[ "$NO_DECISION_SUPPORT" == "1" ]] && CORPUS_ARGS+=(--no-decision-support)
+[[ "$NO_RELATION_SCHEMA" == "1" ]] && CORPUS_ARGS+=(--no-relation-schema-in-prompt)
 
 # Soft guard on the single most damaging misconfiguration: the input belongs to
 # one corpus and CORPUS names the other. The run would complete normally and
@@ -86,6 +88,9 @@ echo "  python      $PYTHON"
 echo "  model       $MODEL"
 echo "  corpus      $CORPUS  (${CORPUS_ARGS[*]})"
 echo "  input       $INPUT"
+echo "  guideline   ${GUIDELINE:-<pipeline default: MoBiKo_label_guidance_v4.md>}"
+echo "  relation schema in prompt  $([[ "$NO_RELATION_SCHEMA" == "1" ]] && echo "NO" || echo "yes (default)")"
+echo "  dependency hints           ${DEPENDENCY_RELATION_HINTS:-unset -> off}"
 echo "  K           $K samples per sentence"
 echo "  sentences   $SENTENCES  ($SHARDS shards x $PER_SHARD)"
 echo "  calls       $(( SENTENCES * K ))  total annotator calls"

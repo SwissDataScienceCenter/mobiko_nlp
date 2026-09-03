@@ -100,20 +100,54 @@ REGISTRY = [
     # deepseek-ai/DeepSeek-V4-Flash-0731 via RCP, added 2026-08-11. Fifth model
     # family, and the second run whose arm is verifiable from its own run_meta
     # (use_dependency_relation_hints=true, hints_requested=true).
-    # TWO CAVEATS, both from run_meta rather than the filename:
-    #   1. include_relation_schema=FALSE — so this cell is noRS, like the
-    #      Apertus70B Aug-noRS rows and unlike gptoss_dep (schema ON). A future
-    #      DeepSeek no-dep arm must keep the schema OFF or the contrast is
-    #      confounded the way the July apertus one was.
-    #   2. PARTIAL RUN — 112 of the 155 gold sentences (112 unique, no
-    #      duplicates, one run_meta throughout). It stopped, it was not
-    #      subsampled, so the 112 are the first 112 in input order rather than a
-    #      random draw. n on every paired test here is ~110 instead of ~150,
-    #      which widens its CI by ~15% relative to a full run; the point
-    #      estimates are still on the same gold. Re-run to completion and
-    #      re-score before this row goes in a paper.
+    #
+    # COMPLETE at 155/155 as of 2026-08-12, sha256 d5f11ddeb4490524…. Getting
+    # there took three scorings: the live file changed under two of them
+    # (155 -> 132 -> 138 -> 155 records) and one intermediate state was scored
+    # from a frozen snapshot. Only stamp_provenance's input hash made that
+    # detectable — the kimi27_dep failure mode (COMPARISON 12a), avoided rather
+    # than repeated. 4 empty records remain, all `constrained`.
+    #   include_relation_schema=FALSE — so this cell is noRS, like the
+    #   Apertus70B Aug-noRS rows and unlike gptoss_dep (schema ON). A future
+    #   DeepSeek no-dep arm must keep the schema OFF or the contrast is
+    #   confounded the way the July apertus one was.
+    # GUIDELINE: hash fe4116752ffa930a5e94c938ebe88cc5. Its v2 counterpart below
+    # differs from it in the GUIDELINE ALONE, which is why they are separate rows.
     ("DeepSeek-V4-Flash", "dep", "deepseek_dep",
      D / "auto_annotated_local/datademo_manually_labeled_rcp-deepseek_v1_dep"),
+
+    # ── GUIDELINE-v4 RUNS, kept as SEPARATE MODEL ROWS (decision 2026-08-17) ──
+    # Both use MoBiKo_label_guidance_v4.md, guideline_sections_hash
+    # 09db658b91fcc806f5594f0661b22911 — verified IDENTICAL across the two, so
+    # "guid-v4" means the same prompt text in both rows.
+    # NAMING: "guid-v4" is the GUIDELINE version. It has nothing to do with
+    # DeepSeek-V4-Flash, whose "V4" is part of the model name. Do not conflate.
+    # WHY SEPARATE ROWS rather than replicates of the rows above: they differ
+    # from their siblings in the guideline, and the Apertus Jul/Aug precedent
+    # says a run differing in build/config does not share a cell — that is what
+    # keeps a later same-config contrast interpretable.
+    #
+    # deepseek_dep_v2 is the cleanest single-variable contrast in the programme:
+    # same model, same arm (hints ON, schema OFF), same input sha256, same three
+    # temperatures, same max_rounds/tool_choice/strict_critic/cold_start — the
+    # ONLY experimental difference from deepseek_dep is the guideline. Residual
+    # confound: git_commit a6367af -> fcc811d, so the code moved too.
+    ("DeepSeek guid-v4", "dep", "deepseek_dep_v2",
+     D / "auto_annotated_local/datademo_manually_labeled_rcp-deepseek_v2_dep"),
+
+    # qwen3.6 + guideline v4 + hints ON + schema OFF, run on the RunAI pod and
+    # copied local 2026-08-14 (sha256 c6ccb58d278d342e56374456…, verified
+    # byte-identical to the remote). It differs from qwen36_35B_dep in TWO ways —
+    # guideline AND relation schema — so unlike the DeepSeek pair it isolates
+    # nothing on its own. First qwen run with a stamped arm (the other three
+    # predate run_meta) and the first COMPLETE qwen noRS run: v2 aborted, v3 is
+    # 0 bytes on the pod. git_commit is None; the pod checkout does not stamp it.
+    # HYGIENE TRAP: 6 off-schema spans, all ABIOTIC misspellings (ABOTIC
+    # PROPERTY x2, ABITIC ENTITY x2, ABIOITC ENTITY, ABIOITC PROCESS).
+    # xrun_analysis._canon_type has no alias table, so canon == as-is and the
+    # hyg column reads +0.000 despite 6 broken labels. Report the raw count.
+    ("Qwen3.6 guid-v4", "dep", "qwen36_35B_v4_dep_noRS",
+     D / "auto_annotated/datademo_manually_labeled_qwen3-35B-vllm_v4_dep_no_relation_schema"),
 
     ("Qwen3.5 (legacy)", "no-dep", "qwen35_v2",
      D / "auto_annotated/datademo_manually_labeled2.jsonl"),
@@ -127,6 +161,7 @@ MODEL_SHORT = {
     "Qwen3.6-35B": "Qwen3.6", "Apertus70B Jul": "ApJul",
     "Apertus70B Aug-noRS": "ApAug", "Kimi-2.7": "Kimi",
     "GPT-OSS-120B": "GPToss", "DeepSeek-V4-Flash": "DSeek",
+    "DeepSeek guid-v4": "DSg4", "Qwen3.6 guid-v4": "Q36g4",
     "Qwen3.5 (legacy)": "Qwen3.5",
 }
 

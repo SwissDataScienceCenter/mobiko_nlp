@@ -155,6 +155,37 @@ def span_distributions(samples, min_detections):
     return out
 
 
+def bh_family(tests, q=0.05):
+    """Benjamini-Hochberg over this run's own tests. -> {name: qvalue}.
+
+    Every other RQ2 signal in the programme is reported as "survives BH within
+    its run's family"; these three tests were not, which is why the cross-run
+    summary grades this instrument ESTABLISHED-PENDING rather than ESTABLISHED.
+    The family is the three tests computed here — typing by modal frequency,
+    typing by label entropy, and detection.
+
+    Note the family is mildly conservative: typing-by-entropy is a near-duplicate
+    of typing-by-modal-frequency (they agree to ~0.003 on every run measured), so
+    the effective number of independent tests is closer to two than three. The
+    same redundancy is already flagged for the logprob/entropy pair in the
+    cross-run summary. Erring conservative is the right direction here.
+
+    Mirrors xrun_analysis.bh, kept separate only because this script deliberately
+    has no numpy/scipy dependency.
+    """
+    tests = [(n, p) for n, p in tests if isinstance(p, (int, float)) and p == p]
+    m = len(tests)
+    if not m:
+        return {}
+    order = sorted(range(m), key=lambda i: tests[i][1])
+    qvals, running = {}, 1.0
+    for rank in range(m, 0, -1):
+        i = order[rank - 1]
+        running = min(running, tests[i][1] * m / rank)
+        qvals[tests[i][0]] = running
+    return qvals
+
+
 def _correlate(pairs, target):
     """Uncertainty vs human disagreement, one dict shape for both target types.
 
@@ -228,6 +259,17 @@ def score(records, human, min_detections, target="binary", min_span_annotators=1
             entropy_pairs.append((d["label_entropy"], typ_target))
     # Discrimination of the REPORTED confidence, computed here rather than in
     # report() so the number lands in the saved JSON and can be cited directly.
+    # Parse-failure accounting. A sample that failed to parse contributes no
+    # spans, so a run can lose most of its data and still produce a
+    # confident-looking correlation over whatever survived: one deepseek run
+    # scored rho and AUC over 23 spans while 77% of its samples had failed. The
+    # rate has to be reported next to the correlation, not left in the logs.
+    n_samples = n_failed = 0
+    for rec in records:
+        samples = rec.get("samples") or []
+        n_samples += len(samples)
+        n_failed += sum(1 for s in samples if not s)
+
     fl, un = [m for m in mech if m[0]], [m for m in mech if not m[0]]
     fl_t1, un_t1 = [m[1] for m in fl], [m[1] for m in un]
     fl_me = [m[2] for m in fl if m[2] is not None]
@@ -235,7 +277,7 @@ def score(records, human, min_detections, target="binary", min_span_annotators=1
     auc_t1, p_t1 = auc_lower(fl_t1, un_t1)
     # entropy runs the other way: higher = less certain, so swap the groups
     auc_me, p_me = auc_lower(un_me, fl_me) if (fl_me and un_me) else (None, None)
-    return {
+    res = {
         "n_sentences": n_sent,
         "n_matched_spans": n_spans,
         "n_typing_spans": len(typing_pairs),
@@ -249,13 +291,20 @@ def score(records, human, min_detections, target="binary", min_span_annotators=1
                              if (fl_t1 and un_t1) else None,
         },
         "target": target,
+        "n_samples": n_samples,
+        "n_failed_samples": n_failed,
+        "parse_failure_rate": (n_failed / n_samples) if n_samples else None,
         "annotators_per_scored_sentence": dict(sorted(ann_counts.items())),
         "min_span_annotators": min_span_annotators,
         "n_dropped_below_min_annotators": n_dropped_singleton,
         "typing": _correlate(typing_pairs, target),
         "entropy": _correlate(entropy_pairs, target),
         "detection": _correlate(det_pairs, target),
+        "bh": None,   # filled below, once the three tests exist
     }
+    res["bh"] = bh_family([(k, (res[k] or {}).get("point_biserial_p"))
+                           for k in ("typing", "entropy", "detection")])
+    return res
 
 
 def report(res, k_hint=None):
@@ -268,6 +317,18 @@ def report(res, k_hint=None):
         print("  was located by both humans. Nothing can be concluded.")
         return
     unanimous = sum(1 for x in mf if x >= 0.999) / len(mf)
+    pfr = res.get("parse_failure_rate")
+    if pfr is not None:
+        print(f"  samples that failed to parse   {res['n_failed_samples']}/"
+              f"{res['n_samples']}  ({100*pfr:.1f}%)")
+        if pfr > 0.05:
+            print()
+            print("  !! PARSE FAILURE RATE ABOVE 5%. Everything below is computed on")
+            print("     the samples that survived. A failed sample contributes no")
+            print("     spans, so the correlations can look healthy while most of the")
+            print("     run is missing — check the shard .full.log files before")
+            print("     reporting any number from this run.")
+            print()
     print(f"  spans scored for typing        {len(mf)}")
     print(f"  unanimous across samples       {100*unanimous:.1f}%")
     print(f"  mean modal-label frequency     {sum(mf)/len(mf):.4f}")
@@ -286,7 +347,7 @@ def report(res, k_hint=None):
     print("  SIGNAL — sampling uncertainty vs human disagreement")
     print("  (rho comparable to span:logprob / span:entropy in the RQ2 tables)")
     print("=" * 78)
-    print(f"  {'measure':28s} {'rho':>8s} {'p':>9s} {'n':>6s}  target")
+    print(f"  {'measure':28s} {'rho':>8s} {'p':>9s} {'q(BH)':>9s}  {'n':>6s}  target")
     for name, key, target in (
         ("typing (1 - modal freq)", "typing", "human type-disagreement"),
         ("typing (label entropy)", "entropy", "human type-disagreement"),
@@ -297,7 +358,12 @@ def report(res, k_hint=None):
         n = res["n_typing_spans"] if key != "detection" else res["n_matched_spans"]
         rs = f"{rho:+.3f}" if isinstance(rho, (int, float)) else "   n/a"
         ps = f"{p:.4f}" if isinstance(p, (int, float)) else "     n/a"
-        print(f"  {name:28s} {rs:>8s} {ps:>9s} {n:6d}  {target}")
+        # q = BH-adjusted within this run's 3-test family, so these are directly
+        # comparable to the "survives BH" marks on every other RQ2 signal.
+        q = (res.get("bh") or {}).get(key)
+        qs = f"{q:.4f}" if isinstance(q, (int, float)) else "     n/a"
+        star = "*" if isinstance(q, (int, float)) and q < 0.05 else " "
+        print(f"  {name:28s} {rs:>8s} {ps:>9s} {qs:>9s}{star} {n:6d}  {target}")
     print()
     print(f"  sentences paired with both humans: {res['n_sentences']}")
 
@@ -317,6 +383,10 @@ def report(res, k_hint=None):
         print("  to ~1.0 and their difference sits in the 4th decimal, which reads as")
         print("  'no signal' whether or not one is there. AUC asks the discrimination")
         print("  question directly: 0.5 = the report is uninformative, 1.0 = perfect.")
+        print()
+        print("  AUC also reproduces. Over three same-model replicate pairs it moved by")
+        print("  at most 0.027, while the mean gap moved 21-80% and the typing")
+        print("  correlation by up to 0.066. Compare models on AUC, not on the gap.")
         print()
         print(f"  {'spans':28s} {'n':>5s} {'mean top-1':>11s} {'mean max-entropy':>17s}")
         for name, grp in (("FLIPPED across samples", flip),
@@ -346,14 +416,15 @@ def report(res, k_hint=None):
                 print("      logprob is a working uncertainty instrument and should agree")
                 print("      with the sampling measure.")
             elif p < 0.05:
-                print("  >>> SIGNAL PRESENT BUT COMPRESSED. The report does rank flipped")
-                print(f"      spans below unanimous ones (AUC {auc:.3f}, p={p:.4f}), but the")
-                print(f"      whole separation spans {spread:.5f} of probability mass. Squeezed")
-                print("      into that range it survives a rank test against a clean binary")
-                print("      target and dies against a noisy one like human disagreement —")
-                print("      which is how the RQ2 logprob correlation can be null here while")
-                print("      the sampling correlation is not. Report this as limited dynamic")
-                print("      range, NOT as the logprob being blind.")
+                print("  >>> PARTIAL. The report does rank flipped spans below unanimous")
+                print(f"      ones (AUC {auc:.3f}, p={p:.4f}), so it is not blind, but it")
+                print("      separates them far less reliably than a model scoring >=0.85.")
+                print("      Do NOT explain this by the size of the gap below. Measured")
+                print("      across models, the gap does not predict the AUC: one model")
+                print("      separates the groups by 0.00037 of probability mass — an order")
+                print("      of magnitude less than another — and still discriminates far")
+                print("      better (0.864 vs 0.700). Report the AUC; treat WHY it varies")
+                print("      as open.")
             else:
                 print("  >>> THE REPORT IS BLIND TO THE FLIPS. Reported confidence cannot")
                 print(f"      distinguish spans the model flipped (AUC {auc:.3f}, p={p:.4f}).")

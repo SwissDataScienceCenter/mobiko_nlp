@@ -145,6 +145,14 @@ def main() -> None:
                          "--guideline means 'use the preset', not 'use none'.")
     ap.add_argument("--no-decision-support", action="store_true",
                     help="run with no decision-support table")
+    ap.add_argument("--no-relation-schema-in-prompt", action="store_true",
+                    help="drop the '## Relation Schema' section from the annotator "
+                         "system prompt. The schema is still loaded from --schema "
+                         "and still served by the schema_lookup tool. Same flag and "
+                         "same meaning as demo_ag2.py, so a self-consistency arm can "
+                         "match the grid configuration, which pins it OFF "
+                         "(scripts/xrun/grid_config.py). Without it the constructor "
+                         "default applies and the schema IS in the prompt.")
     ap.add_argument("--resume", action="store_true",
                     help="skip sentences already in the output file")
     ap.add_argument("--progress-file", type=Path, default=None,
@@ -190,6 +198,7 @@ def main() -> None:
         critic_model=args.annotator_model,          # unused, must be constructible
         adjudicator_model=args.annotator_model,     # unused
         annotator_temperature=args.annotator_temperature,
+        include_relation_schema=not args.no_relation_schema_in_prompt,
         input_path=args.input.resolve(),
         **corpus_kwargs,
     )
@@ -221,6 +230,15 @@ def main() -> None:
          f"guideline_search={meta.get('guideline_search_registered')} "
          f"relations={'yes' if schema_path else 'none'} "
          f"prompts={meta.get('prompt_set')}")
+    # The three settings that define the arm, read back from run_meta rather than
+    # from argv: dep hints can be flipped by DEPENDENCY_RELATION_HINTS and
+    # force-disabled when spaCy is missing, and the guideline path is a silent
+    # fallback when unset. Printing what was REQUESTED would hide both.
+    prog(f"arm: guideline={meta.get('guideline_path')} "
+         f"guideline_hash={meta.get('guideline_sections_hash')} "
+         f"relation_schema_in_prompt={meta.get('include_relation_schema')} "
+         f"dep_hints={meta.get('use_dependency_relation_hints')} "
+         f"(requested {meta.get('hints_requested')})")
     prog(f"expect {len(todo) * args.k} annotator calls total")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

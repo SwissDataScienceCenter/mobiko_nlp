@@ -20,8 +20,8 @@
 #   MODEL=rcp-kimi-2.7 TAG=kimi27 SENTENCES=56 SHARDS=8 scripts/xrun/run_selfconsistency_remote.sh
 #
 # Every knob of run_selfconsistency.sh (MODEL, TAG, K, SENTENCES, SHARDS, INPUT,
-# OUTDIR, RESUME, PLAN) is forwarded verbatim, so the two scripts share one
-# interface — this one only adds where it runs.
+# OUTDIR, RESUME, PLAN, GUIDELINE, NO_RELATION_SCHEMA) is forwarded verbatim, so
+# the two scripts share one interface — this one only adds where it runs.
 
 set -uo pipefail
 
@@ -42,10 +42,14 @@ cd "$LOCAL_ROOT" || exit 1
 # ── env forwarded into the remote run ───────────────────────────────────────
 # PYTHON is NOT in this list: it is set from REMOTE_PYTHON below, since the
 # local interpreter path is meaningless on the pod.
+# MOBIKO_CODE_VERSION is forwarded because the pod is not a git checkout: without
+# it every record stamps git_commit=null, which is the provenance gap
+# grid_config.py --check refuses to launch with. Export it locally from the repo:
+#   export MOBIKO_CODE_VERSION=$(git rev-parse --short HEAD)
 FORWARD=(MODEL TAG K SENTENCES SHARDS INPUT OUTDIR RESUME PLAN
-         CORPUS GUIDELINE NO_GUIDELINE NO_DECISION_SUPPORT
+         CORPUS GUIDELINE NO_GUIDELINE NO_DECISION_SUPPORT NO_RELATION_SCHEMA
          MOBIKO_ENV_FILE ADJUDICATOR_MODEL ANNOTATOR_TOP_LOGPROBS
-         RCP_ENABLE_THINKING DEPENDENCY_RELATION_HINTS
+         RCP_ENABLE_THINKING DEPENDENCY_RELATION_HINTS MOBIKO_CODE_VERSION
          GUIDELINE_SEARCH_BACKEND GUIDELINE_SEARCH_EMBEDDING_MODEL)
 env_prefix=""
 for v in "${FORWARD[@]}"; do
