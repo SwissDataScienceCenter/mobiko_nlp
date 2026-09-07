@@ -206,3 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .idea
+# Authority snapshots: large, re-fetchable. The manifest beside them is small
+# and IS tracked, because it is the provenance record.
+data/authorities/*
+!data/authorities/manifest.json

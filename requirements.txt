@@ -17,3 +17,4 @@ requests
 pronto
 nltk
 matplotlib
+rapidfuzz>=3.0
