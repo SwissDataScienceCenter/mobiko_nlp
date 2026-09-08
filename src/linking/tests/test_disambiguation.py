@@ -390,6 +390,44 @@ def test_scope_preference_is_not_applied_between_places(d):
     assert len(r.candidates) > 5
 
 
+# ── candidate generation ─────────────────────────────────────────
+#
+# `Dictionary.search` had no caller and had never returned a row: it built an
+# implicit-AND FTS5 query, so any mention carrying one token the index lacks
+# came back empty — which is every mention a candidate generator exists for.
+
+def test_the_search_query_is_ored_not_anded(d):
+    """AND is the bug. One absent token must not empty the whole result."""
+    q = d._fts_query("Salvelina fontinalis")
+    assert " OR " in q and '" "' not in q
+
+
+@pytest.mark.parametrize("text", ["3,4-dichlorophenol", "species' range", 'a "q" b'])
+def test_punctuation_in_a_mention_is_not_an_fts_syntax_error(d, text):
+    """`3,4-dichlorophenol` and `species'` are legitimate mentions, and both are
+    a syntax error unquoted. Interior punctuation is load-bearing elsewhere in
+    this module, so it reaches here intact and has to survive."""
+    d.search(text, ["envo", "pato"], limit=5)          # must not raise
+
+
+@needs_gbif
+def test_a_misspelling_reaches_its_concept_as_a_candidate(d):
+    """The case Phase 7 asks for. Before the fix this returned zero rows while
+    *Salvelinus fontinalis* sat in the index."""
+    cands = d.search("Salvelina fontinalis", ["gbif"], limit=300)
+    assert cands
+    assert any(m.label == "Salvelinus fontinalis" for m in cands)
+
+
+@needs_geonames
+def test_a_prefix_reaches_a_shorter_variant(d):
+    """`annamites` must find *Annamite Mountains*, i.e. the prefix has to drop
+    the mention's own tail — `"annamites"*` matches only terms starting with
+    all of it, and the index holds the shorter `annamite`."""
+    assert any(m.label == "Annamite Mountains"
+               for m in d.search("Annamites", ["geonames"], limit=50))
+
+
 @pytest.mark.parametrize("mention", ["mountains", "Mountains", "mountain"])
 def test_mountains_is_not_an_undersea_mountain(d, mention):
     """ENVO ships this pair with their scopes swapped: `mountains` is an EXACT

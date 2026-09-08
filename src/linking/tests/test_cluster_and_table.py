@@ -113,6 +113,27 @@ def test_a_shared_authority_does_not_merge_across_labels():
     assert len({comp[s[0]] for s in sigs}) == 3
 
 
+@pytest.mark.parametrize("a,b", [
+    ("gradient of temperature", "temperature gradient"),
+    ("rates of diversification", "diversification rates"),
+    ("the number of", "number"),
+    ("to conserve", "conserve"),
+    ("length from head to abdomen", "head-to-abdomen length"),
+    ("small patches of", "small patches"),
+])
+def test_function_words_do_not_split_an_entity(a, b):
+    """The key is an unordered multiset, so a preposition or an infinitive
+    marker carries nothing that survives into it. All 15 merges this produces
+    on the gold were hand-checked and every one is a genuine variant."""
+    assert content_key(a, "BIOTIC PROPERTY") == content_key(b, "BIOTIC PROPERTY")
+
+
+def test_a_phrase_of_only_function_words_keeps_them():
+    """Otherwise every such span collapses onto one empty key."""
+    assert content_key("of the", "CONCEPT")[1]
+    assert content_key("of the", "CONCEPT") != content_key("in on", "CONCEPT")
+
+
 def test_determiners_are_stripped_but_quantifiers_are_not():
     """"the lake" is "lake"; "all species" is not "species" — the schema types
     quantifiers as QUANTITATIVE PROPERTY in their own right."""
@@ -255,6 +276,39 @@ def test_gap_report_lists_the_entities_that_stayed_unresolved(tmp_path):
     assert len(listed) == meta["n_entities_project_local"]
     assert meta["n_entities_from_authorities"] + meta["n_entities_project_local"] \
         == meta["n_entities"]
+
+
+@pytest.mark.skipif(not artifact_path("ontologies").exists(),
+                    reason="compiled dictionary absent")
+def test_the_two_entity_reports_partition_the_entities(tmp_path):
+    """--linked-report and --gap-report are a pair: what an authority caught
+    and what it missed. Between them they must account for every entity
+    exactly once, or one of the two is quietly lying about coverage."""
+    src = ROOT / "data/aug_runs/combined_M_D_Mark_postprocessed.jsonl"
+    if not src.exists():
+        pytest.skip("human gold not present")
+    out, gap, linked = (tmp_path / "r.jsonl", tmp_path / "gap.tsv",
+                        tmp_path / "linked.tsv")
+    subprocess.run([sys.executable, "-m", "src.linking.resolve_corpus",
+                    "--input", str(src), "--out", str(out), "--no-split",
+                    "--gap-report", str(gap), "--linked-report", str(linked)],
+                   cwd=ROOT, capture_output=True, text=True, check=True)
+
+    def ids(path, col):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        i = lines[0].split("\t").index(col)
+        return {l.split("\t")[i] for l in lines[1:]}
+
+    gap_ids, linked_ids = ids(gap, "entity_id"), ids(linked, "entity_id")
+    assert linked_ids, "no grounded entities reported"
+    assert not (gap_ids & linked_ids), "an entity is in both reports"
+
+    rows = [json.loads(l) for l in out.open(encoding="utf-8")]
+    assert linked_ids == {r["entity_id"] for r in rows if r["authority_uri"]}
+    assert gap_ids | linked_ids == {r["entity_id"] for r in rows if r["entity_id"]}
+
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert len(linked_ids) == meta["n_entities_from_authorities"]
 
 
 # ── the singular fallback ────────────────────────────────────────

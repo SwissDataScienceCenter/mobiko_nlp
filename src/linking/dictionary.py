@@ -36,7 +36,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from src.linking.authorities.registry import (ARTIFACT_DIR, GROUPS,
                                                UNIVERSAL_TYPE, artifact_path)
-from src.linking.mention_norm import NORMALIZER_VERSION
+from src.linking.mention_norm import NORMALIZER_VERSION, normalize_key
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 # whole design exists to avoid.
 CONFIDENT_SCOPES: Tuple[str, ...] = ("label", "exact", "vernacular")
 LOOSE_SCOPES: Tuple[str, ...] = ("narrow", "broad", "related")
+
+# Candidate generation matches long terms by a PREFIX of themselves, so that a
+# variant ending reaches its concept in both directions: `"annamites"*` finds
+# only terms starting with all of it and so misses the shorter `annamite`,
+# whereas dropping the tail finds both. Up to FTS_PREFIX_DROP characters go,
+# never taking a term below FTS_PREFIX_MIN — enough for a plural or a Latin
+# case ending, short of turning every term into a wildcard.
+FTS_PREFIX_MIN = 5
+FTS_PREFIX_DROP = 3
 
 
 class StaleArtifactError(RuntimeError):
@@ -169,6 +178,20 @@ class Dictionary:
         return [Match(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], r[8])
                 for r in rows]
 
+    @staticmethod
+    def _fts_query(text: str) -> str:
+        """An FTS5 MATCH expression for candidate generation. See ``search``."""
+        terms = []
+        for tok in normalize_key(text).split():
+            tok = tok.replace('"', "")
+            if not tok:
+                continue
+            if len(tok) > FTS_PREFIX_MIN:
+                terms.append(f'"{tok[:max(FTS_PREFIX_MIN, len(tok) - FTS_PREFIX_DROP)]}"*')
+            else:
+                terms.append(f'"{tok}"')
+        return " OR ".join(terms)
+
     def search(self, text: str, sources: Sequence[str],
                limit: int = 10) -> List[Match]:
         """BM25 candidate generation over alias names.
@@ -176,11 +199,25 @@ class Dictionary:
         Candidates only — never a decision. Ranking by string overlap cannot
         tell a synonym from an antonym, which is the entire reason the matcher
         keeps retrieval and adjudication apart.
+
+        **The terms are OR-ed, and that is the whole point.** FTS5 puts an
+        implicit AND between bare terms, and an AND query inverts what a
+        candidate generator is for: a correctly spelled mention was already
+        found by ``lookup``, and a misspelled one has a token the index does
+        not contain, so requiring every token returns nothing exactly when
+        candidates are needed. Measured: `Salvelina fontinalis` returned 0
+        candidates while *Salvelinus fontinalis* sat in the index on 4 rows;
+        the same tokens OR-ed return 567. This method had no caller when the
+        bug was found, so it had never once produced a row.
+
+        Long terms are matched as prefixes, so a variant ending still reaches
+        its concept — `annamites` finds *Annamite Mountains*. Every term is
+        quoted because a token may legitimately carry punctuation
+        (`3,4-dichlorophenol`, `species'`), which is a syntax error unquoted.
         """
-        terms = [t for t in text.split() if t]
-        if not terms or not sources:
+        query = self._fts_query(text)
+        if not query or not sources:
             return []
-        query = " ".join(f'"{t}"' for t in terms)
         src_ph = ",".join("?" * len(sources))
         sql = self._union(
             f"""SELECT c.uri, c.curie, c.source, c.label, a.scope, a.name,

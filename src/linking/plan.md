@@ -1472,3 +1472,174 @@ supplementary plural table needed here.
 **89 tests pass.** The fallback is pinned by the same invariant as `--no-split`:
 turning it off yields a strict weakening of the same table, never a different
 one.
+
+## Fuzzy matching measured and rejected; `Dictionary.search` repaired (8 Sep 2026)
+
+**Rejected for general use.** Over 1,665 unresolved forms, identity scopes only,
+exact matches excluded, `fuzz.ratio` over BM25 candidates:
+
+    thr 95 -> 11 forms / 14 mentions      thr 90 -> 37 / 44
+    thr 92 -> 24 forms / 28 mentions      thr 88 -> 58 / 79
+
+Hand-checked precision is roughly 45% and **does not improve as the threshold
+rises**, which is the finding. The top-scoring errors are one-character
+taxonomic differences, and in Latin nomenclature the suffix IS the rank:
+
+    Arachnidae     -> Arachnoidae   95.2     different family
+    Scarabaeinae   -> Scarabaeidae  91.7     subfamily vs family
+    Actinomycetota -> Actinomycetia 88.9     phylum vs class
+
+So string distance is anti-correlated with semantic distance for exactly the
+strings this corpus is about. It also resurrects `Dipteran` -> *Saxifraga*, and
+brings back `landscapes` -> "Landscape" and `mountain ranges` -> "Mountain Home
+Range" — capitalised, so the proper-name rule waves them through. Worst by
+volume: `human wellbeing` -> **human dwelling**, 7 mentions at 89.7.
+`predator behavior` -> *antipredation* behavior inverts the meaning.
+
+WRatio is worse still: its partial-ratio component gives 90 to any candidate
+CONTAINED IN the mention, so `Bidoup Nui Ba National Park` — the one case whose
+right answer is NIL, since Bidoup is genuinely absent — draws a confident 90.0
+to "Núi Ba".
+
+**Every true positive has a better deterministic fix**, which is the useful
+half of the result: morphology Morphy missed (`interglacials`, `biomarkers`,
+`nutrients`), en-US/en-GB spelling (`behavior`/`behaviour`), and PATO's
+systematic comparative pattern (`higher elevations` -> increased elevation,
+6+ mentions). The only irreducible fuzzy case is the typo `Salvelina
+fontinalis`, 2 mentions. A narrow rule — GBIF only, >=2 tokens, species rank,
+ratio 90-100 — yields exactly that one form with zero false positives, and
+would close Phase 7 item 27. Not built; noted.
+
+### `Dictionary.search` was broken, not merely unused
+
+It built `"Salvelina" "fontinalis"`, and FTS5 puts an implicit **AND** between
+bare terms. That inverts what a candidate generator is for: a correctly spelled
+mention was already found by `lookup`, and a misspelled one has a token the
+index does not contain, so requiring every token returns nothing exactly when
+candidates are needed. Measured: 0 candidates while *Salvelinus fontinalis* sat
+in the index on 4 rows; the same tokens OR-ed return 567. With no caller and no
+test, it had never once produced a row — and would have handed its first caller
+a plausible-looking empty result, the "not attempted vs attempted and missed"
+confusion the rest of the module is careful about.
+
+Fixed: terms OR-ed; long terms matched by a prefix of themselves with up to 3
+trailing characters dropped (`"annamites"*` matches only terms starting with all
+of it and so misses the shorter `annamite` — dropping the tail finds both);
+every term quoted, because `3,4-dichlorophenol` and `species'` are legitimate
+mentions and a syntax error unquoted. Known targets now reachable at rank 1
+where none was reachable before: *Salvelinus fontinalis*, *Annamite Mountains*,
+ecocore `species range`. `Langbian Plateau` is still not reached — the index
+holds "Plateau du Lang Bian", so `Langbian` vs `Lang Bian` is a tokenisation
+gap that needs a trigram index, not a prefix. 5 tests. **96 tests pass.**
+
+## Clustering the unlinked mentions — reviewed and tightened (8 Sep 2026)
+
+State before: 2,641 unresolved mentions -> 1,554 project-local entities, 1,065
+of them singletons, 94 merging more than one surface form. The exact-key design
+holds up; three candidate relaxations were measured against it.
+
+**Taken — function words are dropped from the key.** The key is an unordered
+multiset of lemmatised words, so a preposition, conjunction or infinitive
+marker carries nothing that survives into it, yet it was still splitting
+entities. Dropping `of in on for with to from by at and or` from anywhere in
+the phrase (determiners were already stripped from the front) gives **15
+merges, and all 15 were checked by hand and are genuine**:
+
+    gradient of temperature / temperature gradient
+    rates of diversification / diversification rates
+    length from head to abdomen / head-to-abdomen length
+    the number of / number      to conserve / conserve      in space / space
+    a decrease in / decrease    centres of / centres        2070, / by 2070
+    implementation of / implementation   importance of / importance
+    majority of / majority      small patches of / small patches
+    dates of ice-off / ice-off date      identify / to identify
+
+Quantifiers still stay, for the reason already recorded. A span consisting of
+nothing but function words keeps them, or every such span collapses onto one
+empty key.
+
+Result: 1,754 -> **1,738 entities** (200 grounded, 1,538 project-local).
+Diffed against the previous run: 118 mentions changed `entity_id`, no outcome
+changed, **nothing lost its grounding**, and one mention gained it — `east of`
+now joins the grounded `east` at PATO:0045092, which is right. Note this
+renumbers the affected ids; `entity_id` is content-derived, so changing the key
+function is a one-time migration. Cheap now, expensive once anything consumes
+the table.
+
+**Rejected — an irregular-plural table merges nothing.** Morphy's blind spots
+turn out not to bite clustering at all: `interglacials`, `biomarkers` have no
+singular counterpart anywhere in the corpus, so there is nothing to merge them
+with. They matter for LINKING, where the singular fallback already covers the
+words Morphy does handle. (An earlier measurement appeared to show the entity
+count going UP; that was a confounded replication of `content_key`, not a
+finding.)
+
+**Blocked — coref links, Phase 5 item 21.** The postprocessed gold carries only
+`text`, `spans` and `relations`; there are no coref links in it. The only coref
+available is model-generated under `cache/coref/`, and Apertus-70B invents
+about 40% of its mentions. This is blocked on data, not on code.
+
+### Noted, not fixed
+
+A mention that reaches a grounded entity by CHAINING carries `entity_label:
+null`, because the label is looked up in `clusters` and a chained row's
+`entity_id` is the URI-named one. Cosmetic, pre-existing, and visible on the
+`east of` row above.
+
+**103 tests pass.**
+
+## Coref measured — it belongs to the relation layer, not to linking (8 Sep 2026)
+
+Correction to the entry above: the coref links DO exist, in
+`data/aug_runs/{Mark,Davnah}_relation_input.json` (not in the postprocessed
+gold, which carries only text/spans/relations). 52 per file, 104 total, from
+`rcp-kimi-2.7` — not the Apertus model whose mentions are ~40% invented. Each
+carries the anaphor with offsets, the antecedent text, its sentence and offset,
+a kind (pronoun / demonstrative / definite_np) and a confidence.
+
+**Alignment.** Only 6 of 104 anaphors match an annotated span exactly; allowing
+a leading determiner ("the coniferous forest" vs the span "coniferous forest")
+raises it to **43**. The other 61 are pronouns and demonstratives the
+annotators did not mark as spans at all, which is correct for their schema.
+
+**As a replacement text for matching: zero gain, six losses.** Resolving each
+of the 43 through its antecedent instead of its surface form:
+
+    nil -> nil 33 | linked -> nil 5 | linked -> linked 2
+    nil -> ambiguous 2 | ambiguous -> nil 1        became linked: 0
+
+Structural, not incidental: antecedents are long descriptive noun phrases
+("areas of high species richness", "The Sierra Nevada of California",
+"a violation of independence between data points") and long phrases are not in
+ontologies. The antecedent is LESS matchable than the anaphor, which is the
+same modifier-preserving problem from the other direction.
+
+**As same-entity edges for clustering (Phase 5 item 21): 5 merges, 4 of them
+forbidden.** Grouping the anaphors that share an antecedent:
+
+    mountain decay      This process ABIOTIC PROCESS + process CONCEPT
+    coniferous forest   habitat SPATIAL ENTITY + habitat BIOTIC ENTITY
+    Sierra Nevada …     mountain range ABIOTIC + SPATIAL ENTITY
+    the Great Escarp…   Escarpment + eastern Escarpment   (same label)
+    a novel conservation index (CI)   CI + index           (same label)
+
+The first three cross a LABEL, which full-label identity forbids — and the
+second is the `habitat` case that decision was settled on by name. The fourth
+crosses a modifier, which modifier-preserving granularity forbids. Only
+`CI`/`index` is a legitimate merge, and it is an acronym pair, i.e. exactly the
+thing a content key cannot catch and coref is not needed for either.
+
+**Why this is systematic rather than unlucky.** Coref tracks DISCOURSE
+REFERENTS; the identity model tracks CONCEPTS. "the habitat" and "coniferous
+forest" are one referent and two concepts, and both statements are true at
+their own layer. So feeding coref in as same-entity edges would have quietly
+undone both identity decisions. Phase 5 item 21 should be considered answered
+in the negative and closed.
+
+**Where it does belong:** the relation layer. A relation whose argument is "the
+habitat" needs to know which habitat, and that is a per-mention question about
+a discourse referent — which is what coref actually provides. `match.py`'s
+existing AMBIGUOUS reason ("its referent depends on coreference, which is not
+resolved here") stays accurate as a statement about the mention; what it should
+NOT imply is that resolving the coref would produce a link here. Measured: it
+would not.

@@ -339,6 +339,9 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--gap-report", type=Path, default=None,
                     help="also write the unresolved clusters ranked by document "
                          "frequency: the measured ontology coverage gap")
+    ap.add_argument("--linked-report", type=Path, default=None,
+                    help="also write one row per GROUNDED entity — the mirror of "
+                         "--gap-report, and what a precision check reads")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -477,6 +480,10 @@ def main(argv: List[str] | None = None) -> int:
     # moved 28 entities to the wrong side of the split.
     grounded_entities: set = set()
     local_entities: set = set()
+    # One record per grounded entity, for the report that mirrors --gap-report:
+    # the gap report is what an authority MISSED, this is what it caught, and
+    # the second is what a precision check has to read.
+    linked: Dict[str, dict] = {}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as fh:
         for r in rows:
@@ -490,6 +497,23 @@ def main(argv: List[str] | None = None) -> int:
                             ("cluster" if eid else None)))
             if eid:
                 (grounded_entities if authority_uri else local_entities).add(eid)
+            if eid and authority_uri:
+                e = linked.setdefault(eid, {
+                    "entity_type": r["entity_type"], "uri": authority_uri,
+                    "curie": None, "label": None, "source": None,
+                    "scope": None, "surface": Counter(), "docs": set(),
+                    "via_singular": 0,
+                })
+                e["surface"][r["text"]] += 1
+                e["docs"].add(r["doc_id"])
+                e["via_singular"] += int(r["concept_source"] == "singular")
+                # A mention that reached this entity by chaining carries no
+                # Match of its own; take the naming details from one that did.
+                if res.outcome is Outcome.LINKED and res.match and not e["curie"]:
+                    e["curie"] = res.match.curie or res.match.uri
+                    e["label"] = res.match.label
+                    e["source"] = res.match.source
+                    e["scope"] = res.match.scope
             fh.write(json.dumps({
                 "mention_id": r["mention_id"],
                 "source_file": r["source_file"],
@@ -588,6 +612,28 @@ def main(argv: List[str] | None = None) -> int:
         print(f"      {args.gap_report}  ({len(ranked):,} unresolved entities"
               + (f"; {grounded_after_chaining} more chained into a grounded one"
                  if grounded_after_chaining else "") + ")")
+
+    if args.linked_report:
+        # Same ordering as the gap report — document frequency first, then
+        # mentions, then the id — so the two read as one pair and both are
+        # byte-reproducible.
+        order = sorted(linked.items(),
+                       key=lambda kv: (-len(kv[1]["docs"]),
+                                       -sum(kv[1]["surface"].values()), kv[0]))
+        args.linked_report.parent.mkdir(parents=True, exist_ok=True)
+        with args.linked_report.open("w", encoding="utf-8") as fh:
+            fh.write("doc_freq\tmentions\tentity_type\tconcept\tcurie\tsource"
+                     "\tscope\tvia_singular\tentity_id\tauthority_uri"
+                     "\tsurface_forms\n")
+            for eid, e in order:
+                forms = "; ".join(f"{f}({n})" for f, n in e["surface"].most_common())
+                fh.write(f"{len(e['docs'])}\t{sum(e['surface'].values())}\t"
+                         f"{e['entity_type']}\t{e['label'] or ''}\t{e['curie'] or ''}\t"
+                         f"{e['source'] or ''}\t{e['scope'] or ''}\t"
+                         f"{e['via_singular']}\t{eid}\t{e['uri']}\t{forms}\n")
+        by_source = Counter(e["source"] for _, e in order)
+        print(f"      {args.linked_report}  ({len(order):,} grounded entities: "
+              + ", ".join(f"{n} {s}" for s, n in by_source.most_common()) + ")")
     return 0
 
 

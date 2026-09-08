@@ -97,6 +97,26 @@ ROLES = frozenset({"ENTITY", "PROCESS", "PROPERTY", "CONCEPT"})
 # "all species" as "species" would discard a distinction the annotators drew.
 _DETERMINERS = frozenset({"the", "a", "an", "this", "that", "these", "those"})
 
+# Prepositions, conjunctions and the infinitive marker, dropped from ANYWHERE in
+# the phrase rather than only the front. The words are already an unordered
+# multiset, so what these carry is not word order — it is nothing:
+#
+#     gradient of temperature  =  temperature gradient
+#     rates of diversification =  diversification rates
+#     the number of            =  number
+#     to conserve              =  conserve
+#     length from head to abdomen = head-to-abdomen length
+#
+# All 15 merges this produces on the gold were checked by hand and every one is
+# a genuine variant. Quantifiers ("all", "many", "several") stay, for the same
+# reason as above: the schema types them in their own right.
+#
+# `or toks` guards the degenerate case — a span that is nothing but function
+# words keeps them rather than becoming an empty key that swallows every other
+# empty one.
+_FUNCTION_WORDS = frozenset({"of", "in", "on", "for", "with", "to", "from",
+                             "by", "at", "and", "or"})
+
 _wn = None
 
 
@@ -179,6 +199,7 @@ def content_key(text: str, entity_type: str) -> Tuple[str, Tuple[str, ...]]:
     tokens = [t for t in normalize_key(text).replace("-", " ").split() if t]
     while tokens and tokens[0] in _DETERMINERS:
         tokens = tokens[1:]
+    tokens = [t for t in tokens if t not in _FUNCTION_WORDS] or tokens
     return ((entity_type or "").strip().upper(),
             tuple(sorted(_lemma(t) for t in tokens)))
 
