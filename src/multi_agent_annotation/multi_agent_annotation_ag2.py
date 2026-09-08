@@ -1562,6 +1562,25 @@ def _critic_is_satisfied(msg: dict) -> bool:
     return False
 
 
+# A turn's prompt is not a turn's output. The revision prompts embed the agent's
+# OWN previous JSON (see _build_annotator_revision_msg), so a termination check
+# that asks only "does this content parse as my output?" fires the moment the
+# prompt arrives — ending the turn before the model is ever called. That is what
+# silently disabled round 2 of the deliberation loop on every run: rounds_used
+# said 2, while the round-2 Annotator turn recorded 0 tokens and 0.0 seconds.
+#
+# Every prompt we construct is tagged with this sentinel and the check refuses to
+# terminate on a message carrying it. A sentinel rather than a role/name test
+# because both the prompt and the agent's real reply reach the executor from the
+# same sender, so AG2's message metadata cannot separate them.
+TASK_PROMPT_SENTINEL = "<!-- mobiko:task-prompt -->"
+
+
+def tag_task_prompt(message: str) -> str:
+    """Mark a message as a prompt, so no termination check mistakes it for output."""
+    return f"{TASK_PROMPT_SENTINEL}\n{message}"
+
+
 def _make_structured_termination_check(
     parse_fn: Callable[[str], Optional[Any]],
 ) -> Callable[[dict], bool]:
@@ -1579,9 +1598,12 @@ def _make_structured_termination_check(
     the console with duplicate content.
     """
     def _is_done(msg: dict) -> bool:
+        content = (msg.get("content") or "").strip()
+        # A tagged prompt can never be this turn's output, however well it parses.
+        if TASK_PROMPT_SENTINEL in content:
+            return False
         if _is_final_terminate_msg(msg):
             return True
-        content = (msg.get("content") or "").strip()
         return bool(content) and parse_fn(content) is not None
     return _is_done
 
@@ -2822,7 +2844,7 @@ class MultiAgentAnnotator:
         reset_logprob_capture()
         adj_result = self.adjudicator.initiate_chat(
             recipient=self.adj_executor,
-            message=adjudicator_msg,
+            message=tag_task_prompt(adjudicator_msg),
             max_turns=self._adjudicator_max_turns(),
         )
         # Read the buffer NOW: the retry paths below issue further calls that
@@ -3477,7 +3499,7 @@ class MultiAgentAnnotator:
         _t0 = time.perf_counter()
         chat = agent.initiate_chat(
             recipient=executor,
-            message=message,
+            message=tag_task_prompt(message),
             max_turns=self._agent_turn_max_turns(),
         )
         elapsed_s = time.perf_counter() - _t0

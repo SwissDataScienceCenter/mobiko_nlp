@@ -157,8 +157,18 @@ def record_signals(rec: dict) -> Dict[str, Any]:
     all_critic = sum(len(c["disagreements"]) for c in crit)
     adj = len(tl["adjudication"]["resolutions"])
     rounds = rec.get("rounds_used", len(crit))
+    # rounds_used counts turns the loop ENTERED. A turn can be entered and
+    # produce nothing — that is exactly how a termination bug kept round 2 from
+    # ever calling the model while this field still read 2. Count what actually
+    # came back, so the two can never be conflated again.
+    productive = sum(
+        1 for m in rec.get("messages", [])
+        if m.get("agent") == "Annotator" and (m.get("content") or "").strip()
+    )
     return {
         "rounds_used": rounds,
+        "annotator_turns_productive": productive,
+        "rounds_invoked_but_empty": max(0, rounds - productive),
         "r1_disagreements": r1_dis,
         "r1_agreements": r1_agr,
         "r1_rate": r1_dis / (r1_dis + r1_agr) if (r1_dis + r1_agr) else 0.0,
@@ -249,6 +259,7 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
 
     traj = Counter()
     direction = Counter()
+    n_second_annotation = 0   # records that HAVE a round-2 annotation to follow
 
     n_ent = n_step = n_rule = 0
 
@@ -293,6 +304,8 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
             adj_resolutions_total += len(res)
 
         # convergence trajectory: follow each round-1 dispute into the revision
+        if len(annotator_rounds) >= 2:
+            n_second_annotation += 1
         if critic_rounds and len(annotator_rounds) >= 2:
             next_ents = annotator_rounds[1]
             for d in critic_rounds[0]["disagreements"]:
@@ -370,6 +383,11 @@ def analyze(records: List[dict]) -> Dict[str, Any]:
         "top_confusions_all_rounds": top(taxonomy_all, 20),
         "missing_entity_types": dict(missing_types.most_common()),
         "convergence_trajectory": {
+            # Without this denominator a 0 here is ambiguous: it reads as "the
+            # Annotator never changed its mind" when it can equally mean "there
+            # was no second annotation to compare against". That ambiguity hid a
+            # dead round-2 across every run in the project.
+            "records_with_second_annotation": n_second_annotation,
             "round1_disputes_followed": followed,
             "resolved_by_round2": traj["resolved"],
             "persisted_to_round2": traj["persisted"],
