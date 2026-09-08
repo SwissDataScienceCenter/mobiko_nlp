@@ -35,8 +35,16 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import sys
+
 from eval_utils import stamp_provenance
-from label_norm import canonicalize_entity_type
+
+# Running this as a script puts only evaluation/ on sys.path, so the package
+# root has to be added before label_norm (which lives there) can be imported.
+_PKG = Path(__file__).resolve().parent.parent
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))
+from label_norm import canonicalize_entity_type  # noqa: E402
 from typing import Any, Dict, List, Optional
 
 _THIS_DIR = Path(__file__).resolve().parent

@@ -51,7 +51,6 @@ from collections import defaultdict
 from pathlib import Path
 
 from eval_utils import stamp_provenance
-from label_norm import canonicalize_entity_type
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +67,10 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent   # …/multi_agent_annotatio
 for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+# Must come AFTER the path block above: label_norm lives at the package root,
+# which is only importable once _PKG_ROOT is on sys.path.
+from label_norm import canonicalize_entity_type  # noqa: E402
 from deliberation_history import (  # noqa: E402
     reconstruct_timeline, record_signals, agent_disagreed_spans,
     norm, label_of, overlaps,

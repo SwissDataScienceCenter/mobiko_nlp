@@ -34,7 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from src.linking.authorities.registry import ARTIFACT_DIR, GROUPS, artifact_path
+from src.linking.authorities.registry import (ARTIFACT_DIR, GROUPS,
+                                               UNIVERSAL_TYPE, artifact_path)
 from src.linking.mention_norm import NORMALIZER_VERSION
 
 logger = logging.getLogger(__name__)
@@ -90,11 +91,15 @@ class Dictionary:
             self._schemas.append((schema, group))
 
         self._routing: Dict[str, Set[str]] = defaultdict(set)
+        self._universal: Set[str] = set()
         self._source_group: Dict[str, str] = {}
         for schema, group in self._schemas:
             for source, etype in self._conn.execute(
                     f"SELECT source, entity_type FROM {schema}.source_serves"):
-                self._routing[etype].add(source)
+                if etype == UNIVERSAL_TYPE:
+                    self._universal.add(source)
+                else:
+                    self._routing[etype].add(source)
                 self._source_group[source] = group
 
     # ── construction ─────────────────────────────────────────────
@@ -125,10 +130,15 @@ class Dictionary:
     def sources_for(self, entity_type: str) -> Set[str]:
         """Which sources may answer for a canonicalised entity type.
 
+        Universal authorities (the concept ontologies) answer for every type;
+        the name authorities answer only for the types they are gated to. See
+        ``registry.Authority`` for why the two are treated differently.
+
         Empty means the type is not routable with the artifacts present — which
         the caller must report as "not attempted", not as a miss.
         """
-        return self._routing.get((entity_type or "").strip().upper(), set())
+        gated = self._routing.get((entity_type or "").strip().upper(), set())
+        return gated | self._universal
 
     # ── lookup ───────────────────────────────────────────────────
 

@@ -35,9 +35,26 @@ normaliser handles case, dashes and diacritics. Nothing merges across a modifier
 difference, so `bird species`, `bat species` and `species` stay three entities,
 as do `temperature`, `high temperatures` and `peak water temperature`.
 
-Entity type is part of the key because type is part of entity identity
-(decision, 7 Sep): `biodiversity` as BIOTIC PROPERTY and as BIOTIC ENTITY are
-two entities.
+Identity is the FULL entity label; the ontology link is what is shared
+----------------------------------------------------------------------
+The label schema has two layers (MoBiKo_label_guidance_v4, "Step 2"): an
+ontological **role** — entity, process, property, concept — and a **domain** —
+abiotic, biotic, anthropogenic, spatial, temporal, quantitative, qualitative.
+"BIOTIC ENTITY" is the pair.
+
+Identity keys on the **pair**. `habitat` typed ABIOTIC ENTITY, BIOTIC ENTITY and
+SPATIAL ENTITY is three nodes, one per label — and all three carry the same
+``authority_uri``, ENVO:01000739, so the ontological entity they share is
+explicit rather than implied (decision, 7 Sep, superseding the role-only key
+tried earlier the same day). In RDF that is three nodes with `skos:exactMatch`
+to one ENVO term.
+
+The role/domain split is still computed and exposed (``entity_role``,
+``entity_domain``), because the distinction is real and analyses want it; it
+just does not decide identity. Keying on the role alone merged 213 mentions that
+the domain distinguishes, and the merge was not recoverable afterwards, whereas
+keeping them apart and sharing an authority_uri is recoverable in both
+directions.
 
 Why ids are content-derived rather than sequential
 --------------------------------------------------
@@ -71,6 +88,10 @@ logger = logging.getLogger(__name__)
 ID_PREFIX = "mobiko:e"
 ID_LEN = 12
 
+# The ontological roles of the schema. A label's LAST word carries the role;
+# everything before it is the domain. CONCEPT takes no domain.
+ROLES = frozenset({"ENTITY", "PROCESS", "PROPERTY", "CONCEPT"})
+
 # Determiners only. Quantifiers ("all", "many", "several") are NOT stripped:
 # the schema types them as QUANTITATIVE PROPERTY in their own right, so treating
 # "all species" as "species" would discard a distinction the annotators drew.
@@ -102,13 +123,75 @@ def _lemma(token: str) -> str:
     return _wn.morphy(token, _wn.NOUN) or token
 
 
+# Trimmed from the head token before lemmatising. `normalize_key` strips
+# punctuation only from the ends of the WHOLE string, so "Annamites:" arrives
+# with the colon still attached to the word Morphy has to recognise.
+_HEAD_TRIM = " \t\n.,;:!?()[]{}\"'`"
+
+
+def singular_form(text: str) -> Optional[str]:
+    """The mention with its HEAD noun singularised, or None if it is unchanged.
+
+    A surface form, not a key — `match.resolve` must be given surface text.
+    **The capitalisation is preserved deliberately.** It is what the proper-name
+    rule reads, and folding it here would hide the exact failure morphology was
+    demoted for: `landscapes` has to arrive as lowercase `landscape` so that it
+    can still be refused against the settlement named Landscape.
+
+    Only the head is touched. Lemmatising every token is right for the identity
+    key, where the words are an unordered multiset, and wrong here, where the
+    result has to be a phrase an authority might actually list.
+    """
+    tokens = (text or "").split()
+    if not tokens:
+        return None
+    head = tokens[-1].strip(_HEAD_TRIM)
+    if not head:
+        return None
+    lemma = _lemma(head.lower())
+    if lemma == head.lower():
+        return None
+    if head[:1].isupper():
+        lemma = lemma[:1].upper() + lemma[1:]
+    return " ".join(tokens[:-1] + [lemma])
+
+
+def split_entity_type(entity_type: str) -> Tuple[str, Optional[str]]:
+    """(role, domain) for a canonicalised label. "BIOTIC ENTITY" -> ("ENTITY", "BIOTIC").
+
+    An off-schema label whose last word is not a known role is returned whole as
+    the role, with no domain. That keeps it distinct rather than guessing which
+    role was meant — the same choice `label_norm.canonicalize_entity_type` makes
+    when it surfaces an unknown label instead of repairing it. The gold carries
+    a handful: NEGATION, CHANGE, QUANTITATIVE CHANGE, COMPARATIVE PROPERTY.
+    """
+    label = (entity_type or "").strip().upper()
+    if not label:
+        return "", None
+    head, _, last = label.rpartition(" ")
+    if last in ROLES:
+        return last, (head or None)
+    return label, None
+
+
 def content_key(text: str, entity_type: str) -> Tuple[str, Tuple[str, ...]]:
-    """The identity key: (entity type, sorted lemmatised content words)."""
+    """The identity key: (full entity label, sorted lemmatised content words)."""
     tokens = [t for t in normalize_key(text).replace("-", " ").split() if t]
     while tokens and tokens[0] in _DETERMINERS:
         tokens = tokens[1:]
     return ((entity_type or "").strip().upper(),
             tuple(sorted(_lemma(t) for t in tokens)))
+
+
+def surface_key(text: str) -> Tuple[str, ...]:
+    """The words alone, with no label. Groups a phrase across its labels.
+
+    `habitat` under three labels is three entities by design, but an analysis
+    that wants "every habitat node" needs a handle on them. For grounded
+    entities the shared ``authority_uri`` already provides one; this is the
+    equivalent for entities no authority covers.
+    """
+    return content_key(text, "")[1]
 
 
 def entity_id(key: Tuple[str, Tuple[str, ...]]) -> str:
@@ -120,9 +203,10 @@ def entity_id(key: Tuple[str, Tuple[str, ...]]) -> str:
 @dataclass
 class Cluster:
     entity_id: str
-    entity_type: str
+    role: str
     key: Tuple[str, ...]
     label: str                              # most frequent surface form
+    entity_types: Counter = field(default_factory=Counter)   # every label seen
     surface_forms: Counter = field(default_factory=Counter)
     mention_uids: List[str] = field(default_factory=list)
     doc_ids: set = field(default_factory=set)
@@ -134,6 +218,19 @@ class Cluster:
     @property
     def doc_frequency(self) -> int:
         return len(self.doc_ids)
+
+    @property
+    def entity_type(self) -> str:
+        """The cluster's label. Identity keys on it, so there is exactly one.
+
+        Read off ``entity_types`` rather than stored separately because the key
+        already carries it; the counter is kept for the mention counts. Ties are
+        broken alphabetically for the same reason ``label`` breaks them that
+        way — the gap report has to be byte-reproducible.
+        """
+        if not self.entity_types:
+            return ""
+        return min(self.entity_types.items(), key=lambda kv: (-kv[1], kv[0]))[0]
 
 
 def build_clusters(mentions: Iterable[Tuple[str, str, str, str]]) -> Dict[str, Cluster]:
@@ -150,8 +247,9 @@ def build_clusters(mentions: Iterable[Tuple[str, str, str, str]]) -> Dict[str, C
         eid = entity_id(key)
         c = clusters.get(eid)
         if c is None:
-            c = clusters[eid] = Cluster(entity_id=eid, entity_type=key[0],
+            c = clusters[eid] = Cluster(entity_id=eid, role=split_entity_type(key[0])[0],
                                         key=key[1], label=text)
+        c.entity_types[(etype or "").strip().upper()] += 1
         c.surface_forms[text] += 1
         c.mention_uids.append(uid)
         if doc_id:
@@ -161,6 +259,52 @@ def build_clusters(mentions: Iterable[Tuple[str, str, str, str]]) -> Dict[str, C
         # reproducible rather than dependent on insertion order.
         c.label = min(c.surface_forms.items(), key=lambda kv: (-kv[1], kv[0]))[0]
     return clusters
+
+
+class _Union:
+    """Minimal union-find over hashable signatures."""
+
+    def __init__(self) -> None:
+        self.parent: Dict[object, object] = {}
+
+    def find(self, x):
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            # Order by repr so the representative does not depend on insertion
+            # order — the table has to be byte-reproducible.
+            lo, hi = sorted((ra, rb), key=repr)
+            self.parent[hi] = lo
+
+
+def link_signatures(signatures: Iterable[Tuple[object, object]]) -> Dict[object, object]:
+    """Group signatures that co-occur on the same mention.
+
+    A mention can carry two identity signatures: its content key, and the
+    authority concept it grounded to. Either alone is incomplete.
+
+      * Content key alone loses what grounding merges. `Vietnam` and `Viet Nam`
+        have different words and are one place; `Diptera` and `flies` likewise.
+      * Grounding alone loses what the key merges, and splits on an accident.
+        `mountains` typed ABIOTIC ENTITY grounds to ENVO while `mountains`
+        typed SPATIAL ENTITY does not, so the same word in the same role became
+        two entities — 26 mentions of the gold did this.
+
+    Treating both as evidence of one identity and taking connected components
+    uses each where it is strong. Returns signature -> component representative.
+    """
+    u = _Union()
+    for a, b in signatures:
+        u.union(a, a)
+        if b is not None:
+            u.union(a, b)
+    return {sig: u.find(sig) for sig in list(u.parent)}
 
 
 def rank_by_document_frequency(clusters: Dict[str, Cluster]) -> List[Cluster]:

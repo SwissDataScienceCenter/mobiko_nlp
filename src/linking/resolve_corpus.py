@@ -38,28 +38,41 @@ offsets and provenance, and a merge is expressed by two rows sharing an
 ``entity_id``. A bad merge is therefore reversible, which is the property that
 made modifier-preserving granularity the safe default in the first place.
 
-Why the entity id is type-scoped even when it grounds
------------------------------------------------------
-Entity type is part of entity identity (decision, 7 Sep), so ``biodiversity`` as
-BIOTIC PROPERTY and as BIOTIC ENTITY are two entities. Grounding must not quietly
-undo that. `habitat` is typed ABIOTIC ENTITY in one sentence and BIOTIC ENTITY in
-another and both link to ENVO:01000739; on the raw URI they would merge, in
-contradiction of the rule. Ten pairs in the gold do this — `habitat`, `size`,
-`climate`, `grassland`, `length`, `rhizosphere`, `orientation`, `temperate`,
-`sensitive`, `variability` — and every one is an annotator disagreement about
-domain or role, not about which concept is meant.
+Why the entity id carries the full label
+----------------------------------------
+The label schema has two layers: an ontological **role** (entity, process,
+property, concept) and a **domain** (abiotic, biotic, spatial, …). Identity is
+the **pair**, so `habitat` typed ABIOTIC / BIOTIC / SPATIAL ENTITY is three
+nodes — and all three carry the same ``authority_uri``, ENVO:01000739. The
+ontological entity they share is stated explicitly rather than by merging them.
 
-So identity is type-scoped and grounding is not: ``entity_id`` carries the type,
-while ``authority_uri`` carries the bare external URI. Two entities may share an
-authority_uri, which an RDF export renders as two nodes with `skos:exactMatch`
-to one ENVO term — legitimate, and visible to a human who may want to merge
-them. Splitting is the reversible error; merging is not.
+    entity_id      ABIOTIC ENTITY@…/ENVO_01000739
+                   BIOTIC ENTITY@…/ENVO_01000739
+                   SPATIAL ENTITY@…/ENVO_01000739
+    authority_uri  http://purl.obolibrary.org/obo/ENVO_01000739   (all three)
+
+In RDF that is three nodes with `skos:exactMatch` to one ENVO term. Both
+directions stay recoverable: a consumer wanting the labels apart has them, and
+one wanting them together groups on `authority_uri`.
+
+``surface_key`` is the same handle for entities no authority covers — the words
+with the label stripped — so `species` under three labels can still be gathered
+without being merged.
 
 Why relations are untouched
 ---------------------------
 Relations stay exactly where they are, in the input files. When their mapping is
 built later it is a join on ``uid`` against this table — no rework on either
 side. That is the reason ``uid`` is the key and not, say, a normalised string.
+
+Coordinated spans
+-----------------
+A span covering a coordination denotes more than one thing, so it is emitted as
+a container row with no ``entity_id`` plus one row per part. "eastern and
+western slopes" is not an entity; "eastern slopes" and "western slopes" are.
+Parts carry ``split_from`` and a ``mention_id`` suffixed ``.1``, ``.2``, so the
+original span is always recoverable and a run with splitting disabled produces a
+strict subset of the rows rather than different ones.
 
 Why ambiguous mentions get no id
 --------------------------------
@@ -87,11 +100,14 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from src.linking.authorities.registry import ARTIFACT_DIR
-from src.linking.cluster import build_clusters, rank_by_document_frequency
+from src.linking.cluster import (build_clusters, content_key, entity_id,
+                                 link_signatures, rank_by_document_frequency,
+                                 singular_form, split_entity_type, surface_key)
 from src.linking.dictionary import Dictionary
+from src.linking.split_spans import SpanSplitter
 from src.linking.match import Outcome, resolve
 from src.linking import wordnet_guard
-from src.linking.mention_norm import NORMALIZER_VERSION
+from src.linking.mention_norm import NORMALIZER_VERSION, normalize_key
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "multi_agent_annotation"))
 from label_norm import canonicalize_entity_type  # noqa: E402
@@ -130,56 +146,166 @@ def _synthetic_uid(doc_id: str, sent_i: int, start, end, text: str) -> str:
     return "syn" + hashlib.sha256(payload).hexdigest()[:10]
 
 
+def _iter_records(path: Path) -> Iterator[dict]:
+    """Records from a file that is either JSONL or one whole JSON document.
+
+    Both shapes are in use and they are not distinguishable by extension: the
+    postprocessed gold is JSONL, while the relation-annotation inputs are a
+    single pretty-printed object — and those are the only files that carry
+    ``concept_text``, so a JSONL-only reader silently cannot see it.
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        whole = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        yield from (whole if isinstance(whole, list) else [whole])
+        return
+    for line_i, line in enumerate(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            logger.warning("%s: unparseable line %d, skipped", path, line_i)
+
+
+_TOKEN_TRIM = " \t\n.,;:!?()[]{}\"'`"
+
+
+def _tokens(text: str) -> List[str]:
+    """Words, with punctuation trimmed from each token's edges.
+
+    Trimming per token matters: `normalize_key` only strips punctuation from the
+    ends of the whole string, so a sentence ending "...topographic relief."
+    yields the token `relief.`, and a naive containment test then reports
+    `relief` as missing from a sentence that plainly contains it. That bug
+    rejected most of the valid concept_texts on the first attempt.
+    """
+    return [t for t in (tok.strip(_TOKEN_TRIM)
+                        for tok in normalize_key(text).replace("-", " ").split())
+            if t]
+
+
+def validate_concept_text(concept: str, sentence: str,
+                          document: Optional[str] = None) -> Optional[str]:
+    """Which scope supports this ``concept_text``: "sentence", "document", or None.
+
+    Token containment, not substring. A substring test would reject the valid
+    cases: "annual rainfall" carries concept_text "high annual rainfall" because
+    `high` distributes across a conjunction, and that phrase is not contiguous
+    in "areas of high temperatures, annual rainfall and topographic relief".
+    Every token IS present, so containment accepts it.
+
+    The document is checked when the sentence does not support the value,
+    because the most valuable corrections are exactly the ones that reach beyond
+    it: the annotators expand abbreviated binomials, turning the span `frater`
+    into `Myotis frater` and `javanicus` into `Pipistrellus javanicus` using a
+    genus named earlier in the abstract. Those are worth honouring — a full
+    binomial is what GBIF can match, and a bare epithet is not.
+
+    Both scopes still reject the corrupt values, and on this data almost every
+    rejection is one artefact rather than a judgement call: 190 of the 195
+    rejected values are the annotation tool's placeholder, the literal token
+    "x" prefixed to the span text ("x three", "x phylogenetic", "x Bacillota").
+    The remaining five are genuine corruptions — "Helarctos malayanus" recorded
+    as "Helarctos Malayans", "predator presence" as "predator changed".
+    """
+    if not concept:
+        return None
+    want = _tokens(concept)
+    if not want:
+        return None
+    if sentence and all(t in set(_tokens(sentence)) for t in want):
+        return "sentence"
+    if document and all(t in set(_tokens(document)) for t in want):
+        return "document"
+    return None
+
+
 def iter_spans(path: Path) -> Iterator[dict]:
     """Yield one dict per span, from either file shape in use."""
     seen_uids: Counter = Counter()
-    with path.open(encoding="utf-8") as fh:
-        for line_i, line in enumerate(fh):
-            line = line.strip()
-            if not line:
+    for obj in _iter_records(path):
+        base_doc = obj.get("doc_id") or path.stem
+        sentences = obj.get("sentences")
+        blocks = sentences if isinstance(sentences, list) else [obj]
+        document = " ".join((b.get("text") or b.get("sentence") or "")
+                            for b in blocks if isinstance(b, dict))
+        sub_doc = 0
+        for sent_i, s in enumerate(blocks):
+            if not isinstance(s, dict):
                 continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("%s: unparseable line %d, skipped", path, line_i)
-                continue
-            base_doc = obj.get("doc_id") or path.stem
-            sentences = obj.get("sentences")
-            blocks = sentences if isinstance(sentences, list) else [obj]
-            sub_doc = 0
-            for sent_i, s in enumerate(blocks):
-                if not isinstance(s, dict):
+            sentence = s.get("text") or s.get("sentence") or ""
+            if DOC_BOUNDARY_RE.match(sentence):
+                sub_doc += 1
+            doc_id = f"{base_doc}#{sub_doc:02d}"
+            for sp in (s.get("spans") or s.get("entities") or []):
+                if not isinstance(sp, dict):
                     continue
-                sentence = s.get("text") or s.get("sentence") or ""
-                if DOC_BOUNDARY_RE.match(sentence):
-                    sub_doc += 1
-                doc_id = f"{base_doc}#{sub_doc:02d}"
-                for sp in (s.get("spans") or s.get("entities") or []):
-                    if not isinstance(sp, dict):
-                        continue
-                    text = (sp.get("text") or "").strip()
-                    if not text:
-                        continue
-                    start, end = sp.get("start_char"), sp.get("end_char")
-                    uid = sp.get("uid") or _synthetic_uid(doc_id, sent_i, start, end, text)
-                    seen_uids[uid] += 1
-                    occurrence = seen_uids[uid]
-                    yield {
-                        "mention_id": f"{path.stem}:{uid}#{occurrence}",
-                        "uid_occurrence": occurrence,
-                        "source_file": path.name,
-                        "uid": uid,
-                        "doc_id": doc_id,
-                        "sent_index": sent_i,
-                        "sentence": sentence,
-                        "start_char": start,
-                        "end_char": end,
-                        "text": text,
-                        "entity_type": canonicalize_entity_type(
-                            sp.get("type") or sp.get("entity_type") or ""),
-                        # Optional, and honoured when present — see the plan.
-                        "concept_text": sp.get("concept_text"),
-                    }
+                text = (sp.get("text") or "").strip()
+                if not text:
+                    continue
+                start, end = sp.get("start_char"), sp.get("end_char")
+                uid = sp.get("uid") or _synthetic_uid(doc_id, sent_i, start, end, text)
+                seen_uids[uid] += 1
+                occurrence = seen_uids[uid]
+                concept = sp.get("concept_text")
+                scope = validate_concept_text(concept, sentence, document) if concept else None
+                concept_ok = scope is not None
+                yield {
+                    "mention_id": f"{path.stem}:{uid}#{occurrence}",
+                    "uid_occurrence": occurrence,
+                    "source_file": path.name,
+                    "uid": uid,
+                    "doc_id": doc_id,
+                    "sent_index": sent_i,
+                    "sentence": sentence,
+                    "start_char": start,
+                    "end_char": end,
+                    "text": text,
+                    "entity_type": canonicalize_entity_type(
+                        sp.get("type") or sp.get("entity_type") or ""),
+                    # Optional, honoured when present AND supported by its
+                    # sentence. The canonical form is what identity and
+                    # matching both use; concept_source records which it was,
+                    # so a run can be read without guessing.
+                    "concept_text": concept,
+                    "concept_text_scope": scope,
+                    "canonical_text": concept if concept_ok else text,
+                    "concept_source": (f"concept_text:{scope}" if concept_ok
+                                       else ("concept_text_rejected" if concept
+                                             else "surface")),
+                }
+
+
+def _try_singular(dictionary, sp: dict, nil_result):
+    """One more attempt at a mention nothing matched, using its singular.
+
+    Third in the canonical-form precedence, after `concept_text` and the
+    surface form, and reached only when the surface form matched nothing — so
+    it can add grounding but never take an answer away.
+
+    **Only a LINK is accepted.** The singular is a hypothesis about what the
+    plural denotes; a hypothesis that grounds cleanly is evidence, while one
+    that comes back ambiguous says only that the singular is ambiguous, which
+    is a fact about a form the annotator did not write. Adopting that would
+    strip 15 mentions of an entity_id they currently have — `landscapes` would
+    inherit `landscape`'s refusal — and buy nothing. They stay NIL and keep
+    their project-local identity.
+
+    Identity does not move either way: `content_key` lemmatises every token, so
+    the plural and the singular already share a key.
+    """
+    alt_text = singular_form(sp["canonical_text"])
+    if not alt_text:
+        return nil_result, sp
+    alt = resolve(dictionary, alt_text, sp["entity_type"])
+    if alt.outcome is not Outcome.LINKED:
+        return nil_result, sp
+    return alt, {**sp, "canonical_text": alt_text, "concept_source": "singular"}
 
 
 def _code_version() -> Optional[str]:
@@ -205,6 +331,11 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--dir", type=Path, default=ARTIFACT_DIR)
     ap.add_argument("--input", type=Path, action="append", dest="inputs")
     ap.add_argument("--out", type=Path, default=Path("output/resolution.jsonl"))
+    ap.add_argument("--no-split", action="store_true",
+                    help="skip coordination splitting even when the parser is present")
+    ap.add_argument("--no-singular", action="store_true",
+                    help="do not retry an unmatched mention with its head noun "
+                         "singularised (`glaciations` -> `glaciation`)")
     ap.add_argument("--gap-report", type=Path, default=None,
                     help="also write the unresolved clusters ranked by document "
                          "frequency: the measured ontology coverage gap")
@@ -223,53 +354,163 @@ def main(argv: List[str] | None = None) -> int:
             print(f"missing input: {p}", file=sys.stderr)
             return 1
 
+    splitter = None if args.no_split else SpanSplitter()
+    if splitter and not splitter.available:
+        print(f"  note: coordination splitting is OFF — {splitter.error}")
+
+    # Pass 0 — collect, then split coordinated spans into their parts.
+    raw: List[dict] = []
+    for path in inputs:
+        raw.extend(iter_spans(path))
+
+    n_split = 0
+    if splitter and splitter.available:
+        by_sentence: Dict[str, list] = {}
+        for i, sp in enumerate(raw):
+            by_sentence.setdefault(sp["sentence"], []).append((i, sp["start_char"],
+                                                              sp["end_char"]))
+        expanded: List[dict] = []
+        for sp in raw:
+            sp["split_from"] = None
+            sp["part_index"] = None
+        for sentence, group in by_sentence.items():
+            for i, sres in splitter.split_all(sentence, group).items():
+                raw[i]["_split"] = sres
+        for sp in raw:
+            sres = sp.pop("_split", None)
+            expanded.append(sp)
+            if not sres:
+                continue
+            n_split += 1
+            sp["split_into"] = len(sres.parts)
+            for k, part in enumerate(sres.parts, 1):
+                child = dict(sp)
+                child.pop("split_into", None)
+                child.update({
+                    "mention_id": f"{sp['mention_id']}.{k}",
+                    "text": part,
+                    "canonical_text": part,
+                    "concept_source": f"split:{sres.pattern}",
+                    "split_from": sp["text"],
+                    "part_index": k,
+                })
+                expanded.append(child)
+        raw = expanded
+
     # Pass 1 — resolve every mention against the authorities.
     rows: List[dict] = []
     stats: Counter = Counter()
     reused_uids = 0
-    for path in inputs:
-        for sp in iter_spans(path):
-            if sp["uid_occurrence"] > 1:
+    n_singular = 0
+    concept_stats: Counter = Counter()
+    if True:
+        for sp in raw:
+            if sp.get("part_index") is None and sp["uid_occurrence"] > 1:
                 reused_uids += 1
-            r = resolve(d, sp["text"], sp["entity_type"])
+            # canonical_text, not the raw span: where an annotator recorded a
+            # concept_text and the sentence supports it, that is what the
+            # mention denotes. The surface form is kept on the row regardless.
+            r = resolve(d, sp["canonical_text"], sp["entity_type"])
+            if r.outcome is Outcome.NIL and not args.no_singular:
+                r, sp = _try_singular(d, sp, r)
+                n_singular += int(sp["concept_source"] == "singular")
+            concept_stats[sp["concept_source"]] += 1
             stats[r.outcome.value] += 1
             rows.append({**sp, "_res": r})
 
-    # Pass 2 — mint project-local ids for everything that grounded to nothing.
-    to_cluster = [(r["mention_id"], r["text"], r["entity_type"], r["doc_id"])
+    # Pass 2 — decide identity. A mention carries up to two signatures, its
+    # content key and the concept it grounded to, and both are evidence of the
+    # same identity; connected components over them use each where it is strong.
+    sigs = []
+    for r in rows:
+        res = r["_res"]
+        if res.outcome is Outcome.AMBIGUOUS or r.get("split_into"):
+            # A container row for a coordination denotes no single entity; its
+            # parts do.
+            r["_sig"] = None
+            continue
+        # Both signatures carry the FULL label: joining on the role alone would
+        # merge the three habitat nodes back together through their shared URI.
+        key_sig = ("key", content_key(r["canonical_text"], r["entity_type"]))
+        uri_sig = (("uri", r["entity_type"], res.match.uri)
+                   if res.outcome is Outcome.LINKED else None)
+        r["_sig"] = key_sig
+        sigs.append((key_sig, uri_sig))
+    comp = link_signatures(sigs)
+
+    # Name each component: its authority URI where it has one, else its key.
+    comp_uri: Dict[object, str] = {}
+    comp_key: Dict[object, tuple] = {}
+    for r in rows:
+        if r["_sig"] is None:
+            continue
+        c = comp[r["_sig"]]
+        comp_key.setdefault(c, r["_sig"][1])
+        if r["_res"].outcome is Outcome.LINKED:
+            uri = r["_res"].match.uri
+            # Deterministic when a component somehow spans two authorities.
+            if c not in comp_uri or uri < comp_uri[c]:
+                comp_uri[c] = uri
+
+    def _entity_of(row) -> Optional[str]:
+        if row["_sig"] is None:
+            return None
+        c = comp[row["_sig"]]
+        if c in comp_uri:
+            return f"{row['entity_type']}@{comp_uri[c]}"
+        return entity_id(comp_key[c])
+
+    to_cluster = [(r["mention_id"], r["canonical_text"], r["entity_type"], r["doc_id"])
                   for r in rows if r["_res"].outcome in CLUSTERED_OUTCOMES]
     clusters = build_clusters(to_cluster)
-    mention_to_entity = {mid: c.entity_id
-                         for c in clusters.values() for mid in c.mention_uids}
 
-    distinct_entities: set = set()
+    # Every label any annotator gave this entity, so the merge discards nothing.
+    entity_labels: Dict[str, Counter] = {}
+    for r in rows:
+        eid = _entity_of(r)
+        if eid:
+            entity_labels.setdefault(eid, Counter())[r["entity_type"]] += 1
+
+    # Counted directly rather than derived from len(clusters). A content key
+    # that chained into a grounded component is named by its authority URI, so
+    # it is no longer a project-local entity — subtracting the cluster count
+    # moved 28 entities to the wrong side of the split.
+    grounded_entities: set = set()
+    local_entities: set = set()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as fh:
         for r in rows:
-            res = r.pop("_res")
-            authority_uri = res.match.uri if res.match else None
-            if res.outcome is Outcome.LINKED:
-                # Type-scoped: grounding must not undo type-as-identity.
-                eid = f"{r['entity_type']}@{authority_uri}"
-                source = res.match.source
-            elif res.outcome in CLUSTERED_OUTCOMES:
-                eid, source = mention_to_entity.get(r["mention_id"]), "cluster"
-            else:
-                eid, source = None, None
+            res = r["_res"]
+            role, domain = split_entity_type(r["entity_type"])
+            eid = _entity_of({**r, "_res": res, "_sig": r.get("_sig")})
+            authority_uri = (comp_uri.get(comp[r["_sig"]])
+                             if r.get("_sig") is not None else None)
+            source = (res.match.source if res.outcome is Outcome.LINKED
+                      else ("authority" if authority_uri else
+                            ("cluster" if eid else None)))
             if eid:
-                distinct_entities.add(eid)
+                (grounded_entities if authority_uri else local_entities).add(eid)
             fh.write(json.dumps({
                 "mention_id": r["mention_id"],
                 "source_file": r["source_file"],
                 "uid": r["uid"],
                 "uid_occurrence": r["uid_occurrence"],
+                "split_from": r.get("split_from"),
+                "part_index": r.get("part_index"),
+                "split_into": r.get("split_into"),
                 "doc_id": r["doc_id"],
                 "sent_index": r["sent_index"],
                 "start_char": r["start_char"],
                 "end_char": r["end_char"],
                 "text": r["text"],
                 "concept_text": r["concept_text"],
+                "canonical_text": r["canonical_text"],
+                "concept_source": r["concept_source"],
                 "entity_type": r["entity_type"],
+                "entity_role": role,
+                "entity_domain": domain,
+                "surface_key": "+".join(surface_key(r["canonical_text"])) or None,
+                "entity_types": sorted(entity_labels.get(eid, ())) or None,
                 "entity_id": eid,
                 "authority_uri": authority_uri,
                 "entity_label": res.match.label if res.match else (
@@ -292,9 +533,17 @@ def main(argv: List[str] | None = None) -> int:
         "counts": dict(stats),
         "n_mentions": len(rows),
         "reused_uids_in_input": reused_uids,
-        "n_entities": len(distinct_entities),
-        "n_entities_from_authorities": len(distinct_entities) - len(clusters),
-        "n_entities_project_local": len(clusters),
+        "spans_split": n_split,
+        "grounded_via_singular": n_singular,
+        "splitter_model": (splitter.model if splitter and splitter.available else None),
+        "concept_text": dict(concept_stats),
+        "n_entities": len(grounded_entities) + len(local_entities),
+        "n_entities_from_authorities": len(grounded_entities),
+        "n_entities_project_local": len(local_entities),
+        # Content keys minted for unresolved mentions. Larger than
+        # n_entities_project_local by however many chained into a grounded
+        # component; the gap report lists only the ones that stayed unresolved.
+        "n_unresolved_clusters": len(clusters),
     }
     meta_path = args.out.with_suffix(".meta.json")
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True, default=str) + "\n",
@@ -302,16 +551,32 @@ def main(argv: List[str] | None = None) -> int:
 
     print(f"\nwrote {args.out}  ({len(rows):,} mentions)")
     print(f"      {meta_path}")
+    if n_split:
+        print(f"  coordination: {n_split} spans split into parts "
+              f"({splitter.model})")
+    if n_singular:
+        print(f"  singular:     {n_singular:,} mention(s) grounded via their "
+              f"singular after matching nothing")
+    used = sum(v for k, v in concept_stats.items() if k.startswith("concept_text:"))
+    rejected = concept_stats["concept_text_rejected"]
+    if used or rejected:
+        print(f"  concept_text: {used:,} honoured, {rejected:,} rejected "
+              f"(tokens absent from the sentence and the document)")
     for k in ("linked", "ambiguous", "nil", "unrouted"):
         print(f"  {k:10s} {stats[k]:6,}  ({100*stats[k]/max(len(rows),1):4.1f}%)")
-    print(f"\n  distinct entities: {len(distinct_entities):,}  "
-          f"({len(distinct_entities) - len(clusters):,} from authorities, "
-          f"{len(clusters):,} project-local)")
+    print(f"\n  distinct entities: {len(grounded_entities) + len(local_entities):,}  "
+          f"({len(grounded_entities):,} from authorities, "
+          f"{len(local_entities):,} project-local)")
     print(f"  {len(rows) - stats['ambiguous']:,} mentions carry an entity_id; "
           f"{stats['ambiguous']:,} deliberately left unresolved")
 
     if args.gap_report:
-        ranked = rank_by_document_frequency(clusters)
+        # Only the clusters that stayed unresolved. A key that chained into a
+        # grounded component IS covered by an authority, so listing it here
+        # would overstate the gap — and its minted id appears nowhere in the
+        # table, since the component is named by its URI instead.
+        ranked = [c for c in rank_by_document_frequency(clusters)
+                  if c.entity_id in local_entities]
         args.gap_report.parent.mkdir(parents=True, exist_ok=True)
         with args.gap_report.open("w", encoding="utf-8") as fh:
             fh.write("doc_freq\tmentions\tentity_type\tlabel\tentity_id\tsurface_forms\n")
@@ -319,7 +584,10 @@ def main(argv: List[str] | None = None) -> int:
                 forms = "; ".join(f"{f}({n})" for f, n in c.surface_forms.most_common())
                 fh.write(f"{c.doc_frequency}\t{c.n_mentions}\t{c.entity_type}\t"
                          f"{c.label}\t{c.entity_id}\t{forms}\n")
-        print(f"      {args.gap_report}  ({len(ranked):,} unresolved entities)")
+        grounded_after_chaining = len(clusters) - len(ranked)
+        print(f"      {args.gap_report}  ({len(ranked):,} unresolved entities"
+              + (f"; {grounded_after_chaining} more chained into a grounded one"
+                 if grounded_after_chaining else "") + ")")
     return 0
 
 

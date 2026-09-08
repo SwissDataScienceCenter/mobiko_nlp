@@ -154,10 +154,25 @@ def test_unambiguous_place_resolves(d):
 
 # ── 4. the outcomes stay distinct ────────────────────────────────
 
-def test_unrouted_is_not_nil(d):
-    """No authority serves CONCEPT: not attempted, which is not the same as missed."""
-    r = resolve(d, "sdg", "CONCEPT")
-    assert r.outcome is Outcome.UNROUTED
+def test_every_type_routes_while_the_ontologies_are_universal(d):
+    """UNROUTED is unreachable with this registry, and that is the decision.
+
+    ENVO and PATO hold concepts rather than names, so they answer for every
+    entity type (decision, 8 Sep, confirming the measurement in
+    `registry.Authority`: 51 links gained, and `unrouted` went from 647
+    mentions to 0). Nothing is therefore "not attempted" any more — CONCEPT
+    reaches the ontologies, finds nothing, and comes back NIL.
+
+    The UNROUTED outcome is kept in the enum and in the coverage report because
+    gating the ontologies again would immediately make it reachable, and
+    "not attempted" must never be reported as "attempted and missed". This test
+    pins which of the two the current registry produces, so that a future
+    gating change fails loudly here instead of quietly moving 647 mentions
+    between columns.
+    """
+    assert d.sources_for("CONCEPT")
+    assert d.sources_for("A TYPE NOBODY HAS DECLARED")
+    assert resolve(d, "sdg", "CONCEPT").outcome is Outcome.NIL
 
 
 def test_nil_is_not_unrouted(d):
@@ -176,18 +191,24 @@ def test_every_non_linked_outcome_explains_itself(d):
 
 
 @needs_geonames
-def test_routing_does_not_leak_across_ontological_roles(d):
-    """Entity type is part of entity identity, so each mention routes by its own.
+@needs_gbif
+def test_a_gated_authority_answers_only_for_the_types_it_serves(d):
+    """Each mention routes by its OWN type, never the union of the types the
+    string was given elsewhere. Unioning produced a leak on 135 mentions.
 
-    `mountains` as SPATIAL ENTITY must look in GeoNames and come back NIL, not
-    reach across into ENVO's abiotic concept. Unioning the types a surface form
-    was ever given produced exactly that leak on 135 mentions of the gold —
-    including `location` as SPATIAL ENTITY resolving to a PATO *property*.
+    Probed on the two GATED authorities, because they are where the rule still
+    bites: the ontologies are universal by decision (8 Sep), so reaching ENVO
+    from any type is correct now and cannot demonstrate a leak. GBIF and
+    GeoNames hold millions of proper names that collide with ordinary English,
+    which is exactly why they stayed gated.
     """
-    assert resolve(d, "mountains", "SPATIAL ENTITY").outcome is not Outcome.LINKED
-    assert resolve(d, "habitat", "SPATIAL ENTITY").outcome is not Outcome.LINKED
-    # The same strings under the roles their authorities actually serve do link.
-    assert resolve(d, "habitat", "ABIOTIC ENTITY").outcome is Outcome.LINKED
+    # GeoNames is not consulted for a living thing...
+    assert resolve(d, "Vietnam", "BIOTIC ENTITY").outcome is not Outcome.LINKED
+    # ...nor GBIF for a place.
+    assert resolve(d, "diptera", "SPATIAL ENTITY").outcome is not Outcome.LINKED
+    # Under the types they do serve, both link.
+    assert resolve(d, "Vietnam", "SPATIAL ENTITY").match.source == "geonames"
+    assert resolve(d, "diptera", "BIOTIC ENTITY").match.source == "gbif"
 
 
 def test_same_string_under_two_types_is_two_entities(d):
@@ -196,7 +217,9 @@ def test_same_string_under_two_types_is_two_entities(d):
     a = resolve(d, "biodiversity", "BIOTIC PROPERTY")
     b = resolve(d, "biodiversity", "CONCEPT")
     assert a.entity_type != b.entity_type
-    assert b.outcome is Outcome.UNROUTED     # no authority serves CONCEPT
+    # CONCEPT reaches ENVO and PATO like every other type; neither carries
+    # `biodiversity`, so this is a real miss rather than an unrouted type.
+    assert b.outcome is Outcome.NIL
 
 
 # ── 5. the genericness claim itself ──────────────────────────────
@@ -323,8 +346,21 @@ def test_coverage_report_is_byte_reproducible():
 @pytest.mark.parametrize("mention", ["landscape", "mountain range", "center"])
 def test_common_noun_does_not_resolve_to_a_named_place(d, mention):
     """"the landscape" denotes something, but not the settlement called
-    Landscape. Its referent is a coreference question this module cannot answer,
-    so it is declined with that reason rather than bound by spelling."""
+    Landscape. None of these may be bound to a place by spelling alone."""
+    assert resolve(d, mention, "SPATIAL ENTITY").outcome is Outcome.AMBIGUOUS
+
+
+@needs_geonames
+@pytest.mark.parametrize("mention", ["landscape", "center"])
+def test_a_common_noun_is_declined_as_a_coreference_question(d, mention):
+    """Not merely unresolvable — UNDER-SPECIFIED. "the landscape" denotes a
+    landscape named earlier in the text, which is a coreference question this
+    module cannot answer, so the reason says so.
+
+    `mountain range` is excluded: it is still declined, but now by the
+    cross-authority rule, because since the ontologies became universal ENVO
+    answers for SPATIAL ENTITY alongside GeoNames. Same refusal, earlier gate.
+    """
     r = resolve(d, mention, "SPATIAL ENTITY")
     assert r.outcome is Outcome.AMBIGUOUS
     assert "coreference" in r.reason
@@ -352,6 +388,26 @@ def test_scope_preference_is_not_applied_between_places(d):
     r = resolve(d, "lake", "SPATIAL ENTITY")
     assert r.outcome is Outcome.AMBIGUOUS
     assert len(r.candidates) > 5
+
+
+@pytest.mark.parametrize("mention", ["mountains", "Mountains", "mountain"])
+def test_mountains_is_not_an_undersea_mountain(d, mention):
+    """ENVO ships this pair with their scopes swapped: `mountains` is an EXACT
+    synonym of *seamount* and only a RELATED synonym of *mountain*. Related is
+    not an identity scope, so the correct concept was excluded and the undersea
+    one won all 14 mentions of it in a corpus about mountain biodiversity.
+
+    Corrected in the artifact at build time
+    (`compile_db.OBO_SCOPE_CORRECTIONS`), because no matching rule can tell a
+    mis-scoped synonym from a correct one — they are string-identical. This
+    test fails if the artifact predates the correction.
+    """
+    assert resolve(d, mention, "ABIOTIC ENTITY").match.curie == "ENVO:00000081"
+
+
+def test_the_scope_correction_does_not_disturb_seamount(d):
+    """Demoting the bad alias must not cost *seamount* its own name."""
+    assert resolve(d, "seamount", "ABIOTIC ENTITY").match.curie == "ENVO:00000264"
 
 
 def test_proper_name_rule_does_not_apply_to_class_naming_sources(d):

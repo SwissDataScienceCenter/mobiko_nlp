@@ -80,10 +80,24 @@ class Authority:
     """One external vocabulary we can ground against.
 
     ``serves`` lists the canonicalised MoBiKo entity types this authority may
-    answer for. It is the type gate, declared as data rather than buried in an
-    if-chain: routing a BIOTIC ENTITY at PATO merely wastes a lookup, but
-    routing an ABIOTIC PROPERTY at GBIF invites a confident wrong answer,
-    because GBIF will happily fuzzy-match an ordinary English word to a genus.
+    answer for, and ``universal`` overrides it to mean "any type at all".
+
+    The distinction that decides which an authority gets is **what kind of thing
+    it contains**, and it was settled by measurement (7 Sep):
+
+      * **Name authorities must be gated.** GBIF and GeoNames hold millions of
+        proper names that collide with ordinary English. Ungated, `data` and
+        `areas` resolve to genera, `large` to a butterfly, `extinct` to the
+        Labrador Duck, and `SDG` to Sundargarh district. Worse, the collisions
+        trigger the cross-authority rule and destroy 46 *correct* links —
+        `erosion`, `mammal`, `lake`, `Argentina` — by making them ambiguous.
+      * **Concept ontologies can be universal.** ENVO and PATO hold concepts
+        rather than names, so a spurious match is rare and the ambiguity rules
+        catch it. Opening them to every type gained 51 links, lost **zero**,
+        added **zero** ambiguity, and took `unrouted` from 647 mentions to 0.
+
+    ``serves`` is kept on the universal authorities as documentation of the
+    types they were designed around; it no longer restricts them.
 
     ``version`` is the pinned release. Changing it is how the vocabulary is
     upgraded, and doing so invalidates the compiled artifact.
@@ -102,6 +116,7 @@ class Authority:
     # GO ships three ontologies in one file; only biological_process is relevant
     # to BIOTIC PROCESS. None means "take everything".
     namespace_filter: Optional[str] = None
+    universal: bool = False
     notes: str = ""
 
     @property
@@ -124,6 +139,7 @@ AUTHORITIES: Dict[str, Authority] = {
     a.key: a for a in [
         Authority(
             key="envo",
+            universal=True,
             name="Environment Ontology",
             url=f"https://raw.githubusercontent.com/EnvironmentOntology/envo/{ENVO_VERSION}/envo.json",
             version=ENVO_VERSION,
@@ -144,6 +160,7 @@ AUTHORITIES: Dict[str, Authority] = {
         ),
         Authority(
             key="pato",
+            universal=True,
             name="Phenotype And Trait Ontology",
             url=f"https://raw.githubusercontent.com/pato-ontology/pato/{PATO_VERSION}/pato.json",
             version=PATO_VERSION,
@@ -358,6 +375,10 @@ def manifest_provenance(keys: Optional[List[str]] = None,
     }
 
 
+# Marker written into ``source_serves`` for a universal authority.
+UNIVERSAL_TYPE = "*"
+
+
 def authorities_for(entity_type: str) -> List[Authority]:
     """Which authorities may answer for a canonicalised entity type.
 
@@ -366,4 +387,4 @@ def authorities_for(entity_type: str) -> List[Authority]:
     a mention we cannot route is a NIL, not a guess.
     """
     et = (entity_type or "").strip().upper()
-    return [a for a in AUTHORITIES.values() if et in a.serves]
+    return [a for a in AUTHORITIES.values() if a.universal or et in a.serves]

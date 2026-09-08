@@ -67,7 +67,8 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from src.linking.authorities.registry import (
-    AUTHORITIES, GROUPS, Authority, artifact_path, file_sha256, load_manifest,
+    AUTHORITIES, GROUPS, UNIVERSAL_TYPE, Authority, artifact_path, file_sha256,
+    load_manifest,
 )
 from src.linking.mention_norm import NORMALIZER_VERSION, normalize_display, normalize_key
 
@@ -86,6 +87,32 @@ _SCOPE = {
 }
 
 CONFIDENT_SCOPES = ("label", "exact", "vernacular")
+
+# ── Upstream scope errors ────────────────────────────────────────
+#
+# Corrections to synonym scopes that are wrong in the released ontology, keyed
+# by (concept URI, normalised alias). Data repair, deliberately not a matching
+# heuristic: each entry names two rows in one release and changes nothing else.
+# The matcher cannot do this job, because a mis-scoped synonym is
+# string-identical to a correct one.
+#
+# ENVO ships `mountain` and `seamount` with their scopes swapped for this pair:
+#
+#     ENVO:00000081  mountain   hasRelatedSynonym  "mountains"
+#     ENVO:00000264  seamount   hasExactSynonym    "mountains"
+#
+# `related` is not an identity scope, so the correct concept is excluded and the
+# undersea one wins every time: all 14 mentions of `mountains` in the corpus
+# resolved to *seamount*, in a corpus about mountain biodiversity. Singular
+# `mountain` was unaffected, which is what makes it a data bug rather than a
+# policy one.
+#
+# Keep this table tiny and report upstream. Corrections that no longer fire are
+# listed in `build_meta` so an ontology upgrade shows which entries went stale.
+OBO_SCOPE_CORRECTIONS = {
+    (f"{_OBO_PREFIX}ENVO_00000264", "mountains"): "related",
+    (f"{_OBO_PREFIX}ENVO_00000081", "mountains"): "exact",
+}
 
 # ── GBIF filters ─────────────────────────────────────────────────
 #
@@ -183,6 +210,28 @@ def _split_uri(uri: str) -> Tuple[Optional[str], Optional[str]]:
     return prefix.lower(), f"{prefix}:{local}"
 
 
+_CORRECTION_STAT = "scope_correction"
+
+
+def _correction_stat(uri: str, norm: str, was: str, now: str) -> str:
+    return f"{_CORRECTION_STAT}:{uri.rsplit('/', 1)[-1]}|{norm}|{was}->{now}"
+
+
+def stale_corrections(all_stats: dict) -> List[str]:
+    """Entries of ``OBO_SCOPE_CORRECTIONS`` that no correction fired for.
+
+    A correction that stops firing means the release fixed it upstream, or the
+    concept was retired — either way the entry is now dead weight pretending to
+    be doing something. Surfaced at build time rather than discovered later.
+    """
+    fired = {k.split(":", 1)[1].rsplit("|", 1)[0]
+             for s in all_stats.values() for k in s
+             if k.startswith(f"{_CORRECTION_STAT}:")}
+    return sorted(f"{uri.rsplit('/', 1)[-1]}|{norm}"
+                  for uri, norm in OBO_SCOPE_CORRECTIONS
+                  if f"{uri.rsplit('/', 1)[-1]}|{norm}" not in fired)
+
+
 def parse_obograph(auth: Authority, stats: Counter) -> Iterator[Rec]:
     with auth.path.open("r", encoding="utf-8") as fh:
         doc = json.load(fh)
@@ -225,8 +274,15 @@ def parse_obograph(auth: Authority, stats: Counter) -> Iterator[Rec]:
                 scope = _SCOPE.get(str(syn.get("pred", "")).split("#")[-1])
                 val = normalize_display(syn.get("val"))
                 if scope and val:
+                    norm = normalize_key(val)
+                    corrected = OBO_SCOPE_CORRECTIONS.get((uri, norm))
+                    if corrected and corrected != scope:
+                        # Counted in stats like everything else, so build_meta
+                        # can name the corrections that actually fired.
+                        stats[_correction_stat(uri, norm, scope, corrected)] += 1
+                        scope = corrected
                     stats[f"syn_{scope}"] += 1
-                    yield ("alias", (uri, val, normalize_key(val), scope, source))
+                    yield ("alias", (uri, val, norm, scope, source))
 
 
 # ── GBIF Darwin Core Archive ─────────────────────────────────────
@@ -403,10 +459,17 @@ def build(group: str, out: Optional[Path] = None) -> int:
             print(f"  {key:10s} {stats['concepts']:>9,} concepts from "
                   f"{stats['rows']:>10,} rows", file=sys.stderr)
 
+        # A universal authority is written once against the "*" marker rather
+        # than enumerated: the schema's off-schema labels (NEGATION, CHANGE…)
+        # cannot be listed in advance, and they must route too.
+        serves_rows = []
+        for k in keys:
+            src = AUTHORITIES[k].key.split("_", 1)[0]
+            if AUTHORITIES[k].universal:
+                serves_rows.append((src, UNIVERSAL_TYPE))
+            serves_rows += [(src, et) for et in AUTHORITIES[k].serves]
         conn.executemany(
-            "INSERT INTO source_serves(source,entity_type) VALUES (?,?)",
-            [(AUTHORITIES[k].key.split("_", 1)[0], et)
-             for k in keys for et in AUTHORITIES[k].serves])
+            "INSERT INTO source_serves(source,entity_type) VALUES (?,?)", serves_rows)
 
         # Aliases whose concept was filtered out (a GO molecular_function term,
         # a GBIF synonym of a dropped taxon) point at nothing.
@@ -450,6 +513,10 @@ def build(group: str, out: Optional[Path] = None) -> int:
                      "sha256": (manifest.get(k) or {}).get("sha256")}
                  for k in keys}, sort_keys=True),
             "parse_stats": json.dumps(all_stats, sort_keys=True),
+            "scope_corrections": json.dumps(
+                {"declared": sorted(f"{u.rsplit('/', 1)[-1]}|{n}"
+                                    for u, n in OBO_SCOPE_CORRECTIONS),
+                 "stale": stale_corrections(all_stats)}, sort_keys=True),
             "n_concepts": str(n_c),
             "n_aliases": str(n_a),
             "orphan_aliases_dropped": str(orphans),
@@ -463,6 +530,14 @@ def build(group: str, out: Optional[Path] = None) -> int:
 
     tmp.replace(out)
     print(f"\n  wrote {out}  ({out.stat().st_size/1e6:,.1f} MB)")
+    fired = sum(v for s in all_stats.values() for k, v in s.items()
+                if k.startswith(f"{_CORRECTION_STAT}:"))
+    if fired:
+        print(f"  {fired} upstream synonym scope(s) corrected")
+    stale = stale_corrections(all_stats)
+    if stale and any(AUTHORITIES[k].fmt == "obograph" for k in keys):
+        print(f"  WARNING scope correction(s) never fired, so they are now dead "
+              f"entries or the concept moved: {', '.join(stale)}", file=sys.stderr)
     print(f"  {n_c:,} concepts, {n_a:,} aliases"
           f"{f', {orphans:,} orphan' if orphans else ''}"
           f"{f', {dupes:,} duplicate' if dupes else ''}"
