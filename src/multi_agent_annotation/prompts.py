@@ -13,24 +13,48 @@ def _build_guideline_summary(sections: List[Dict[str, str]]) -> str:
     return "\n\n".join(f"### {s['title']}\n{s['content']}" for s in sections)
 
 
-def _relation_schema_section(relation_schema: dict, include: bool,
-                             heading: str = "## Relation Schema") -> str:
-    """
-    Render the in-prompt relation-schema section, or nothing when it is disabled.
+def _relation_vocab_section(mandatory: bool = False,
+                            relation_types: Optional[List[str]] = None) -> str:
+    """The relation vocabulary block: the closed list of names, plus the tools.
 
-    Turning it off removes the schema only from the system prompt — the
-    schema_lookup tool still carries it, so agents can retrieve the valid
-    relations for an entity-type pair on demand. Includes the trailing blank
-    line so the section can be dropped without leaving a gap in the prompt.
+    The NAMES are listed here so an agent knows the option set without spending a
+    tool call on it. The DEFINITIONS are not: they live in the relation guide and
+    are reached with relation_search, the same split as the entity side, where the
+    type list is in the prompt and the rules are behind guideline_search.
+
+    The list is rendered from the loaded guide rather than written out here.
     """
-    if not include:
-        return ""
-    return f"{heading}\n{relation_schema}\n\n"
+    names = sorted(relation_types or [])
+    if names:
+        listing = ("The complete set of valid relations is:\n\n"
+                   + ", ".join(names)
+                   + "\n\nThis list is COMPLETE. Try not invent a relation name. "
+                     "Add a new relation type only if you unable to find the relevant one in the list and guideline search is not helping.")
+    else:
+        # No guide loaded: the tools are not registered either, so point at
+        # nothing rather than promising a list that cannot be fetched.
+        listing = ("No relation vocabulary is loaded for this run. Annotate entities "
+                   "only, and do not emit relations.")
+        return listing
+
+    duty = (
+        "Before emitting ANY relation you MUST call relation_search for the label you "
+        "intend to use, and use that label only if the guide returns it."
+        if mandatory else
+        "Call relation_search when you are unsure which relation applies, or to read a "
+        "relation's definition and examples before committing to it."
+    )
+    return f"""{listing}
+
+{duty} relation_search also accepts a description of the link you have found \
+("one thing makes another possible") and returns the relations that cover it; \
+list_relation_types re-lists the names above."""
 
 
 def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                           guideline_search_mandatory: bool = True,
-                          include_relation_schema: bool = True) -> str:
+                          relation_search_mandatory: bool = False,
+                          relation_types: Optional[List[str]] = None) -> str:
     gs_step = (
         "2. For EACH candidate span, you MUST call guideline_search with the span text before "
         "assigning its type. Do NOT assign an entity type you have not checked against the "
@@ -40,39 +64,28 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
         "relevant rule before assigning its type. All valid types are listed in the Entity Type "
         "Schema above."
     )
-    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM COVERAGE: identify \
 and annotate every possible entity and every valid relation (triplet) in the given sentence. \
 It is far better to over-annotate than to miss entities or relations — the Critic will filter errors later.
  
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful. 
-
-Here is the established relation list:
-
-1. HAS_PROPERTY
-2. IS_PART_OF
-3. LOCATED_IN
-4. AFFECTS
-5. HAS_PROCESS
-6. COMPARES_TO
-7. CAUSES
-8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
-
-You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+{relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
 
-{relation_schema_section}## Labelling Decision Table
+## Labelling Decision Table
 {guideline}
 
 ## Available Tools
 - schema_lookup       : OPTIONAL, advisory — which entity-type pairs have been catalogued so far. \
 Incomplete: an empty result means "not catalogued", NEVER "invalid".
 - guideline_search    : retrieve the exact guideline rule that applies to a span/type
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 
 ## Process
 1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
@@ -107,7 +120,7 @@ Return a JSON object with exactly these fields (field values here are just examp
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
   ],
   "relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -126,8 +139,9 @@ Output rules:
 
 def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                        guideline_search_mandatory: bool = True,
-                       precedent_memory: bool = True,
-                       include_relation_schema: bool = True) -> str:
+                       relation_search_mandatory: bool = False,
+                       relation_types: Optional[List[str]] = None,
+                       precedent_memory: bool = True) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -173,27 +187,14 @@ def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict
         "definition/question/example OR a narrative guideline rule — in your "
         "\"guideline_reference\". Flag any label the guideline contradicts."
     )
-    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Critic, a rigorous QA reviewer for biodiversity annotations. \
 Your objective is precision: scrutinise every label the Annotator proposes, \
 challenge anything that is incorrect or ambiguous, and surface anything that was missed. \
 Disagreement is expected and productive — correctness matters more than consensus.
 
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
-
-Here is the established relation list:
-
-1. HAS_PROPERTY
-2. IS_PART_OF
-3. LOCATED_IN
-4. AFFECTS
-5. HAS_PROCESS
-6. COMPARES_TO
-7. CAUSES
-8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
-
-You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+{relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -203,8 +204,10 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 ## Labelling Guideline
 {guideline}
 
-{relation_schema_section}## Available Tools
+## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 - schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
 "not catalogued", NEVER "invalid"{precedent_tool_line}
 
@@ -255,8 +258,9 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 
 def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schema: dict,
                               guideline_search_mandatory: bool = True,
-                              precedent_memory: bool = True,
-                              include_relation_schema: bool = True) -> str:
+                              relation_search_mandatory: bool = False,
+                              relation_types: Optional[List[str]] = None,
+                              precedent_memory: bool = True) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -284,7 +288,7 @@ def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schem
         "\"guideline_reference\". Flag any label that contradicts or is not clearly supported "
         "by the guideline."
     )
-    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Critic, a rigorous QA reviewer for biodiversity annotations. \
 Your default posture is to challenge. Correctness matters more than consensus, \
@@ -292,20 +296,7 @@ and false negatives — errors you silently accept — are more harmful than fal
 When a label is borderline between two types, even if one reading is plausible, \
 raise it as a disagreement. Do not give the Annotator the benefit of the doubt.
 
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
-
-Here is the established relation list:
-
-1. HAS_PROPERTY
-2. IS_PART_OF
-3. LOCATED_IN
-4. AFFECTS
-5. HAS_PROCESS
-6. COMPARES_TO
-7. CAUSES
-8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
-
-You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+{relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -315,8 +306,10 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 ## Labelling Guideline
 {guideline}
 
-{relation_schema_section}## Available Tools
+## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 - schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
 "not catalogued", NEVER "invalid"{precedent_tool_line}
 
@@ -431,8 +424,9 @@ name the cue in the text that decided it."""
 
 def _annotator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
                                      guideline_search_mandatory: bool = False,
-                                     include_relation_schema: bool = True) -> str:
-    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
+                                     relation_search_mandatory: bool = False,
+                                     relation_types: Optional[List[str]] = None) -> str:
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Annotator, a biodiversity NLP expert working in a COLD-START setting: the \
 labelling guideline has not been written yet. Your primary objective is MAXIMUM \
@@ -442,33 +436,22 @@ the Critic filters errors later.
 
 {_COLD_START_GUIDELINE_NOTE}
 
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
-
-Here is the established relation list:
-
-1. HAS_PROPERTY
-2. IS_PART_OF
-3. LOCATED_IN
-4. AFFECTS
-5. HAS_PROCESS
-6. COMPARES_TO
-7. CAUSES
-8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
-
-You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+{relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
 
-{relation_schema_section}## Labelling Guideline (cold-start scaffold — definitions only)
+## Labelling Guideline (cold-start scaffold — definitions only)
 {guideline}
 
 ## Available Tools
 - schema_lookup       : OPTIONAL, advisory — which entity-type pairs have been catalogued so far. \
 Incomplete: an empty result means "not catalogued", NEVER "invalid".
 - guideline_search    : retrieve a type's one-line definition (it holds nothing more at cold start)
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 
 ## Process
 1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
@@ -502,7 +485,7 @@ Return a JSON object with exactly these fields (values here are just examples):
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "", "confidence": 0.9, "reasoning": "attribute measured on a biotic entity (birds); 'richness' is a count of taxa, so BIOTIC PROPERTY not ABIOTIC PROPERTY"}}
   ],
   "relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -521,8 +504,9 @@ distinguishing principle (this type vs the plausible alternative). Keep it conci
 
 def _critic_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
                                   guideline_search_mandatory: bool = False,
-                                  precedent_memory: bool = True,
-                                  include_relation_schema: bool = True) -> str:
+                                  relation_search_mandatory: bool = False,
+                                  relation_types: Optional[List[str]] = None,
+                                  precedent_memory: bool = True) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -533,7 +517,7 @@ def _critic_system_msg_coldstart(guideline: str, entity_schema: str, relation_sc
         "unproven, so raise the disagreement anyway if the current sentence gives independent grounds."
         if precedent_memory else ""
     )
-    relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Critic, a rigorous QA reviewer for biodiversity annotations, working in a \
 COLD-START setting: the labelling guideline has not been written yet. Your objective \
@@ -551,20 +535,7 @@ a reusable rule ("X is <type A> not <type B> because <cue>"), since that explana
 mined directly into the reconstructed guideline. Do not fabricate a "guideline_reference"; \
 leave it "" whenever the guideline is silent (which is nearly always).
 
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
-
-Here is the established relation list:
-
-1. HAS_PROPERTY
-2. IS_PART_OF
-3. LOCATED_IN
-4. AFFECTS
-5. HAS_PROCESS
-6. COMPARES_TO
-7. CAUSES
-8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
-
-You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+{relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
@@ -574,8 +545,10 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 ## Labelling Guideline (cold-start scaffold — definitions only)
 {guideline}
 
-{relation_schema_section}## Available Tools
+## Available Tools
 - guideline_search   : retrieve a type's one-line definition (nothing more exists at cold start)
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 - schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
 "not catalogued", NEVER "invalid"{precedent_tool_line}
 
@@ -644,9 +617,9 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 
 
 def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
-                                       include_relation_schema: bool = True) -> str:
-    relation_schema_section = _relation_schema_section(
-        relation_schema, include_relation_schema, heading="## Relation schema:")
+                                       relation_search_mandatory: bool = False,
+                                       relation_types: Optional[List[str]] = None) -> str:
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations, working in a \
 COLD-START setting: the labelling guideline has not been written yet. You see the \
@@ -659,31 +632,20 @@ expertise and the tie-breaker below. When a case is genuinely ambiguous and the 
 is silent, that is a signal a rule is MISSING — flag it for human review rather than \
 forcing a confident label.
 
-The relation set is not yet fixed, we are at the stage of exploring which relations are useful.
-
-Here is the established relation list:
-
-1. HAS_PROPERTY
-2. IS_PART_OF
-3. LOCATED_IN
-4. AFFECTS
-5. HAS_PROCESS
-6. COMPARES_TO
-7. CAUSES
-8. RELATED_TO (be careful not overuse this one; it is a fallback for when you are unsure which of the above relations applies!)
-
-You can add additional relations if you think they are useful and the existing relations set does not cover the relation you want to annotate.
+{relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
 
 ## Entity Type Schema
 {entity_schema}
 
-{relation_schema_section}## Labelling Guideline (cold-start scaffold — definitions only)
+## Labelling Guideline (cold-start scaffold — definitions only)
 {guideline}
 
 ## Available Tools
 - guideline_search   : retrieve a type's one-line definition (nothing more exists at cold start)
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 - schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
 "not catalogued", NEVER "invalid"
 
@@ -703,7 +665,7 @@ Return a JSON object with exactly these fields, then end your message with TERMI
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "primary referent is …, so Y not X"}}
@@ -720,30 +682,25 @@ Output rules:
 
 
 def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
-                            include_relation_schema: bool = True) -> str:
-    relation_schema_section = _relation_schema_section(
-        relation_schema, include_relation_schema, heading="## Relation schema:")
+                            relation_search_mandatory: bool = False,
+                            relation_types: Optional[List[str]] = None) -> str:
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations. 
 You see the Annotator's labels and the Critic's review.
 
-Here is the full relation list:
-
-1. IS_PART_OF
-2. LOCATED_IN
-3. AFFECTS
-4. HAS_PROCESS
-5. COMPARES_TO
-6. CAUSES
+{relation_vocab_section}
 
 ## Entity Type Schema
 {entity_schema}
 
-{relation_schema_section}## Labelling Guideline
+## Labelling Guideline
 {guideline}
 
 ## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
 - schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
 "not catalogued", NEVER "invalid"
 
@@ -764,7 +721,7 @@ Return a JSON object with exactly these fields, then end your message with TERMI
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "HAS_PROPERTY", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "guideline step Z says..."}}
@@ -784,7 +741,8 @@ Output rules:
 
 def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_schema: dict,
                                guideline_search_mandatory: bool = True,
-                               include_relation_schema: bool = True) -> str:
+                               relation_search_mandatory: bool = False,
+                               relation_types: Optional[List[str]] = None) -> str:
     """Single-pass annotator: no Critic, no Adjudicator, output is final.
 
     WHY THIS EXISTS. _annotator_system_msg tells the model its "primary objective
@@ -815,8 +773,7 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
     """
     base = _annotator_system_msg(
         guideline, entity_schema, relation_schema,
-        guideline_search_mandatory=guideline_search_mandatory,
-        include_relation_schema=include_relation_schema)
+        guideline_search_mandatory=guideline_search_mandatory)
 
     base = re.sub(
         r"You are Annotator, a biodiversity NLP expert\. Your primary objective is "

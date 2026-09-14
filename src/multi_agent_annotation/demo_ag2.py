@@ -57,6 +57,11 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     _fill_char_offsets,
     schema_lookup,
     guideline_search,
+    relation_search,
+    list_relation_types,
+    load_relation_guide,
+    off_schema_relation_report,
+    _DEFAULT_RELATION_GUIDE,
     consistency_check,
     list_entity_types,
     off_schema_label_report,
@@ -179,8 +184,13 @@ def run_dry(schema_path: Path, seeds_path: Path, guideline_search_backend: str =
           f"(from {'file' if _DEFAULT_GUIDELINE.exists() else 'fallback'})")
 
     all_sections = decision_support_sections + guidance_sections
+    relation_guide = (load_relation_guide(_DEFAULT_RELATION_GUIDE)
+                      if _DEFAULT_RELATION_GUIDE.exists() else [])
+    print(f"[OK] Relation guide: {len(relation_guide)} relations "
+          f"(from {'file' if _DEFAULT_RELATION_GUIDE.exists() else 'MISSING'})")
     _init_tool_state(schema, all_sections, seeds, entity_types_list=SCHEMA_BIODIV_LIST,
-                     guideline_search_backend=guideline_search_backend)
+                     guideline_search_backend=guideline_search_backend,
+                     relation_guide=relation_guide)
 
     # list_entity_types tool
     types_json = list_entity_types()
@@ -225,6 +235,21 @@ def run_dry(schema_path: Path, seeds_path: Path, guideline_search_backend: str =
     if not dry_run_ok:
         raise RuntimeError("Embedding guideline_search check failed — see [FAIL] lines above.")
 
+    # relation tools — the relation vocabulary reaches the agents ONLY through
+    # these, so a dry run that cannot answer here is a run that cannot annotate
+    # relations at all.
+    rel_types = json.loads(list_relation_types())
+    print(f"\n[OK] list_relation_types() -> {len(rel_types)} relations")
+    print("     " + ", ".join(rel_types[:8]) + (" ..." if len(rel_types) > 8 else ""))
+    for _q in ("CAUSES", "one thing makes another possible"):
+        _r = json.loads(relation_search(_q))
+        _hits = [h["title"] for h in _r["results"]]
+        if rel_types and not _hits:
+            print(f"[FAIL] relation_search({_q!r}) -> no match via {_r['backend']}")
+            dry_run_ok = False
+        else:
+            print(f"[OK] relation_search({_q!r}) -> {_hits} via {_r['backend']}")
+
     # consistency_check tool
     consistency_query = "species of vascular plants"
     matches = json.loads(consistency_check(consistency_query))
@@ -254,6 +279,7 @@ def run_live(
     request_timeout: int = 600,
     strict_critic: bool = False,
     guideline_search_mandatory: bool = True,
+    relation_search_mandatory: bool = True,
     include_relation_schema: bool = False,
     tool_choice: str | None = None,
     annotator_max_tokens: int | None = None,
@@ -292,6 +318,7 @@ def run_live(
         request_timeout=request_timeout,
         strict_critic=strict_critic,
         guideline_search_mandatory=guideline_search_mandatory,
+        relation_search_mandatory=relation_search_mandatory,
         include_relation_schema=include_relation_schema,
         tool_choice=tool_choice,
         annotator_max_tokens=annotator_max_tokens,
@@ -418,12 +445,21 @@ def main() -> None:
              "if you specifically want forced per-span guideline retrieval.",
     )
     parser.add_argument(
-        "--no-relation-schema-in-prompt", action="store_true",
-        help="Drop the '## Relation Schema' section from all three system prompts. The schema "
-             "is still loaded from --schema and still served by the schema_lookup tool, so "
-             "agents can retrieve the valid relations for an entity-type pair on demand — this "
-             "only stops the whole schema from being pasted into every prompt (ablation / "
-             "context-budget flag). Default: the schema is included.",
+        "--relation-search", choices=["mandatory", "optional"], default="optional",
+        help="Whether Annotator/Critic MUST call relation_search for every label "
+             "('mandatory') or only when unsure ('optional', default). The relation "
+             "NAMES are listed in the system prompt, so the agents already know the "
+             "option set and a forced per-relation lookup mostly buys latency — the "
+             "same reasoning as --guideline-search. The DEFINITIONS are still tool-only. "
+             "Ignored when --no-relation-guide leaves no guide to search.",
+    )
+    parser.add_argument(
+        "--relation-schema-in-prompt", action="store_true",
+        help="CoNLL only: paste the relation schema into the system prompts. Has no "
+             "effect on --corpus mobiko, whose prompts carry the relation NAME list "
+             "and reach definitions through relation_search — the biodiversity "
+             "schema is never pasted. CoNLL annotates no relations by default, so "
+             "this matters only together with an explicit --schema.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -537,7 +573,8 @@ def main() -> None:
             request_timeout=args.timeout,
             strict_critic=args.strict_critic,
             guideline_search_mandatory=(args.guideline_search == "mandatory"),
-            include_relation_schema=not args.no_relation_schema_in_prompt,
+            relation_search_mandatory=(args.relation_search == "mandatory"),
+            include_relation_schema=args.relation_schema_in_prompt,
             tool_choice=args.tool_choice,
             annotator_max_tokens=annotator_max_tokens,
             critic_max_tokens=critic_max_tokens,
@@ -567,6 +604,23 @@ def main() -> None:
         else:
             print("\n[OK] All emitted entity labels are schema-valid "
                   "(canonicaliser repaired any formatting drift).")
+
+        # Same report for the other vocabulary. The relation guide is a CLOSED
+        # set reachable only through relation_search, so a label outside it means
+        # an agent emitted a relation it never looked up — the failure mode the
+        # tool exists to prevent, and worth naming rather than counting silently.
+        off_relations = off_schema_relation_report()
+        if off_relations:
+            total = sum(off_relations.values())
+            print(f"\n[WARN] {total} relation(s) carry {len(off_relations)} label(s) "
+                  f"that are not in the relation guide:")
+            for label, count in off_relations.items():
+                print(f"         {label!r} x{count}")
+            print("       They were kept, not dropped. Each is a relation the agent "
+                  "did not obtain from relation_search — check that the tool is "
+                  "registered and that --relation-search is 'mandatory'.")
+        else:
+            print("[OK] All emitted relation labels are in the relation guide.")
 
 
 if __name__ == "__main__":

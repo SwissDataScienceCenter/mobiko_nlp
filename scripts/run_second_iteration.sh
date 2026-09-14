@@ -50,7 +50,6 @@ run_pipeline() {
     "$PY" src/multi_agent_annotation/demo_ag2.py \
         --input "$src" \
         --output "$dest" \
-        --no-relation-schema-in-prompt \
         --resume \
         "$@"
 }

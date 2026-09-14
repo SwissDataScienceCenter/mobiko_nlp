@@ -20,7 +20,7 @@
 #   MODEL=rcp-kimi-2.7 TAG=kimi27 SENTENCES=56 SHARDS=8 scripts/xrun/run_selfconsistency_remote.sh
 #
 # Every knob of run_selfconsistency.sh (MODEL, TAG, K, SENTENCES, SHARDS, INPUT,
-# OUTDIR, RESUME, PLAN, GUIDELINE, NO_RELATION_SCHEMA) is forwarded verbatim, so
+# OUTDIR, RESUME, PLAN, GUIDELINE) is forwarded verbatim, so
 # the two scripts share one interface — this one only adds where it runs.
 
 set -uo pipefail
@@ -47,7 +47,7 @@ cd "$LOCAL_ROOT" || exit 1
 # grid_config.py --check refuses to launch with. Export it locally from the repo:
 #   export MOBIKO_CODE_VERSION=$(git rev-parse --short HEAD)
 FORWARD=(MODEL TAG K SENTENCES SHARDS INPUT OUTDIR RESUME PLAN
-         CORPUS GUIDELINE NO_GUIDELINE NO_DECISION_SUPPORT NO_RELATION_SCHEMA
+         CORPUS GUIDELINE NO_GUIDELINE NO_DECISION_SUPPORT
          MOBIKO_ENV_FILE ADJUDICATOR_MODEL ANNOTATOR_TOP_LOGPROBS
          RCP_ENABLE_THINKING DEPENDENCY_RELATION_HINTS MOBIKO_CODE_VERSION
          GUIDELINE_SEARCH_BACKEND GUIDELINE_SEARCH_EMBEDDING_MODEL)

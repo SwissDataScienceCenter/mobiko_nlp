@@ -44,13 +44,18 @@ import prompts_conll as _prompts_conll
 # disagree about what a label is. _ALL_ENTITY_TYPES is mutated in place here.
 from label_norm import (  # noqa: F401
     canonicalize_entity_type,
+    canonicalize_relation_type,
     off_schema_label_report,
+    off_schema_relation_report,
     reset_off_schema_labels,
+    reset_off_schema_relations,
     normalize_text,
     _ALL_ENTITY_TYPES,
+    _ALL_RELATION_TYPES,
     _ENTITY_TYPE_ALIASES,
     _FALLBACK_ENTITY_TYPES,
     _OFF_SCHEMA_LABELS,
+    _OFF_SCHEMA_RELATIONS,
 )
 
 # The MoBiKo prompts are domain-specific well beyond the schema string (role
@@ -313,6 +318,17 @@ def _canonicalize_label_field(value):
     return canonicalize_entity_type(value) if isinstance(value, str) else value
 
 
+def _canonicalize_relation_field(value):
+    """Shared pydantic validator body for any relation-label string field.
+
+    Same emit-time repair as the entity validator, for the other vocabulary:
+    relation names are underscore-joined, and the guide is the closed set.
+    Attached to every model that carries one, so no construction path — annotator
+    JSON, critic proposal, adjudicator output, precedent reuse — can bypass it.
+    """
+    return canonicalize_relation_type(value) if isinstance(value, str) else value
+
+
 class EntityAnnotation(BaseModel):
     text: str
     entity_type: str
@@ -507,6 +523,8 @@ class RelationAnnotation(BaseModel):
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
 
+    _canon_relation = field_validator("relation")(_canonicalize_relation_field)
+
 
 class DeliberationRecord(BaseModel):
     sentence: str
@@ -574,6 +592,7 @@ class RelationFlat(BaseModel):
 
     _canon_endpoint_types = field_validator("e1_type", "e2_type")(
         _canonicalize_label_field)
+    _canon_relation = field_validator("relation")(_canonicalize_relation_field)
 
     def to_relation_annotation(self) -> RelationAnnotation:
         return RelationAnnotation(
@@ -670,6 +689,10 @@ class RelationPrecedent(BaseModel):
     confidence: float = 1.0
     source_sentence: str = ""
     times_applied: int = 0
+
+    _canon_relation = field_validator("relation")(_canonicalize_relation_field)
+    _canon_endpoint_types = field_validator("e1_type", "e2_type")(
+        _canonicalize_label_field)
 
 
 
@@ -879,6 +902,53 @@ def load_decision_support(path: Path) -> List[Dict[str, str]]:
         return []
 
 
+def load_relation_guide(path: Path) -> List[Dict[str, str]]:
+    """
+    Parse the relation guide ("Relation schema.csv") — one row per relation,
+    columns Relation, Definition, Example.
+
+    This is the relation-side counterpart of the entity guideline: the closed
+    vocabulary of relation names TOGETHER with what each one means. It is served
+    only through the list_relation_types and relation_search tools, never pasted
+    into a system prompt, so an agent has to look a relation up before using it.
+
+    Each row becomes a searchable section whose title is the relation name, so an
+    exact-name lookup and a semantic search over the definitions share one index.
+    Falls back to an empty list if the file is missing or unreadable, which
+    disables both tools rather than half-registering them.
+    """
+    try:
+        if path.suffix.lower() != ".csv":
+            logger.warning("Relation guide %s is not a .csv; ignoring.", path)
+            return []
+        import csv
+        sections: List[Dict[str, str]] = []
+        with open(path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                name = canonicalize_relation_type(
+                    row.get("Relation") or "", record_off_schema=False)
+                if not name:
+                    continue
+                definition = (row.get("Definition") or "").strip()
+                example = (row.get("Example") or "").strip()
+                parts = []
+                if definition:
+                    parts.append(f"Definition: {definition}")
+                if example:
+                    parts.append(f"Examples: {example}")
+                sections.append({
+                    "title": name,
+                    "content": "\n".join(parts),
+                    "definition": definition,
+                    "example": example,
+                    "source": "relation_guide",
+                })
+        return sections
+    except Exception as exc:
+        logger.warning("Could not load relation guide %s: %s", path, exc)
+        return []
+
+
 # Section-boundary patterns for MoBiKo label guidance draft v2
 _MOBIKO_V2_SECTION_STARTS = (
     re.compile(r"^Step \d"),
@@ -979,8 +1049,21 @@ _GUIDELINE_EMBEDDING_MODEL = None
 _GUIDELINE_EMBEDDING_MODEL_LOADED_NAME: Optional[str] = None
 _GUIDELINE_EMBEDDING_ERROR: Optional[str] = None
 
+# Relation guide: the closed relation vocabulary plus definitions, reachable
+# only through tools. Embeddings are cached and invalidated by content hash,
+# exactly like the guideline sections.
+_RELATION_GUIDE: List[Dict[str, str]] = []
+_RELATION_GUIDE_EMBEDDINGS: Optional[List[List[float]]] = None
+_RELATION_GUIDE_HASH: Optional[str] = None
+
 _GUIDELINE_SEARCH_NO_MATCH_SUGGESTION = "This concept may not be covered in the guideline"
 _GUIDELINE_EMBEDDING_MIN_SCORE = 0.25
+# Relation definitions are a single sentence each, where the guideline sections
+# are paragraphs, so cosine similarity against them runs lower for the same
+# quality of match: "X is found inside Y" scores LOCATED_IN at 0.230 and
+# CONTAINS at 0.223 — both right, both under the guideline threshold. Measured
+# on the 41-relation guide; raise it only with new measurements.
+_RELATION_EMBEDDING_MIN_SCORE = 0.15
 _CONSISTENCY_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "into",
     "is", "of", "on", "or", "the", "to", "with",
@@ -1081,12 +1164,14 @@ def _init_tool_state(schema, guideline_sections, seed_examples,
                      entity_types_list: Optional[list] = None,
                      guideline_search_backend: Optional[str] = None,
                      guideline_search_embedding_model: Optional[str] = None,
-                     precedent_store: Optional["PrecedentStore"] = None):
+                     precedent_store: Optional["PrecedentStore"] = None,
+                     relation_guide: Optional[List[Dict[str, str]]] = None):
     """Populate module-level state used by tool functions."""
     global _SCHEMA, _TYPE_PAIR_TO_RELATIONS, _ALL_ENTITY_TYPES
     global _GUIDELINE_SECTIONS, _SEED_EXAMPLES, _PRECEDENT_STORE
     global _GUIDELINE_SEARCH_BACKEND, _GUIDELINE_SEARCH_EMBEDDING_MODEL_NAME
     global _GUIDELINE_SECTION_EMBEDDINGS, _GUIDELINE_SECTIONS_HASH, _GUIDELINE_EMBEDDING_ERROR
+    global _RELATION_GUIDE, _RELATION_GUIDE_EMBEDDINGS, _RELATION_GUIDE_HASH
 
     _PRECEDENT_STORE = precedent_store
 
@@ -1123,6 +1208,18 @@ def _init_tool_state(schema, guideline_sections, seed_examples,
     # doesn't stall mid-annotation with a cold-start download/encode.
     if _GUIDELINE_SEARCH_BACKEND == "embedding":
         _ensure_guideline_section_embeddings()
+
+    # Relation guide. _ALL_RELATION_TYPES is the closed vocabulary the emit-time
+    # canonicaliser validates against, so it is rebuilt here and nowhere else.
+    _RELATION_GUIDE = list(relation_guide or [])
+    new_relation_hash = _guideline_sections_hash(_RELATION_GUIDE)
+    if new_relation_hash != _RELATION_GUIDE_HASH:
+        _RELATION_GUIDE_EMBEDDINGS = None
+        _RELATION_GUIDE_HASH = new_relation_hash
+    _ALL_RELATION_TYPES.clear()
+    _ALL_RELATION_TYPES.update(sec["title"] for sec in _RELATION_GUIDE)
+    if _RELATION_GUIDE and _GUIDELINE_SEARCH_BACKEND == "embedding":
+        _ensure_relation_guide_embeddings()
 
     _TYPE_PAIR_TO_RELATIONS.clear()
     _ALL_ENTITY_TYPES.clear()
@@ -1174,6 +1271,111 @@ def guideline_search(
 
     results = _guideline_search_lexical(query)
     return _format_guideline_search_response(query, "lexical", results)
+
+
+def list_relation_types() -> str:
+    """List every relation name in the MoBiKo relation guide. Call this before annotating relations."""
+    return json.dumps(sorted(_ALL_RELATION_TYPES))
+
+
+def relation_search(
+    query: Annotated[str, "A relation name (e.g. 'CAUSES'), or a description of the link between two entities (e.g. 'one thing makes another possible')"],
+) -> str:
+    """Look up what a relation means, or find the relation that fits a described link."""
+    exact = canonicalize_relation_type(query, record_off_schema=False)
+    for sec in _RELATION_GUIDE:
+        if sec["title"] == exact:
+            return json.dumps({
+                "status": "matched",
+                "backend": "exact_name",
+                "query": query,
+                "results": [sec],
+            }, ensure_ascii=False)
+
+    results: List[Dict[str, Any]] = []
+    backend = "lexical"
+    if _GUIDELINE_SEARCH_BACKEND == "embedding":
+        try:
+            embedded = _relation_search_embedding(query)
+        except Exception as exc:
+            logger.warning("Embedding relation_search failed; falling back to lexical: %s", exc)
+            embedded = None
+        if embedded is not None:
+            # A ranked-but-empty result means nothing was similar enough. Do NOT
+            # fall through to lexical there: token overlap against one-sentence
+            # definitions answers "X is found inside Y" with GREATER_THAN, and a
+            # confidently wrong relation is worse than none. Lexical is only the
+            # substitute for embeddings being unavailable.
+            return _format_relation_search_response(query, "embedding", embedded)
+    if not results:
+        results = _relation_search_lexical(query)
+
+    return _format_relation_search_response(query, backend, results)
+
+
+def _format_relation_search_response(query: str, backend: str,
+                                     results: List[Dict[str, Any]]) -> str:
+    payload: Dict[str, Any] = {
+        "status": "matched" if results else "no_match",
+        "backend": backend,
+        "query": query,
+        "results": results,
+    }
+    if not results:
+        # A miss is where an invented label would otherwise be born, so answer it
+        # with the closed vocabulary rather than with nothing.
+        payload["suggestion"] = (
+            "No relation matched. The relation guide is a CLOSED vocabulary — do "
+            "not invent a name. Choose the closest relation from valid_relations "
+            "below, or do not annotate this pair.")
+        payload["valid_relations"] = sorted(_ALL_RELATION_TYPES)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _relation_search_lexical(query: str) -> List[Dict[str, Any]]:
+    tokens = set(re.findall(r"\w+", query.lower()))
+    scored = []
+    for sec in _RELATION_GUIDE:
+        title_tokens = set(re.findall(r"\w+", sec["title"].lower()))
+        content_tokens = set(re.findall(r"\w+", sec["content"].lower()))
+        score = len(tokens & title_tokens) * 3 + len(tokens & content_tokens)
+        if score > 0:
+            scored.append((score, sec))
+    scored.sort(key=lambda x: -x[0])
+    return [s[1] for s in scored[:3]]
+
+
+def _relation_search_embedding(query: str) -> Optional[List[Dict[str, Any]]]:
+    section_embeddings = _ensure_relation_guide_embeddings()
+    if not section_embeddings:
+        return None
+    query_embedding = _embed_guideline_texts([query])[0]
+    scored = []
+    for sec, sec_embedding in zip(_RELATION_GUIDE, section_embeddings):
+        score = _cosine_similarity(query_embedding, sec_embedding)
+        if score >= _RELATION_EMBEDDING_MIN_SCORE:
+            scored.append((score, sec))
+    scored.sort(key=lambda x: -x[0])
+    return [s[1] for s in scored[:3]]
+
+
+def _ensure_relation_guide_embeddings() -> Optional[List[List[float]]]:
+    """Embed the relation definitions once, reusing the guideline's model."""
+    global _RELATION_GUIDE_EMBEDDINGS
+    if _RELATION_GUIDE_EMBEDDINGS is not None:
+        return _RELATION_GUIDE_EMBEDDINGS
+    if not _RELATION_GUIDE:
+        _RELATION_GUIDE_EMBEDDINGS = []
+        return _RELATION_GUIDE_EMBEDDINGS
+    if _GUIDELINE_EMBEDDING_ERROR:
+        return None
+    try:
+        texts = [f"{sec['title']}\n{sec['content']}" for sec in _RELATION_GUIDE]
+        _RELATION_GUIDE_EMBEDDINGS = _embed_guideline_texts(texts)
+        return _RELATION_GUIDE_EMBEDDINGS
+    except Exception as exc:
+        logger.warning("Could not initialize relation guide embeddings: %s", exc)
+        return None
 
 
 def _format_guideline_search_response(
@@ -1392,6 +1594,12 @@ def lookup_precedent(
 ANNOTATOR_TOOL_FUNCTIONS = [
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
+    # The relation vocabulary is deliberately absent from the system prompts, so
+    # these two are the ONLY way an agent can learn which relations exist and
+    # what they mean. Registered before lookup_precedent so they read as the
+    # primary relation references.
+    (list_relation_types, "List every valid relation name. Call before annotating relations."),
+    (relation_search, "Look up what a relation means, or find the relation fitting a described link."),
     (lookup_precedent, "Look up how a span was annotated and adjudicated in earlier sentences."),
 ]
 
@@ -1399,6 +1607,8 @@ ANNOTATOR_TOOL_FUNCTIONS = [
 CRITIC_TOOL_FUNCTIONS = [
     (schema_lookup, "Check which relations are valid between two entity types."),
     (guideline_search, "Search the labelling guideline for relevant rules."),
+    (list_relation_types, "List every valid relation name. Call before judging relations."),
+    (relation_search, "Look up what a relation means, or find the relation fitting a described link."),
     (lookup_precedent, "Look up how a span was adjudicated in earlier sentences this batch."),
 ]
 
@@ -1615,6 +1825,9 @@ def _make_structured_termination_check(
 _THIS_DIR = Path(__file__).resolve().parent
 _DEFAULT_DECISION_SUPPORT = _THIS_DIR / "Decision_support.csv"
 _DEFAULT_GUIDELINE = _THIS_DIR / "MoBiKo_label_guidance_v4.md"
+# The relation vocabulary and its definitions. Reached only through the
+# list_relation_types and relation_search tools — never rendered into a prompt.
+_DEFAULT_RELATION_GUIDE = _THIS_DIR / "Relation schema.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2151,6 +2364,8 @@ class MultiAgentAnnotator:
         schema_path: Optional[Path] = None,
         decision_support_path: Optional[Path] = None,
         guideline_path: Optional[Path] = None,
+        relation_guide_path: Optional[Path] = None,
+        use_relation_guide: bool = True,
         use_guideline: bool = True,
         use_decision_support: bool = True,
         prompt_set: str = "mobiko",
@@ -2167,7 +2382,13 @@ class MultiAgentAnnotator:
         request_timeout: int = 600,
         strict_critic: bool = False,
         guideline_search_mandatory: bool = True,
-        include_relation_schema: bool = True,
+        relation_search_mandatory: bool = False,
+        # CoNLL only. MoBiKo's relation vocabulary reaches the agents as a name
+        # list plus the relation_search tool, never as a pasted schema — its
+        # prompt module has no parameter for it. CoNLL annotates no relations by
+        # default, but can be handed one explicitly via --schema, and its prompts
+        # still render it, so the flag stays meaningful there.
+        include_relation_schema: bool = False,
         tool_choice: Optional[str] = None,
         annotator_temperature: Optional[float] = None,
         critic_temperature: Optional[float] = None,
@@ -2268,6 +2489,23 @@ class MultiAgentAnnotator:
         # guideline_search tool searches across both documents combined
         all_sections = decision_support_sections + guidance_sections
 
+        # The relation guide is loaded but NOT merged into all_sections: it is a
+        # separate vocabulary with its own tools, and mixing it into
+        # guideline_search would put relation definitions in the way of entity
+        # type queries.
+        if use_relation_guide:
+            rg_path = relation_guide_path or _DEFAULT_RELATION_GUIDE
+            relation_guide = load_relation_guide(rg_path) if rg_path and rg_path.exists() else []
+            if rg_path and not rg_path.exists():
+                logger.warning("Relation guide not found at %s — relation tools "
+                               "will not be registered.", rg_path)
+        else:
+            relation_guide = []
+            logger.info("Relation guide disabled.")
+        self.relation_guide_path = (relation_guide_path or _DEFAULT_RELATION_GUIDE) \
+            if use_relation_guide else None
+        self.relation_search_mandatory = relation_search_mandatory
+
         # ── Precedent store (persistent memory across batches) ──
         if use_precedent_memory:
             self.precedent_store: Optional[PrecedentStore] = (
@@ -2283,11 +2521,13 @@ class MultiAgentAnnotator:
                          entity_types_list=entity_types_list or _FALLBACK_ENTITY_TYPES,
                          guideline_search_backend=guideline_search_backend,
                          guideline_search_embedding_model=guideline_search_embedding_model,
-                         precedent_store=self.precedent_store)
+                         precedent_store=self.precedent_store,
+                         relation_guide=relation_guide)
 
         logger.info(
             f"Loaded decision support: {len(decision_support_sections)} sections | "
-            f"guidance: {len(guidance_sections)} sections"
+            f"guidance: {len(guidance_sections)} sections | "
+            f"relation guide: {len(relation_guide)} relations"
         )
 
         # Give the two roles DIFFERENT in-prompt references so they bring distinct
@@ -2329,11 +2569,6 @@ class MultiAgentAnnotator:
         logger.info(
             "guideline_search: %s",
             "mandatory" if guideline_search_mandatory else "optional",
-        )
-        logger.info(
-            "relation schema in prompts: %s",
-            "included" if include_relation_schema
-            else "omitted (schema_lookup tool only)",
         )
         logger.info(
             "tool_choice: %s",
@@ -2411,13 +2646,26 @@ class MultiAgentAnnotator:
                         " (strict critic)" if strict_critic else "",
                         " [SINGLE-PASS: annotator only]" if single_pass else "")
 
+        # The two prompt sets take different relation arguments because the two
+        # corpora treat relations differently. Selecting the kwargs by prompt set
+        # keeps each module's signature honest, rather than forcing a union of
+        # both onto both and having one silently ignore half of it.
+        if prompt_set == "conll":
+            _rel_prompt_kwargs = {"include_relation_schema": include_relation_schema}
+        else:
+            _rel_prompt_kwargs = {
+                "relation_search_mandatory": (relation_search_mandatory
+                                              and bool(relation_guide)),
+                "relation_types": [sec["title"] for sec in relation_guide],
+            }
+
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
             name="Annotator",
             system_message=_annotator_prompt_fn(
                 annotator_guideline, entity_schema_str, relation_schema,
                 guideline_search_mandatory=guideline_search_mandatory,
-                include_relation_schema=include_relation_schema),
+                **_rel_prompt_kwargs),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
             is_termination_msg=annotator_is_done,
@@ -2429,7 +2677,7 @@ class MultiAgentAnnotator:
                 critic_guideline, entity_schema_str, relation_schema,
                 guideline_search_mandatory=guideline_search_mandatory,
                 precedent_memory=use_precedent_memory,
-                include_relation_schema=include_relation_schema),
+                **_rel_prompt_kwargs),
             llm_config=critic_llm,
             human_input_mode="NEVER",
             is_termination_msg=critic_is_done,
@@ -2439,7 +2687,7 @@ class MultiAgentAnnotator:
             name="Adjudicator",
             system_message=_adjudicator_prompt_fn(
                 critic_guideline, entity_schema_str, relation_schema,
-                include_relation_schema=include_relation_schema),
+                **_rel_prompt_kwargs),
             llm_config=adjudicator_llm,
             human_input_mode="NEVER",
             is_termination_msg=adjudicator_is_done,
@@ -2476,6 +2724,20 @@ class MultiAgentAnnotator:
             annotator_tools = [t for t in annotator_tools if t[0] is not guideline_search]
             critic_tools = [t for t in critic_tools if t[0] is not guideline_search]
             logger.info("guideline_search not registered: no guideline sections loaded.")
+        # Same reasoning for the relation tools: with no guide loaded they can
+        # only answer "nothing", and the prompt has already been told not to
+        # require them (relation_search_mandatory is ANDed with bool(relation_guide)).
+        if not relation_guide:
+            _relation_tools = {list_relation_types, relation_search}
+            annotator_tools = [t for t in annotator_tools if t[0] not in _relation_tools]
+            critic_tools = [t for t in critic_tools if t[0] not in _relation_tools]
+            logger.info("relation tools not registered: no relation guide loaded.")
+        else:
+            logger.info(
+                "relation guide: %d relations — names in prompt, definitions "
+                "tool-only (%s lookup).",
+                len(relation_guide),
+                "mandatory" if relation_search_mandatory else "optional")
         _register_tools_on_agents(self.annotator,  self.annotator_executor, annotator_tools)
         _register_tools_on_agents(self.critic,     self.critic_executor,    critic_tools)
         _register_tools_on_agents(self.adjudicator, self.adj_executor,      critic_tools)
@@ -2486,7 +2748,6 @@ class MultiAgentAnnotator:
             critic_model=critic_model,
             adjudicator_model=adjudicator_model,
             requested_hints=use_dependency_relation_hints,
-            include_relation_schema=include_relation_schema,
             tool_choice=tool_choice,
             annotator_temperature=annotator_temp,
             critic_temperature=critic_temp,
@@ -2501,6 +2762,12 @@ class MultiAgentAnnotator:
             effective_guideline_path=str(gl_path) if gl_path else None,
             guideline_search_registered=any(
                 t[0] is guideline_search for t in annotator_tools),
+            include_relation_schema=include_relation_schema and prompt_set == "conll",
+            relation_guide_path=str(self.relation_guide_path) if self.relation_guide_path else None,
+            relation_guide_size=len(relation_guide),
+            relation_search_mandatory=relation_search_mandatory and bool(relation_guide),
+            relation_search_registered=any(
+                t[0] is relation_search for t in annotator_tools),
             entity_types=list(entity_types_list) if entity_types_list else None,
             prompt_set=prompt_set,
             single_pass=single_pass,
@@ -2539,6 +2806,8 @@ class MultiAgentAnnotator:
             # ── the experimental arm ──
             "use_dependency_relation_hints": eff_hints,
             "hints_requested": bool(cfg.get("requested_hints")),
+            # CoNLL-only now: the MoBiKo prompts cannot paste a relation schema
+            # at all, so on a MoBiKo run this is always False.
             "include_relation_schema": bool(cfg.get("include_relation_schema")),
             # EFFECTIVE, not requested: which guidance the run actually had, and
             # from where. "guideline-free" is a claim about the run that must be
@@ -2547,6 +2816,12 @@ class MultiAgentAnnotator:
             "decision_support_sections": cfg.get("n_decision_support_sections"),
             "guideline_path": cfg.get("effective_guideline_path"),
             "guideline_search_registered": cfg.get("guideline_search_registered"),
+            # Which relation vocabulary a run used is not recoverable from the
+            # output alone once the guide can be swapped, so it is stamped here.
+            "relation_guide_path": cfg.get("relation_guide_path"),
+            "relation_guide_size": cfg.get("relation_guide_size"),
+            "relation_search_mandatory": cfg.get("relation_search_mandatory"),
+            "relation_search_registered": cfg.get("relation_search_registered"),
             "entity_types": cfg.get("entity_types"),
             # Which prompt templates the agents actually ran with. Two corpora with
             # structurally parallel but textually different prompts means a run is

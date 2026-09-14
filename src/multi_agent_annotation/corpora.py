@@ -36,6 +36,10 @@ CORPORA = {
         # schema, which is relation_schema_new.py (7 relations — the vocabulary
         # the scored runs actually use).
         "schema": _REPO / "src/resources_updated/relation_schema_new.py",
+        # The relation VOCABULARY and its definitions, as opposed to "schema"
+        # above, which is the entity-type-pair matrix. Served only through the
+        # list_relation_types / relation_search tools; never put in a prompt.
+        "relation_guide": _REPO / "src/multi_agent_annotation/Relation schema.csv",
         "seeds": _REPO / "src/resources_updated/manual_seeds_filled.py",
         "prompt_set": "mobiko",
     },
@@ -49,6 +53,9 @@ CORPORA = {
         # CoNLL-2003 annotates no relations. None (not a path) so schema_lookup
         # reports nothing valid instead of offering biodiversity relations.
         "schema": None,
+        # CoNLL-2003 annotates no relations, so there is no vocabulary to serve
+        # and the relation tools are not registered.
+        "relation_guide": None,
         "seeds": None,
         # Parallel prompt templates: newswire framing, no relations, CoNLL
         # boundary conventions. See prompts_conll.
@@ -58,7 +65,8 @@ CORPORA = {
 
 
 def resolve(corpus: str, *, schema=None, seeds=None, guideline=None,
-            no_guideline: bool = False, no_decision_support: bool = False) -> dict:
+            relation_guide=None, no_guideline: bool = False,
+            no_decision_support: bool = False, no_relation_guide: bool = False) -> dict:
     """Preset for `corpus`, with optional per-flag overrides.
 
     Returns the kwargs both entry points pass to MultiAgentAnnotator. Overrides are
@@ -74,10 +82,13 @@ def resolve(corpus: str, *, schema=None, seeds=None, guideline=None,
     schema_path = schema or preset["schema"]
     seeds_path = seeds or preset["seeds"]
     guideline_path = guideline or preset["guideline"]
+    relation_guide_path = relation_guide or preset["relation_guide"]
     return {
         "schema_path": Path(schema_path).resolve() if schema_path else None,
         "seeds_path": Path(seeds_path).resolve() if seeds_path else None,
         "guideline_path": Path(guideline_path).resolve() if guideline_path else None,
+        "relation_guide_path": Path(relation_guide_path).resolve() if relation_guide_path else None,
+        "use_relation_guide": bool(relation_guide_path) and not no_relation_guide,
         "use_guideline": not no_guideline,
         "use_decision_support": preset["decision_support"] and not no_decision_support,
         "entity_schema_str": preset["entity_schema"],
@@ -99,3 +110,11 @@ def add_corpus_args(parser) -> None:
                              "--guideline means 'use the preset', not 'use none'.")
     parser.add_argument("--no-decision-support", action="store_true",
                         help="run with no decision-support table")
+    parser.add_argument("--relation-guide", type=Path, default=None,
+                        help="relation guide .csv (Relation, Definition, Example); "
+                             "defaults to the corpus preset. Served through the "
+                             "relation tools only — never rendered into a prompt.")
+    parser.add_argument("--no-relation-guide", action="store_true",
+                        help="run with NO relation vocabulary: the relation tools "
+                             "are not registered and relation labels are not "
+                             "validated. Ablation for whether the guide helps.")
