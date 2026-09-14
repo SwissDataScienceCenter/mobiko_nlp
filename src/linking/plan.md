@@ -1643,3 +1643,103 @@ existing AMBIGUOUS reason ("its referent depends on coreference, which is not
 resolved here") stays accurate as a statement about the mention; what it should
 NOT imply is that resolving the coref would produce a link here. Measured: it
 would not.
+
+## `concept_text` becomes a span-first fallback (11 Sep 2026)
+
+Two changes, arrived at by measuring rather than reasoning, and they replace the
+rule of 7 Sep entirely.
+
+**1. The text is no longer the test.** The old rule required every token of a
+`concept_text` to appear in the sentence or the abstract. Resolving every
+binomial the annotators recorded shows that requirement is anti-correlated with
+usefulness:
+
+| annotator value | old gate | grounds? |
+|---|---|---|
+| `Tadarida insignis` (Mark) | **rejected** | **`gbif:4266607`** |
+| `Pipistrellus javanicus` (Mark) | accepted (document) | `gbif:5218488` |
+| `Murina huttonii` (Mark) | accepted (document) | `gbif:8307118` |
+| `Myotis frater` (Mark) | accepted (document) | `gbif:2432428` |
+| `Pi. javanicus` (Davnah) | accepted (document) | nil |
+| `My. frater` (Davnah) | accepted (document) | nil |
+| `Mu. huttonii` (Davnah) | accepted (document) | nil |
+
+Davnah records the *abbreviated* genus, which is in the text, so containment
+passes it — and GBIF holds full binomials, so it grounds to nothing. Mark
+records the full genus for `insignis`, which appears nowhere in the abstract
+(not even as `Ta.`), so containment rejected it — and it is the one value
+carrying a real id. A field whose purpose is to supply what the span does not
+say cannot be gated on the span's own words. **Requiring a link does the same
+job without the flaw**, and is the standard `_try_singular` already sets.
+
+**2. The 190 "tool placeholders" were never junk.** They are the annotation
+tool's bare `x ` written in front of the value. 183 of the 190 strip back to the
+span text exactly, and the remaining 7 strip back to a real correction — `x
+antibacterial properties` for the span `properties`, `x high altitudes` for
+`altitudes`. Rejecting them threw away 7 corrections for nothing. The prefix is
+now stripped and the value used. The field is not two-thirds noise, as recorded
+on 7 Sep; it is sound, with 5 corrupt values out of 281 (under 2%).
+
+**3. The span goes first, and this is the substantive reversal.** Precedence was
+`concept_text` > surface > singular; it is now **surface > `concept_text` >
+singular**, each step reached only when the one before it matched nothing, each
+accepting only a LINK. The reason is not distrust but what the values mostly
+*are* — extensions of the span rather than corrections of it, and an extension
+names a different entity under the modifier-preserving identity rule. Preferring
+`concept_text` grounded 5 mentions and cost 7, and four of the seven gave up a
+link that is correct for the span actually marked:
+
+```
+biomass            -> trout biomass            gave up ENVO:01000155
+water temperature  -> Peak water temperature   gave up ENVO:09200014
+grassland          -> grassland remnants       gave up ENVO:01001206
+insect             -> insect groups            gave up gbif:216
+```
+
+`trout biomass` is not ENVO's `biomass`, so there is nothing to recover there —
+the span is simply the better thing to look up.
+
+**Measured, both relation-input files, 2,216 mentions: 8 links gained, 0 lost**
+against the code at HEAD. Five come from the fallback itself and are all correct
+expansions:
+
+```
+introduced predator -> predator                 ECOCORE:00000089
+frater              -> Myotis frater            gbif:2432428
+insignis            -> Tadarida insignis        gbif:4266607
+javanicus           -> Pipistrellus javanicus   gbif:5218488
+huttonii            -> Murina huttonii          gbif:8307118
+```
+
+The other three (`water temperature`, `grassland`, `insect`, `biomass`) are the
+extensions above, now grounding on their span. Grounded entities 141 -> 144.
+
+**What it costs.** 80 values the text verified but no authority holds no longer
+become the canonical form — the off-by-one span repairs (`ichness` ->
+`richness`, `ontane habitats` -> `montane habitats`) and the reductions
+(`novel habitats` -> `novel`). So `ichness` is its own project-local entity.
+Accepted deliberately: one rule, and no canonical form an authority has not
+confirmed. The old text test was admitting junk of its own anyway — `species` ->
+`historically` passes it, because both words happen to be in the sentence.
+Repairing the spans belongs upstream in postprocessing, not here.
+
+`concept_text_scope` survives as provenance only (`sentence` / `document` /
+`external`) and decides nothing. It is now written to the row, alongside
+`concept_text_used` and `concept_text_tool_prefix`, so a run can be read without
+guessing. The default corpus is untouched: both postprocessed files carry
+`concept_text` on 0 of 3,269 spans, and a re-run is byte-identical to
+`output/linking/resolution.jsonl`. 108 tests in `src/linking`.
+
+**A data bug this surfaced.** `Tadarida` is absent from the abstract because the
+sentence splitter is losing text, not merely splitting badly:
+
+```
+[115] A new species, Myotis himalaicus sp.
+[116] frater complex is described based on multiple evidence of unique characters.
+[117] insignis and report this species for the first time from India.
+```
+
+`nov. from the Myotis` and whatever introduced `Tadarida` are gone from the
+input entirely. The splitter is partly *manufacturing* the need for
+`concept_text`, and the old gate then penalised the annotator for repairing it.
+Worth chasing in the postprocessing path, separately from linking.

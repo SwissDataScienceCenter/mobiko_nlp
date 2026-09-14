@@ -376,7 +376,7 @@ def test_the_singular_fallback_only_ever_adds_grounding(tmp_path):
             assert on[k]["canonical_text"] != on[k]["text"]
 
 
-# ── concept_text is optional input, validated not trusted ────────
+# ── concept_text provenance: which scope supports a value, if any ────────
 
 from src.linking.resolve_corpus import validate_concept_text  # noqa: E402
 
@@ -410,8 +410,93 @@ def test_document_scope_rescues_abbreviated_binomials():
 
 
 @pytest.mark.parametrize("concept", ["x three", "x phylogenetic", "Helarctos Malayans"])
-def test_junk_and_corruption_are_rejected_at_both_scopes(concept):
-    """190 of 195 rejections in the gold are the tool placeholder "x" prefixed
-    to the span; the rest are genuine corruptions."""
+def test_junk_and_corruption_are_unsupported_at_both_scopes(concept):
+    """190 of 195 unsupported values in the gold are the tool placeholder "x"
+    prefixed to the span; the rest are genuine corruptions. Unsupported is no
+    longer the same as rejected — see the gate tests below — but these reach the
+    gate with nothing from the text behind them."""
     sent = "Three phylogenetic groups of Helarctos malayanus were recorded."
     assert validate_concept_text(concept, sent, sent) is None
+
+
+# ── concept_text is a span-first fallback ────────────────────────────────
+
+from types import SimpleNamespace  # noqa: E402
+
+from src.linking.match import Outcome  # noqa: E402
+from src.linking.resolve_corpus import _try_concept_text  # noqa: E402
+
+
+class _StubDict:
+    """Stands in for the compiled authorities; only `resolve` is exercised."""
+
+
+def _span(text, concept, scope, etype="BIOTIC ENTITY"):
+    return {"text": text, "canonical_text": text, "entity_type": etype,
+            "concept_text": concept, "_concept": concept,
+            "concept_text_scope": scope, "concept_source": "surface"}
+
+
+def _nil():
+    return SimpleNamespace(outcome=Outcome.NIL, match=None, candidates=(),
+                           reason=None, decided_by=None)
+
+
+def _fallback(monkeypatch, sp, links):
+    """Run the fallback with `resolve` stubbed to link only `links`."""
+    seen = []
+
+    def fake_resolve(_d, text, _etype):
+        seen.append(text)
+        outcome = Outcome.LINKED if text in links else Outcome.NIL
+        return SimpleNamespace(outcome=outcome, match=None, candidates=(),
+                               reason=None, decided_by=None)
+
+    monkeypatch.setattr("src.linking.resolve_corpus.resolve", fake_resolve)
+    res, out = _try_concept_text(_StubDict(), sp, _nil())
+    return res, out, seen
+
+
+def test_concept_text_is_adopted_when_it_links_and_the_span_did_not(monkeypatch):
+    """`insignis` is in no authority; `Tadarida insignis` is gbif:4266607. The
+    fallback exists for exactly this."""
+    sp = _span("insignis", "Tadarida insignis", None)
+    res, out, _ = _fallback(monkeypatch, sp, links={"Tadarida insignis"})
+    assert res.outcome is Outcome.LINKED
+    assert out["canonical_text"] == "Tadarida insignis"
+    assert out["concept_source"] == "concept_text:external"
+
+
+def test_concept_text_is_dropped_when_it_does_not_link(monkeypatch):
+    """Only a link is accepted, so a value that grounds nowhere leaves the span
+    as the canonical form — `ichness` stays `ichness`, and no text test was
+    needed to decide that."""
+    sp = _span("ichness", "richness", "sentence")
+    res, out, seen = _fallback(monkeypatch, sp, links=set())
+    assert res.outcome is Outcome.NIL
+    assert out["canonical_text"] == "ichness"
+    assert out["concept_source"] == "surface"
+    assert seen == ["richness"]
+
+
+def test_text_support_is_recorded_but_decides_nothing(monkeypatch):
+    """A value that links keeps its scope, so a run shows whether the annotator
+    restated the text or reached beyond it."""
+    sp = _span("ichness", "richness", "sentence")
+    _, out, _ = _fallback(monkeypatch, sp, links={"richness"})
+    assert out["concept_source"] == "concept_text:sentence"
+
+
+def test_a_concept_text_equal_to_the_span_is_not_looked_up_twice(monkeypatch):
+    """183 of the 190 tool-prefixed values strip back to the span itself."""
+    sp = _span("three", "three", "sentence")
+    res, out, seen = _fallback(monkeypatch, sp, links=set())
+    assert seen == []
+    assert out["concept_source"] == "surface"
+
+
+def test_a_span_with_no_concept_text_is_left_alone(monkeypatch):
+    sp = _span("bird species", None, None)
+    _, out, seen = _fallback(monkeypatch, sp, links=set())
+    assert seen == []
+    assert out["canonical_text"] == "bird species"

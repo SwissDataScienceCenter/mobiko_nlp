@@ -174,6 +174,16 @@ def _iter_records(path: Path) -> Iterator[dict]:
 
 _TOKEN_TRIM = " \t\n.,;:!?()[]{}\"'`"
 
+# The annotation tool writes a bare "x " in front of the value, on 190 of the
+# 281 concept_texts in the human files. It is the tool's artefact and not
+# something an annotator typed, which is measurable: 183 of the 190 strip back
+# to the span text exactly, and the other 7 strip back to a real correction —
+# "x antibacterial properties" for the span `properties`, "x high altitudes" for
+# `altitudes`. So the prefix is removed and the value used, rather than treated
+# as grounds for throwing the value away (which is what happened until 11 Sep,
+# and cost those 7 corrections).
+_TOOL_PREFIX = _re.compile(r"^\s*x\s+", _re.IGNORECASE)
+
 
 def _tokens(text: str) -> List[str]:
     """Words, with punctuation trimmed from each token's edges.
@@ -192,6 +202,12 @@ def _tokens(text: str) -> List[str]:
 def validate_concept_text(concept: str, sentence: str,
                           document: Optional[str] = None) -> Optional[str]:
     """Which scope supports this ``concept_text``: "sentence", "document", or None.
+
+    **Provenance only. This decides nothing.** It once gated whether a
+    ``concept_text`` was used at all; the value is now simply trusted (see
+    `iter_spans`). What this still answers is worth recording on the row:
+    whether the annotator restated the text or reached beyond it, which is the
+    difference between a span repair and a piece of outside knowledge.
 
     Token containment, not substring. A substring test would reject the valid
     cases: "annual rainfall" carries concept_text "high annual rainfall" because
@@ -252,9 +268,10 @@ def iter_spans(path: Path) -> Iterator[dict]:
                 uid = sp.get("uid") or _synthetic_uid(doc_id, sent_i, start, end, text)
                 seen_uids[uid] += 1
                 occurrence = seen_uids[uid]
-                concept = sp.get("concept_text")
+                recorded = (sp.get("concept_text") or "").strip() or None
+                concept = (_TOOL_PREFIX.sub("", recorded).strip() or None
+                           if recorded else None)
                 scope = validate_concept_text(concept, sentence, document) if concept else None
-                concept_ok = scope is not None
                 yield {
                     "mention_id": f"{path.stem}:{uid}#{occurrence}",
                     "uid_occurrence": occurrence,
@@ -268,17 +285,66 @@ def iter_spans(path: Path) -> Iterator[dict]:
                     "text": text,
                     "entity_type": canonicalize_entity_type(
                         sp.get("type") or sp.get("entity_type") or ""),
-                    # Optional, honoured when present AND supported by its
-                    # sentence. The canonical form is what identity and
-                    # matching both use; concept_source records which it was,
-                    # so a run can be read without guessing.
-                    "concept_text": concept,
+                    # Optional, and a FALLBACK: the span as written is tried
+                    # first, and the annotator's value is consulted only when
+                    # nothing matched it (`_try_concept_text`). ``concept_text``
+                    # keeps the value exactly as recorded, so the row stays a
+                    # faithful record; ``_concept`` is the form actually tried,
+                    # with the tool's prefix removed. ``concept_text_scope`` is
+                    # provenance only — whether the text happens to contain the
+                    # value — and decides nothing.
+                    "concept_text": recorded,
                     "concept_text_scope": scope,
-                    "canonical_text": concept if concept_ok else text,
-                    "concept_source": (f"concept_text:{scope}" if concept_ok
-                                       else ("concept_text_rejected" if concept
-                                             else "surface")),
+                    "concept_text_tool_prefix": bool(recorded and concept != recorded),
+                    "_concept": concept,
+                    "canonical_text": text,
+                    "concept_source": "surface",
                 }
+
+
+def _try_concept_text(dictionary, sp: dict, nil_result):
+    """The annotator's value, tried when the span as written matched nothing.
+
+    **This is not about distrusting the value.** `concept_text` is sound: of the
+    281 values in the human files, 5 are corrupt — under 2% — and the 190 that
+    look like junk are one tool artefact (a bare "x " prefix, stripped in
+    `iter_spans`), not annotator error. Nothing here tests the value against the
+    text, and nothing rejects it for being unsupported.
+
+    **The span comes first because of what the values mostly are** (decision,
+    11 Sep, reversing the original `concept_text` > surface precedence). Most of
+    them extend the span rather than correct it, and an extension names a
+    *different entity* under §6, where identity is modifier-preserving. Measured
+    across both human files, preferring `concept_text` grounded 5 mentions and
+    cost 7 — and four of the seven were extensions giving up a link that is
+    correct for the span the annotator actually marked:
+
+        biomass           -> trout biomass           gave up ENVO:01000155
+        water temperature -> Peak water temperature  gave up ENVO:09200014
+        grassland         -> grassland remnants      gave up ENVO:01001206
+        insect            -> insect groups           gave up gbif:216
+
+    `trout biomass` is not ENVO's `biomass` and should not be linked to it, so
+    there is nothing to recover there — the span is simply the better thing to
+    look up. Going span-first keeps all 5 gains (`insignis` ->
+    *Tadarida insignis*, `frater` -> *Myotis frater*, `javanicus`, `huttonii`,
+    and `introduced predator` -> `predator` in ECOCORE) and none of the losses.
+
+    **Only a LINK is accepted**, the standard `_try_singular` already sets, so a
+    fallback can add grounding and never take an answer away.
+
+    Reached only on NIL. An AMBIGUOUS span is a deliberate refusal, not a
+    failure to find anything, and is left alone.
+    """
+    alt = sp.get("_concept")
+    if not alt or alt == sp["canonical_text"]:
+        return nil_result, sp
+    res = resolve(dictionary, alt, sp["entity_type"])
+    if res.outcome is not Outcome.LINKED:
+        return nil_result, sp
+    scope = sp.get("concept_text_scope") or "external"
+    return res, {**sp, "canonical_text": alt,
+                 "concept_source": f"concept_text:{scope}"}
 
 
 def _try_singular(dictionary, sp: dict, nil_result):
@@ -408,15 +474,20 @@ def main(argv: List[str] | None = None) -> int:
     stats: Counter = Counter()
     reused_uids = 0
     n_singular = 0
+    n_concept = 0
     concept_stats: Counter = Counter()
     if True:
         for sp in raw:
             if sp.get("part_index") is None and sp["uid_occurrence"] > 1:
                 reused_uids += 1
-            # canonical_text, not the raw span: where an annotator recorded a
-            # concept_text and the sentence supports it, that is what the
-            # mention denotes. The surface form is kept on the row regardless.
+            # The span as written first; then the annotator's concept_text;
+            # then the singular. Each later step is reached only when the one
+            # before it matched nothing, and each accepts only a LINK, so a
+            # fallback can add grounding but never take an answer away.
             r = resolve(d, sp["canonical_text"], sp["entity_type"])
+            if r.outcome is Outcome.NIL:
+                r, sp = _try_concept_text(d, sp, r)
+                n_concept += int(sp["concept_source"].startswith("concept_text:"))
             if r.outcome is Outcome.NIL and not args.no_singular:
                 r, sp = _try_singular(d, sp, r)
                 n_singular += int(sp["concept_source"] == "singular")
@@ -532,6 +603,9 @@ def main(argv: List[str] | None = None) -> int:
                 "end_char": r["end_char"],
                 "text": r["text"],
                 "concept_text": r["concept_text"],
+                "concept_text_scope": r.get("concept_text_scope"),
+                "concept_text_used": r["concept_source"].startswith("concept_text:"),
+                "concept_text_tool_prefix": r.get("concept_text_tool_prefix") or None,
                 "canonical_text": r["canonical_text"],
                 "concept_source": r["concept_source"],
                 "entity_type": r["entity_type"],
@@ -586,10 +660,13 @@ def main(argv: List[str] | None = None) -> int:
         print(f"  singular:     {n_singular:,} mention(s) grounded via their "
               f"singular after matching nothing")
     used = sum(v for k, v in concept_stats.items() if k.startswith("concept_text:"))
-    rejected = concept_stats["concept_text_rejected"]
-    if used or rejected:
-        print(f"  concept_text: {used:,} honoured, {rejected:,} rejected "
-              f"(tokens absent from the sentence and the document)")
+    external = concept_stats["concept_text:external"]
+    n_offered = sum(1 for r in rows if r.get("concept_text"))
+    if n_offered:
+        n_prefix = sum(1 for r in rows if r.get("concept_text_tool_prefix"))
+        print(f"  concept_text: {n_offered:,} recorded, {used:,} used after the "
+              f"span matched nothing ({external:,} of those absent from the "
+              f"text); {n_prefix:,} had the tool's \"x \" prefix removed")
     for k in ("linked", "ambiguous", "nil", "unrouted"):
         print(f"  {k:10s} {stats[k]:6,}  ({100*stats[k]/max(len(rows),1):4.1f}%)")
     print(f"\n  distinct entities: {len(grounded_entities) + len(local_entities):,}  "
