@@ -41,6 +41,20 @@ ONLY=${ONLY:-}
 # built and the guideline sections embedded.
 mkdir -p "$RUN_DIR" "$(dirname "$OUT")"
 
+# One pipeline pass over a source file. Called twice per document when the first
+# pass left parse failures behind: the second call re-attempts exactly those,
+# because --resume skips every sentence still present in the output.
+run_pipeline() {
+    local src="$1" dest="$2"
+    shift 2
+    "$PY" src/multi_agent_annotation/demo_ag2.py \
+        --input "$src" \
+        --output "$dest" \
+        --no-relation-schema-in-prompt \
+        --resume \
+        "$@"
+}
+
 shopt -s nullglob
 files=("$INPUT_DIR"/*.txt)
 if [ ${#files[@]} -eq 0 ]; then
@@ -63,19 +77,50 @@ for f in "${files[@]}"; do
     # --output is always explicit: without --resume, annotate_batch truncates
     # the target to zero bytes before the first sentence, and demo_ag2's default
     # --output points at an existing run file.
-    "$PY" src/multi_agent_annotation/demo_ag2.py \
-        --input "$f" \
-        --output "$out" \
-        --no-relation-schema-in-prompt \
-        --resume \
-        "$@"
+    run_pipeline "$f" "$out" "$@"
 
-    # A parse failure writes an empty record rather than no record, and resume
+    # A parse failure writes an EMPTY record rather than no record, and --resume
     # decides what is done by sentence text, so such a sentence is marked
-    # permanently done and never retried. Dropping those records is the only way
-    # to give them another pass; genuine empty results (status "constrained")
-    # are left alone.
-    "$PY" scripts/prune_failed_records.py "$out" || true
+    # permanently done and is never retried. Deleting the record is the only way
+    # to give it another pass -- which is why the prune has to be followed by a
+    # second run. Genuine empty results (status "constrained") are a real answer
+    # from the model and are left alone by prune_failed_records.py.
+    #
+    # --dry-run first: the script exits 0 whether or not there is anything to
+    # delete, so the decision has to come from its output, and there is no point
+    # taking a backup or spending a second pass when nothing failed. Its exit
+    # status is checked separately -- a dry run that FAILED says nothing about
+    # whether there are failures to prune, and must not fall through into
+    # pruning for real.
+    if ! dry_out=$("$PY" scripts/prune_failed_records.py "$out" --dry-run 2>&1); then
+        echo "  [WARN] could not inspect $pmc for parse failures; skipping retry" >&2
+        printf '%s\n' "$dry_out" >&2
+    elif grep -q "Nothing to delete." <<<"$dry_out"; then
+        echo "  no parse failures to retry."
+    else
+        # Our own backup, stamped to the second. prune_failed_records.py stamps
+        # its own with the DATE only and refuses to overwrite one, so a second
+        # prune of the same file on the same day would abort -- which is exactly
+        # what a retry pass does.
+        backup="$out.pre_prune_$(date +%Y%m%dT%H%M%S).bak"
+        cp -p "$out" "$backup"
+        echo "  backup: $backup"
+
+        if "$PY" scripts/prune_failed_records.py "$out" --no-backup; then
+            echo
+            echo "  --- retrying the pruned sentences ---"
+            # Same arguments; --resume skips everything still in the file, so
+            # this pass touches only the sentences just deleted. One retry, not
+            # a loop: anything that fails again keeps its parse-failed record
+            # and is reported by the converter instead of being hidden.
+            run_pipeline "$f" "$out" "$@"
+        else
+            # Don't abandon the remaining documents over one prune: their run
+            # JSONLs are intact and the backup above still holds this one.
+            echo "  [WARN] prune failed for $pmc; keeping the run as it is" >&2
+            cp -p "$backup" "$out"
+        fi
+    fi
 done
 
 echo
