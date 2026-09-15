@@ -38,6 +38,7 @@ Both are produced by prep scripts and simply absent from older files:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import html as html_mod
 import io
@@ -56,17 +57,59 @@ import streamlit as st
 #  Constants                                                          #
 # ------------------------------------------------------------------ #
 
+# The relation vocabulary, mirroring src/multi_agent_annotation/Relation schema.csv
+# — the same closed set the pipeline serves through its relation_search tool, so
+# what a model can emit is what an annotator can pick.
+#
+# Inlined rather than read from that CSV because the deployment copies only this
+# file and streamlit_app_annotate.py into the image (see deploy_annotate/Dockerfile);
+# a runtime read would work in a checkout and return nothing in the container.
+# _RELATION_TYPES_FROM_GUIDE below reads the CSV when it IS reachable, and
+# deploy_annotate/tests/test_relation_types_match_guide.py fails if the two drift.
 RELATION_TYPES = [
     "HAS_PROPERTY",
-    "IS_PART_OF",
+    "HAS_ROLE",
+    "HAS_STATE",
+    "HAS_VALUE",
+    "SUBSET_OF",
+    "PART_OF",
+    "CONTAINS",
     "LOCATED_IN",
-    "AFFECTS",
-    "HAS_PROCESS",
-    "COMPARES_TO",
+    "OCCURS_IN",
+    "ASSOCIATED_WITH",
     "RELATED_TO",
+    "USES",
     "CAUSES",
-    "DURING",
+    "AFFECTS",
+    "ENABLES",
+    "INTERACTS_WITH",
+    "DEPENDS_ON",
+    "PARTICIPATES_IN",
+    "REPLACES",
+    "SEPARATES",
+    "CORRELATES_WITH",
+    "GREATER_THAN",
+    "LESS_THAN",
+    "SIMILAR_TO",
+    "SAME_AS",
+    "DIFFERS_FROM",
+    "OCCURS_DURING",
+    "HAS_ORIGIN",
+    "HAS_DESTINATION",
+    "STARTS",
+    "ENDS",
+    "SUBJECT_OF",
+    "OBJECT_OF",
+    "INDICATES",
+    "VARIES_WITH",
+    "ADDING_TO",
+    "RESPONDS_TO",
+    "INCREASE_WITH",
+    "LOCATED_BY",
+    "HAS_PROCESS",
+    "OBSERVED",
 ]
+
 
 #  Optional qualifier on a relation itself (not on its arguments), e.g. the
 #  sentence states that the relation does NOT hold.  Free additions are kept
@@ -310,8 +353,8 @@ def _safe_dirname_re(name: str) -> str:
 
 def _normalize_relation_label(text: str) -> str:
     """Normalize a free-typed relation label to the UPPER_SNAKE_CASE
-    convention used by the fixed RELATION_TYPES, e.g. "migrates to" ->
-    "MIGRATES_TO". Returns "" if nothing usable remains."""
+    convention used by RELATION_TYPES, e.g. "migrates to" -> "MIGRATES_TO".
+    Returns "" if nothing usable remains."""
     safe = re_mod.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_")
     return safe.upper()
 
@@ -774,8 +817,9 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
     ent_store = st.session_state.setdefault("ent_gold", {})
     rel_store = st.session_state.setdefault("rel_gold", {})
     merges: Dict[Tuple, _SentenceMerge] = {}
+    restored_comments: Dict[Tuple, str] = {}
     stats = {"sentences": 0, "relations": 0, "added": 0, "edited": 0,
-             "skipped": 0, "deduped": 0, "files": [], "sources": []}
+             "skipped": 0, "deduped": 0, "comments": 0, "files": [], "sources": []}
 
     for run, path in sources:
         try:
@@ -795,6 +839,11 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
                 stats["skipped"] += 1
                 continue
             merge = merges.setdefault(key, _SentenceMerge())
+            # Oldest snapshot first, so the newest non-empty comment wins.
+            # Unlike spans and relations a comment is not unioned: two sittings
+            # concatenated would read as one garbled note.
+            if rec.get("comment"):
+                restored_comments[key] = str(rec["comment"])
             uid_map = merge.add_spans(rec.get("spans") or [], run)
             added, deduped = merge.add_relations(
                 rec.get("relations") or [], uid_map, run)
@@ -828,6 +877,11 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
                 label = r.get("relation", "")
                 if label and label not in RELATION_TYPES and label not in customs:
                     customs.append(label)
+
+    comment_store = st.session_state.setdefault("re_comments", {})
+    for key, comment in restored_comments.items():
+        comment_store[key] = comment
+    stats["comments"] = len(restored_comments)
     return stats
 
 
@@ -929,13 +983,75 @@ def load_json_grouped(file_buffer) -> Dict:
 
 # ------------------------------------------------------------------ #
 
-def _init_rel_state(keys: List[Tuple]):
+def _init_rel_state(keys: List[Tuple], model: Optional[Dict] = None,
+                    seed_from_file: bool = False):
+    """Create the working relation lists.
+
+    With `seed_from_file` (triplet mode) each sentence starts from the model's
+    triplets instead of empty. Endpoints are re-pointed at the working entities:
+    _init_ent_state re-issues a uid that the file reused, so a relation's
+    e1_uid/e2_uid can name a span that no longer exists under that id, and the
+    triplet would render with both arguments blank. It must therefore run AFTER
+    _init_ent_state.
+    """
     if "rel_gold" not in st.session_state:
         st.session_state.rel_gold = {k: [] for k in keys}
-    else:
-        # Ensure all keys exist (new file loaded)
-        for k in keys:
-            st.session_state.rel_gold.setdefault(k, [])
+    for k in keys:
+        st.session_state.rel_gold.setdefault(k, [])
+        if not seed_from_file or model is None or st.session_state.rel_gold[k]:
+            continue
+        seeded = _seed_relations(model, k)
+        if seeded:
+            st.session_state.rel_gold[k] = seeded
+
+
+def _seed_relations(model: Dict, key: Tuple) -> List[Dict]:
+    """The file's relations for one sentence, re-pointed at the working spans."""
+    file_rels = _get_relations(model, key)
+    if not file_rels:
+        return []
+
+    spans = _cur_spans(key)
+    # A working span is reachable by the uid it now has, by the uid it had in
+    # the file when that was re-issued, and by its content signature — which is
+    # what the page itself uses as entity identity everywhere else.
+    by_uid: Dict[str, Dict] = {}
+    by_sig: Dict[Tuple, Dict] = {}
+    for sp in spans:
+        by_uid[sp["uid"]] = sp
+        if sp.get("uid_from_file"):
+            by_uid.setdefault(sp["uid_from_file"], sp)
+        by_sig.setdefault(_span_sig(sp), sp)
+
+    def _resolve(rel: Dict, side: str) -> Optional[Dict]:
+        hit = by_uid.get(rel.get(f"{side}_uid"))
+        if hit is not None:
+            return hit
+        embedded = rel.get(side)
+        return by_sig.get(_span_sig(embedded)) if isinstance(embedded, dict) else None
+
+    out: List[Dict] = []
+    for rel in file_rels:
+        if rel.get("e1_kind", ENTITY_KIND) != ENTITY_KIND or \
+                rel.get("e2_kind", ENTITY_KIND) != ENTITY_KIND:
+            # Hyper-relations reference other triplets, whose uids are minted
+            # here rather than read from the file; skip rather than emit a
+            # triplet pointing at nothing.
+            continue
+        e1, e2 = _resolve(rel, "e1"), _resolve(rel, "e2")
+        if e1 is None or e2 is None or e1["uid"] == e2["uid"]:
+            continue
+        seeded = copy.deepcopy(rel)
+        seeded["uid"] = rel.get("uid") or _uid()
+        seeded["e1_kind"] = seeded["e2_kind"] = ENTITY_KIND
+        seeded["e1_uid"], seeded["e2_uid"] = e1["uid"], e2["uid"]
+        seeded.setdefault("property", "")
+        seeded.setdefault("note", "")
+        # Where the triplet came from, so the annotator can tell a model
+        # proposal from something they added themselves.
+        seeded["from_model"] = True
+        out.append(seeded)
+    return out
 
 
 def _get_spans(model: Dict, key: Tuple) -> List[Dict]:
@@ -954,6 +1070,47 @@ def _get_hints(model: Dict, key: Tuple) -> List[Dict]:
         if hints:
             return hints
     return []
+
+
+def _get_relations(model: Dict, key: Tuple) -> List[Dict]:
+    """Relations carried by the uploaded file itself, for triplet mode.
+
+    Relation mode ignores this key: there, the file supplies entities and the
+    annotator draws every triplet, so seeding from the file would put words in
+    their mouth. Triplet mode is the opposite job — the triplets are a model's
+    proposals and the annotator is reviewing them — so they have to be on screen
+    from the start. Written by scripts/agent_jsonl_to_relation_input.py.
+    """
+    for sent_dict in model.get(key, []):
+        rels = sent_dict.get("relations", [])
+        if rels:
+            return rels
+    return []
+
+
+def _get_comment(model: Dict, key: Tuple) -> str:
+    """A per-sentence free-text note carried by the uploaded file, if any.
+
+    Sentence-level rather than relation-level on purpose: the "note" field on a
+    relation is about that triplet, and annotators had nowhere to record
+    something about the sentence as a whole — that it is ambiguous, off-topic,
+    or needs a second opinion."""
+    for sent_dict in model.get(key, []):
+        comment = sent_dict.get("comment")
+        if comment:
+            return str(comment)
+    return ""
+
+
+def _cur_comment(key: Tuple) -> str:
+    return st.session_state.get("re_comments", {}).get(key, "")
+
+
+def _init_comment_state(model: Dict, keys: List[Tuple]):
+    """Seed the working comments from the uploaded file, once per key."""
+    store = st.session_state.setdefault("re_comments", {})
+    for k in keys:
+        store.setdefault(k, _get_comment(model, k))
 
 
 def _get_coref(model: Dict, key: Tuple) -> List[Dict]:
@@ -1295,11 +1452,17 @@ def export_relations_jsonl(model: Dict, keys: List[Tuple]) -> str:
                 out["text"] = _triplet_text(key, rel)
                 out["level"] = _relation_level(key, rel)
                 rels.append(out)
-            sentences.append({
+            sent_out = {
                 "text": text,
                 "spans": spans,
                 "relations": rels,
-            })
+            }
+            # Only when there is one: a "comment": "" on every sentence would
+            # add a key to files that never used the field.
+            comment = _cur_comment(key)
+            if comment:
+                sent_out["comment"] = comment
+            sentences.append(sent_out)
         buf.write(json.dumps({"doc_id": doc_id, "sentences": sentences},
                               ensure_ascii=False) + "\n")
     return buf.getvalue()
@@ -1461,23 +1624,35 @@ def _property_badge_html(prop: str) -> str:
     )
 
 
-def _entity_ref_chip_html(sp: Dict) -> str:
+def _entity_ref_chip_html(sp: Dict, show_type: bool = False) -> str:
+    """An argument chip. `show_type` spells the entity type out beside the text.
+
+    Colour alone carries the type elsewhere, which works when the entity list is
+    on screen to read the colours against. Triplet mode drops that list, so the
+    type has to be legible in the triplet itself — it is the thing being reviewed.
+    """
     bg, fg = _span_color(sp.get("type", ""))
     concept = html_mod.escape(sp.get("concept_text") or "")
     title = f' title="concept: {concept}"' if concept else ""
+    type_html = ""
+    if show_type and sp.get("type"):
+        type_html = (
+            f'<span style="opacity:.75;font-size:10px;font-weight:600;'
+            f'margin-left:5px">{html_mod.escape(sp["type"])}</span>'
+        )
     return (
         f'<span style="background:{bg};color:{fg};border-radius:4px;'
         f'padding:2px 7px;font-size:12px;font-weight:500"{title}>'
-        f'{html_mod.escape(sp.get("text", ""))}</span>'
+        f'{html_mod.escape(sp.get("text", ""))}{type_html}</span>'
     )
 
 
 def _endpoint_html(res: Dict, t_num: Dict[str, int] | None = None,
-                   depth: int = 0) -> str:
+                   depth: int = 0, show_type: bool = False) -> str:
     """Render a resolved argument: an entity chip, or — for a hyper-relation
     argument — the whole nested triplet boxed inline, recursively."""
     if res.get("kind") != RELATION_KIND:
-        return _entity_ref_chip_html(res)
+        return _entity_ref_chip_html(res, show_type)
     if depth >= _MAX_REL_DEPTH:
         return '<span style="font-size:12px;color:#888">…</span>'
     tag = ""
@@ -1490,11 +1665,11 @@ def _endpoint_html(res: Dict, t_num: Dict[str, int] | None = None,
         'flex-wrap:wrap;border:1px dashed #7986cb;background:#eef1ff;'
         'border-radius:7px;padding:2px 6px">'
         + tag
-        + _endpoint_html(res.get("e1", {}), t_num, depth + 1)
+        + _endpoint_html(res.get("e1", {}), t_num, depth + 1, show_type)
         + '<span style="font-size:12px;color:#888">→</span>'
         + _relation_badge_html(res.get("relation", ""))
         + '<span style="font-size:12px;color:#888">→</span>'
-        + _endpoint_html(res.get("e2", {}), t_num, depth + 1)
+        + _endpoint_html(res.get("e2", {}), t_num, depth + 1, show_type)
         + (_property_badge_html(res["property"]) if res.get("property") else "")
         + '</span>'
     )
@@ -1503,6 +1678,19 @@ def _endpoint_html(res: Dict, t_num: Dict[str, int] | None = None,
 def _entity_label(i: int, sp: Dict) -> str:
     """Plain-text entity label for the E1/E2 pickers."""
     label = f"E{i+1} — {sp.get('text','')} ({sp.get('type','')})"
+    concept_text = sp.get("concept_text")
+    if concept_text and concept_text != sp.get("text"):
+        label += f" → concept: {concept_text}"
+    return label
+
+
+def _entity_label_plain(i: int, sp: Dict) -> str:
+    """Entity label WITHOUT its type, for triplet mode.
+
+    The type sits in its own dropdown beside the argument there, so repeating it
+    in the option text would show it twice and make the two disagree while the
+    dropdown is open."""
+    label = f"E{i+1} — {sp.get('text','')}"
     concept_text = sp.get("concept_text")
     if concept_text and concept_text != sp.get("text"):
         label += f" → concept: {concept_text}"
@@ -1536,6 +1724,53 @@ def _entity_type_picker(sp_type: str, key_root: str,
     if typed and not new_type:
         st.warning("Enter at least one letter or number for the new entity type.")
     return new_type
+
+
+def _inline_entity_type_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
+                               ref: Tuple[str, str], key_root: str,
+                               username: str, label: str = "Entity type") -> None:
+    """Entity-type dropdown beside a triplet argument, editing the entity itself.
+
+    Triplet mode has no entity list, so this is the only place a wrong type can
+    be corrected — and correcting it has to change the ENTITY, not just this
+    triplet: the same span typed two ways across two triplets is a contradiction
+    the export cannot represent (relations resolve their endpoints by uid, so
+    both would render with whichever type the entity ended up holding).
+
+    Writes through exactly like the entity editor does: snapshot the pre-edit
+    state in 'original' once, stamp 'edited_by', autosave.
+    """
+    kind, uid = ref
+    if kind != ENTITY_KIND:
+        # A triplet argument has no entity type of its own.
+        st.selectbox(label, options=["—"], index=0, disabled=True,
+                     key=f"{key_root}_notype")
+        return
+    sp = next((x for x in _cur_spans(cur_key) if x["uid"] == uid), None)
+    if sp is None:
+        return
+    current = sp.get("type", "")
+    options = _entity_type_options(current)
+    # Keyed on the entity, so switching argument shows that entity's own type
+    # rather than the previous one's.
+    chosen = st.selectbox(
+        label, options=options,
+        index=options.index(current) if current in options else 0,
+        key=f"{key_root}_enttype_{uid}",
+    )
+    if chosen and chosen != current:
+        if "original" not in sp:
+            sp["original"] = {
+                k: sp.get(k) for k in
+                ("start_char", "end_char", "type", "text", "concept_text")
+                if k in sp
+            }
+        sp["type"] = chosen
+        sp["edited_by"] = username
+        _remember_entity_type(chosen)
+        _bump_ent_ver(cur_key)
+        _maybe_autosave_re(model, keys)
+        st.rerun()
 
 
 def _relation_property_picker(current: str, key_root: str,
@@ -1655,23 +1890,57 @@ def _render_sentence(model: Dict, keys: List[Tuple], text: str,
             )
 
 
+def _render_sentence_comment(model: Dict, keys: List[Tuple], cur_key: Tuple):
+    """A free-text note about the sentence as a whole.
+
+    Separate from a relation's "note", which is about one triplet: this is for
+    what an annotator wants to say about the sentence itself — that it is
+    ambiguous, off-topic, mis-segmented, or needs a second opinion.
+
+    The widget key carries the sentence key so moving between sentences remounts
+    it rather than carrying one sentence's text onto the next. Saved on change
+    through the same autosave path as everything else, so a comment is never the
+    one thing lost when a session ends.
+    """
+    current = _cur_comment(cur_key)
+    typed = st.text_area(
+        "Comment on this sentence (optional)",
+        value=current,
+        key=f"re_comment_{cur_key}",
+        height=68,
+        placeholder="Anything about the sentence as a whole…",
+    )
+    if typed != current:
+        st.session_state.setdefault("re_comments", {})[cur_key] = typed
+        _maybe_autosave_re(model, keys)
+
+
 def _render_entity_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
-                          text: str, username: str):
+                          text: str, username: str, always_edit: bool = False):
     """The 'Entities' block: index of the sentence's working entities and,
     with edit mode on, an inline editor per entity plus a form to add a missing
     one. Edit mode is off by default and session-wide (not per sentence), so
-    annotators who only link relations keep a compact, read-only index."""
+    annotators who only link relations keep a compact, read-only index.
+
+    `always_edit` pins it on for triplet mode, where every entity on screen is a
+    model proposal rather than a human annotation: there is no read-only reading
+    of that job, so the toggle would only ever be a step between opening the
+    sentence and being able to correct it."""
     spans = _cur_spans(cur_key)
 
     h_left, h_right = st.columns([2, 1])
     with h_left:
         st.markdown("#### Entities")
     with h_right:
-        edit_mode = st.toggle(
-            "✎ Edit mode", key="re_ent_edit_mode",
-            help="Off: compact read-only list. On: fix a wrong type, boundary "
-                 "or concept, delete an entity, or add a missing one.",
-        )
+        if always_edit:
+            edit_mode = True
+            st.caption("✎ Editing — model output")
+        else:
+            edit_mode = st.toggle(
+                "✎ Edit mode", key="re_ent_edit_mode",
+                help="Off: compact read-only list. On: fix a wrong type, boundary "
+                     "or concept, delete an entity, or add a missing one.",
+            )
 
     if not edit_mode:
         # Nothing can be saved from here, so drop a pending save flag rather
@@ -1991,11 +2260,19 @@ def _render_legacy_import(model: Dict, keys: List[Tuple]):
         st.rerun()
 
 
-def render_relation_page(_unused_model: Dict = None):
+def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False):
     """
     Self-contained relation annotation page with its own file uploader.
     Accepts an optional _unused_model for backwards-compatibility with the
     integration call site, but ignores it — RE files are JSON, not JSONL.
+
+    `triplet_mode` reviews a model's output instead of annotating from scratch.
+    Three differences, everything else identical:
+      * the sentence's triplets are seeded from the file's "relations" key, so
+        "Current relations" opens already populated with what the model found;
+      * entity edit mode is pinned on, because every span shown is a proposal;
+      * work is saved under a "_triplet" directory rather than "_relation", so
+        reviewing a file cannot overwrite relation annotation of the same file.
     """
     st.markdown("### Annotator")
     username = st.text_input(
@@ -2009,13 +2286,16 @@ def render_relation_page(_unused_model: Dict = None):
         return
     st.session_state["re_username"] = username
 
-    st.markdown("### Input (relation annotation)")
+    st.markdown("### Input (triplet review)" if triplet_mode
+                else "### Input (relation annotation)")
     re_file = st.file_uploader(
-        "Upload JSON file with pre-labelled entities", type=["json"]
+        "Upload JSON file with the model's entities and relations" if triplet_mode
+        else "Upload JSON file with pre-labelled entities", type=["json"]
     )
 
     if re_file is None:
-        st.info("Upload a JSON file to start annotating relations.")
+        st.info("Upload a JSON file to start reviewing triplets." if triplet_mode
+                else "Upload a JSON file to start annotating relations.")
         return
 
     # Re-parse only when a new file is uploaded
@@ -2045,7 +2325,8 @@ def render_relation_page(_unused_model: Dict = None):
     # instead of overwriting each other's "re_latest.jsonl".
     if st.session_state.get("re_upload_dir_username") != username:
         upload_dir = os.path.join(
-            RE_SAVE_DIR, _safe_dirname_re(re_file.name) + "_relation",
+            RE_SAVE_DIR,
+            _safe_dirname_re(re_file.name) + ("_triplet" if triplet_mode else "_relation"),
             _safe_dirname_re(username),
         )
         os.makedirs(upload_dir, exist_ok=True)
@@ -2069,6 +2350,7 @@ def render_relation_page(_unused_model: Dict = None):
         st.session_state.re_loaded_pair = load_pair
         st.session_state.rel_gold = {}
         st.session_state.ent_gold = {}
+        st.session_state.re_comments = {}
         st.session_state.re_ent_ver = {}
         st.session_state.re_rel_ver = {}
         # Namespaces the add-form widget keys, so a half-filled form from the
@@ -2102,12 +2384,14 @@ def render_relation_page(_unused_model: Dict = None):
                     # Consolidate immediately: the merged state becomes this
                     # session's snapshot, while the sessions it came from stay
                     # on disk untouched.
-                    _init_rel_state(keys)
                     _init_ent_state(model, keys)
+                    _init_rel_state(keys, model, seed_from_file=triplet_mode)
+                    _init_comment_state(model, keys)
                     _maybe_autosave_re(model, keys)
 
-    _init_rel_state(keys)
     _init_ent_state(model, keys)
+    _init_rel_state(keys, model, seed_from_file=triplet_mode)
+    _init_comment_state(model, keys)
 
     if st.session_state.get("re_resume_note"):
         st.caption(f"↩ {st.session_state['re_resume_note']}")
@@ -2166,14 +2450,33 @@ def render_relation_page(_unused_model: Dict = None):
 
     st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}")
 
-    # ---- two-column layout ------------------------------------------
-    col_left, col_right = st.columns([3, 2], gap="large")
+    # ---- layout -----------------------------------------------------
+    # Triplet mode is one column: the entity list is dropped (types are edited
+    # beside each argument in the form instead), so everything under the
+    # sentence belongs to the triplets.
+    if triplet_mode:
+        col_left = col_right = contextlib.nullcontext()
+    else:
+        col_left, col_right = st.columns([3, 2], gap="large")
 
     # ---- LEFT: sentence + entity index ------------------------------
     with col_left:
         _render_sentence(model, keys, text, spans, hints, coref, idx + 1)
 
-        _render_entity_editor(model, keys, cur_key, text, username)
+        if triplet_mode:
+            # Collapsed, so the triplets keep the space, but one click away:
+            # the type is editable beside each argument in the form below, and
+            # everything else about an entity — its text, its boundaries, adding
+            # one the model missed, deleting one it invented — lives here.
+            n_ent = len(spans)
+            with st.expander(
+                f"✎ Entities ({n_ent}) — edit text or boundaries, add or delete",
+                expanded=False,
+            ):
+                _render_entity_editor(model, keys, cur_key, text, username,
+                                      always_edit=True)
+        else:
+            _render_entity_editor(model, keys, cur_key, text, username)
 
         if hints:
             st.markdown("#### Mark's relation hints")
@@ -2190,12 +2493,15 @@ def render_relation_page(_unused_model: Dict = None):
                     unsafe_allow_html=True,
                 )
 
-    # ---- RIGHT: add form + current relations ------------------------
+    # ---- RIGHT: comment + add form + current relations --------------
     with col_right:
-        st.markdown("#### Add relation")
+        _render_sentence_comment(model, keys, cur_key)
+
+        st.markdown("#### Add triplets" if triplet_mode else "#### Add relation")
 
         if not spans:
-            st.warning("No entities — add one on the left before annotating "
+            st.warning("No entities on this sentence." if triplet_mode else
+                       "No entities — add one on the left before annotating "
                        "relations on this sentence.")
         else:
             # Arguments are picked by (kind, uid), not by position: deleting an
@@ -2208,7 +2514,8 @@ def render_relation_page(_unused_model: Dict = None):
                 + [(RELATION_KIND, r["uid"]) for r in existing_rels
                    if r.get("uid")]
             )
-            arg_labels = {(ENTITY_KIND, sp["uid"]): _entity_label(i, sp)
+            _label_fn = _entity_label_plain if triplet_mode else _entity_label
+            arg_labels = {(ENTITY_KIND, sp["uid"]): _label_fn(i, sp)
                           for i, sp in enumerate(spans)}
             arg_labels.update({
                 (RELATION_KIND, r["uid"]):
@@ -2229,12 +2536,25 @@ def render_relation_page(_unused_model: Dict = None):
                            "triplets records a hyper-relation.")
 
             with st.container(border=True):
-                e1_ref = st.selectbox(
-                    "Source argument (E1)",
-                    options=arg_options,
-                    format_func=lambda r: arg_labels[r],
-                    key=f"re_e1_{form_root}_{args_ver}",
-                )
+                if triplet_mode:
+                    a_col, t_col = st.columns([3, 2])
+                    with a_col:
+                        e1_ref = st.selectbox(
+                            "Source argument (E1)",
+                            options=arg_options,
+                            format_func=lambda r: arg_labels[r],
+                            key=f"re_e1_{form_root}_{args_ver}",
+                        )
+                    with t_col:
+                        _inline_entity_type_editor(model, keys, cur_key, e1_ref,
+                                                   f"re_e1_{form_root}", username)
+                else:
+                    e1_ref = st.selectbox(
+                        "Source argument (E1)",
+                        options=arg_options,
+                        format_func=lambda r: arg_labels[r],
+                        key=f"re_e1_{form_root}_{args_ver}",
+                    )
 
                 hint_options = ["(none — pick manually)"] + [
                     f'R{i+1} — "{h.get("text","")}" → {h.get("label","")}'
@@ -2248,16 +2568,21 @@ def render_relation_page(_unused_model: Dict = None):
                 ) if hints else 0
                 suggested_label = hints[hint_sel - 1]["label"] if hint_sel else None
 
-                # Custom relation types typed in earlier this session are
-                # remembered so they reappear as regular options afterwards.
+                # The guide is the vocabulary; anything else is an escape hatch
+                # for a genuine gap, not a routine choice. So the options are the
+                # guide, then whatever custom labels this session already typed,
+                # and the custom entry last.
                 custom_types = st.session_state.setdefault("re_custom_relation_types", [])
                 rel_options = list(RELATION_TYPES)
                 for t in custom_types:
                     if t not in rel_options:
                         rel_options.append(t)
-                if suggested_label and suggested_label not in rel_options:
-                    rel_options.append(suggested_label)
-                default_index = rel_options.index(suggested_label) if suggested_label else 0
+                # A hint's label is pre-selected only when the guide has it:
+                # Mark's hint vocabulary (ASSOCIATIVE, DEPENDENCY, ...) is a
+                # different one and must not seed the picker with a label the
+                # annotator did not choose.
+                default_index = (rel_options.index(suggested_label)
+                                 if suggested_label in rel_options else 0)
                 rel_type_sel = st.selectbox(
                     "Relation type",
                     options=rel_options + [_CUSTOM_RELATION_SENTINEL],
@@ -2277,15 +2602,30 @@ def render_relation_page(_unused_model: Dict = None):
                         st.warning("Enter at least one letter or number for the new relation type.")
                 else:
                     rel_type = rel_type_sel
-                e2_ref = st.selectbox(
-                    "Target argument (E2)",
-                    options=arg_options,
-                    format_func=lambda r: arg_labels[r],
-                    # Second argument by default: a fresh form should not open
-                    # on E1 → E1, which is the one combination it rejects.
-                    index=1 if len(arg_options) > 1 else 0,
-                    key=f"re_e2_{form_root}_{args_ver}",
-                )
+                # Second argument by default: a fresh form should not open on
+                # E1 → E1, which is the one combination it rejects.
+                _e2_index = 1 if len(arg_options) > 1 else 0
+                if triplet_mode:
+                    a_col2, t_col2 = st.columns([3, 2])
+                    with a_col2:
+                        e2_ref = st.selectbox(
+                            "Target argument (E2)",
+                            options=arg_options,
+                            format_func=lambda r: arg_labels[r],
+                            index=_e2_index,
+                            key=f"re_e2_{form_root}_{args_ver}",
+                        )
+                    with t_col2:
+                        _inline_entity_type_editor(model, keys, cur_key, e2_ref,
+                                                   f"re_e2_{form_root}", username)
+                else:
+                    e2_ref = st.selectbox(
+                        "Target argument (E2)",
+                        options=arg_options,
+                        format_func=lambda r: arg_labels[r],
+                        index=_e2_index,
+                        key=f"re_e2_{form_root}_{args_ver}",
+                    )
                 rel_prop, prop_pending = _relation_property_picker(
                     "", f"re_relprop_add_{form_root}",
                 )
@@ -2349,11 +2689,16 @@ def render_relation_page(_unused_model: Dict = None):
                     st.rerun()
 
         # ---- current relations list ---------------------------------
-        st.markdown("#### Current relations")
+        st.markdown("#### Current triplets" if triplet_mode
+                    else "#### Current relations")
+        if triplet_mode:
+            st.caption("Seeded with the model's triplets — correct, delete or "
+                       "add to them.")
         rels = st.session_state.rel_gold.get(cur_key, [])
 
         if not rels:
-            st.caption("No relations yet for this sentence.")
+            st.caption("No triplets yet for this sentence." if triplet_mode
+                       else "No relations yet for this sentence.")
         else:
             # T-numbers label the triplets so the argument pickers above and
             # this list refer to the same things.
@@ -2386,16 +2731,32 @@ def render_relation_page(_unused_model: Dict = None):
                         '<div style="display:flex;align-items:center;gap:6px;'
                         'flex-wrap:wrap;margin-bottom:4px">'
                         + header
-                        + _endpoint_html(e1, t_num)
+                        + _endpoint_html(e1, t_num, show_type=triplet_mode)
                         + '<span style="font-size:12px;color:#888">→</span>'
                         + _relation_badge_html(rel.get("relation", ""))
                         + '<span style="font-size:12px;color:#888">→</span>'
-                        + _endpoint_html(e2, t_num)
+                        + _endpoint_html(e2, t_num, show_type=triplet_mode)
                         + (_property_badge_html(rel["property"])
                            if rel.get("property") else "")
                         + '</div>',
                         unsafe_allow_html=True,
                     )
+
+                    # Entity types, editable on the triplet itself. Skipped on
+                    # a hyper-relation: its arguments are triplets, which have
+                    # no entity type, so the row would be two dead controls.
+                    if triplet_mode and not _is_hyper(rel):
+                        t1_col, t2_col = st.columns(2)
+                        with t1_col:
+                            _inline_entity_type_editor(
+                                model, keys, cur_key, _endpoint_ref(rel, "e1"),
+                                f"re_cur_e1_{uid}", username,
+                                label="E1 entity type")
+                        with t2_col:
+                            _inline_entity_type_editor(
+                                model, keys, cur_key, _endpoint_ref(rel, "e2"),
+                                f"re_cur_e2_{uid}", username,
+                                label="E2 entity type")
 
                     # Editable relation type + delete
                     c_type, c_saved, c_del = st.columns([3, 2, 1])
@@ -2405,6 +2766,10 @@ def render_relation_page(_unused_model: Dict = None):
                         # otherwise the selectbox would fall back to the first
                         # option and silently overwrite it on the next edit.
                         type_options = list(RELATION_TYPES)
+                        # Custom labels typed this session, plus this relation's
+                        # own saved label — the latter matters even when it is in
+                        # neither list, because without it the selectbox falls
+                        # back to the first option and silently rewrites it.
                         for label in (
                             st.session_state.get("re_custom_relation_types", [])
                             + [rel["relation"]]

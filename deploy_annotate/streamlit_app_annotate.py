@@ -611,10 +611,13 @@ MAX_SNAPSHOTS = 50
 st.set_page_config(page_title="BioNER Annotation", layout="wide")
 st.title("BioNER Annotation")
 
-mode = st.sidebar.radio("Annotation mode", ["NER", "Relations"], index=0)
+mode = st.sidebar.radio("Annotation mode", ["NER", "Relations", "Triplets"], index=0,
+                        help="NER: annotate entities. Relations: link pre-labelled "
+                             "entities yourself. Triplets: review a model's entities "
+                             "AND its relations, both already on screen.")
 
-if mode == "Relations":
-    render_relation_page()
+if mode in ("Relations", "Triplets"):
+    render_relation_page(triplet_mode=(mode == "Triplets"))
     st.stop()
 
 # --- NER: Minimal input (single JSONL uploader) ---
