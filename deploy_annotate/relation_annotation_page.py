@@ -1890,6 +1890,109 @@ def _render_sentence(model: Dict, keys: List[Tuple], text: str,
             )
 
 
+def _dot_id(prefix: str, uid: str) -> str:
+    """A DOT-safe node id. Uids are hex, but synthesized ones need escaping."""
+    return f'"{prefix}_{re_mod.sub(chr(91) + "^A-Za-z0-9_" + chr(93), "_", str(uid))}"'
+
+
+def _graph_dot(key: Tuple, rels: List[Dict]) -> str:
+    """The sentence's triplets as a Graphviz digraph.
+
+    Rendered from a DOT string rather than the graphviz python package: that
+    package is not in deploy_annotate/requirements.txt and st.graphviz_chart
+    draws a string client-side, so this adds no dependency to the image.
+
+    Entities are boxes tinted by type; a hyper-relation's triplet argument is a
+    dashed node the edge points at, which is the only way a graph can show an
+    edge whose endpoint is itself an edge.
+    """
+    lines = [
+        "digraph G {",
+        "  rankdir=LR;",
+        "  bgcolor=transparent;",
+        '  node [shape=box style="rounded,filled" fontname="Helvetica" '
+        'fontsize=10 margin="0.08,0.05"];',
+        '  edge [fontname="Helvetica" fontsize=9 color="#7986cb"];',
+    ]
+    seen_nodes = set()
+
+    def entity_node(sp: Dict) -> Optional[str]:
+        uid = sp.get("uid")
+        if not uid:
+            return None
+        nid = _dot_id("e", uid)
+        if nid not in seen_nodes:
+            seen_nodes.add(nid)
+            bg, fg = _span_color(sp.get("type", ""))
+            label = _dot_escape(sp.get("text", "") or "?")
+            etype = _dot_escape(sp.get("type", ""))
+            # Text only. The type was spelled out under it and cost more width
+            # than it earned — the graph is for seeing the SHAPE of the
+            # annotation, and the fill colour already carries the type, with the
+            # full name on hover for when the colour is not enough.
+            lines.append(
+                f'  {nid} [label="{label}", tooltip="{etype}", '
+                f'fillcolor="{bg}" fontcolor="{fg}" color="{bg}"];')
+        return nid
+
+    def triplet_node(rel: Dict) -> Optional[str]:
+        uid = rel.get("uid")
+        if not uid:
+            return None
+        nid = _dot_id("t", uid)
+        if nid not in seen_nodes:
+            seen_nodes.add(nid)
+            lines.append(
+                f'  {nid} [label="{_dot_escape(rel.get("relation", ""))}", '
+                f'shape=box style="rounded,dashed,filled" fillcolor="#eef1ff" '
+                f'fontcolor="#3949ab" color="#7986cb" fontsize=9];')
+        return nid
+
+    def side_node(rel: Dict, side: str) -> Optional[str]:
+        kind, uid = _endpoint_ref(rel, side)
+        if kind == RELATION_KIND and uid:
+            inner = _rel_by_uid(key, uid)
+            return triplet_node(inner) if inner else None
+        return entity_node(_resolve_endpoint(key, rel, side))
+
+    for rel in rels:
+        a, b = side_node(rel, "e1"), side_node(rel, "e2")
+        if not a or not b:
+            continue
+        label = _dot_escape(rel.get("relation", ""))
+        prop = rel.get("property")
+        if prop:
+            label += f"\\n[{_dot_escape(prop)}]"
+        lines.append(f'  {a} -> {b} [label="{label}"];')
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _dot_escape(text: str) -> str:
+    return (str(text).replace("\\", "").replace('"', "'")
+            .replace("<", "").replace(">", "").replace("&", "and"))
+
+
+def _render_graph(cur_key: Tuple, rels: List[Dict]):
+    """Small read-only picture of the sentence's triplets, under everything else.
+
+    Read-only on purpose: the lists above are where annotation happens, and a
+    second editable surface for the same data is two places to keep in step.
+    What a graph adds is shape — an entity nothing points at, a chain that
+    should have been a star, a relation pointing the wrong way — which is hard
+    to see in a list and obvious here.
+    """
+    if not rels:
+        return
+    st.divider()
+    st.markdown("#### Graph")
+    try:
+        st.graphviz_chart(_graph_dot(cur_key, rels), use_container_width=True)
+    except Exception as exc:                      # pragma: no cover - display only
+        st.caption(f"Could not draw the graph: {exc}")
+
+
 def _render_sentence_comment(model: Dict, keys: List[Tuple], cur_key: Tuple):
     """A free-text note about the sentence as a whole.
 
@@ -2841,6 +2944,11 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                 _bump_rel_ver(cur_key)
                 _maybe_autosave_re(model, keys)
                 st.rerun()
+
+    # ---- graph of this sentence -------------------------------------
+    # Outside the column context: full width under everything else, whichever
+    # layout the mode uses.
+    _render_graph(cur_key, st.session_state.rel_gold.get(cur_key, []))
 
     # ---- Export -----------------------------------------------------
     st.divider()
