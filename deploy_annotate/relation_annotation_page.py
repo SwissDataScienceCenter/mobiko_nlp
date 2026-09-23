@@ -1910,9 +1910,22 @@ def _graph_dot(key: Tuple, rels: List[Dict]) -> str:
         "digraph G {",
         "  rankdir=LR;",
         "  bgcolor=transparent;",
+        # Graphviz's `size` only ever SHRINKS a drawing, never enlarges it, so
+        # this is a ceiling rather than a target: a two-node triplet draws at its
+        # natural size instead of being blown up to fill the width, and a dense
+        # sentence is scaled down to fit. Without it the renderer stretches
+        # whatever it has across the container, and the fewer the nodes the
+        # bigger they get.
+        #
+        # Inches at 96 dpi, so this is about 1150x620 px — wide enough that a
+        # busy sentence stays legible. No `ratio`: compress squeezed the layout
+        # on top of the scaling and made even dense graphs small.
+        f'  size="{_GRAPH_MAX_W_IN},{_GRAPH_MAX_H_IN}";',
+        "  nodesep=0.28;",
+        "  ranksep=0.5;",
         '  node [shape=box style="rounded,filled" fontname="Helvetica" '
-        'fontsize=10 margin="0.08,0.05"];',
-        '  edge [fontname="Helvetica" fontsize=9 color="#7986cb"];',
+        'fontsize=11 margin="0.11,0.07"];',
+        '  edge [fontname="Helvetica" fontsize=10 color="#7986cb"];',
     ]
     seen_nodes = set()
 
@@ -1974,6 +1987,30 @@ def _dot_escape(text: str) -> str:
             .replace("<", "").replace(">", "").replace("&", "and"))
 
 
+_TOP_ANCHOR = "sentence-top"
+
+# Ceiling on the drawing, in inches at 96 dpi (~1150 x 620 px). Graphviz scales
+# down to fit this and never up, so small graphs keep their natural size.
+_GRAPH_MAX_W_IN = 12
+_GRAPH_MAX_H_IN = 6.5
+
+
+def _render_back_to_top():
+    """Link back to the sentence header, for when the triplets run long.
+
+    A link rather than a button: st.button reruns the script, which would cost a
+    round trip and redraw everything to do what an anchor does for free.
+    Right-aligned and small so it reads as navigation rather than an action.
+    """
+    st.markdown(
+        f'<div style="text-align:right;margin:2px 0 8px 0">'
+        f'<a href="#{_TOP_ANCHOR}" style="text-decoration:none;font-size:12px;'
+        f'color:#5c6bc0;border:1px solid #c5cae9;border-radius:6px;'
+        f'padding:3px 10px;background:#eef1ff">↑ Back to sentence</a></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_graph(cur_key: Tuple, rels: List[Dict]):
     """Small read-only picture of the sentence's triplets, under everything else.
 
@@ -1988,7 +2025,11 @@ def _render_graph(cur_key: Tuple, rels: List[Dict]):
     st.divider()
     st.markdown("#### Graph")
     try:
-        st.graphviz_chart(_graph_dot(cur_key, rels), use_container_width=True)
+        # use_container_width=False so the chart is drawn at the size the DOT
+        # asks for. With it on, Streamlit stretches the SVG to the full column
+        # whatever the graph contains, which is what made a three-node sentence
+        # fill the bottom of the page.
+        st.graphviz_chart(_graph_dot(cur_key, rels), use_container_width=False)
     except Exception as exc:                      # pragma: no cover - display only
         st.caption(f"Could not draw the graph: {exc}")
 
@@ -2551,7 +2592,11 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
     hints = _get_hints(model, cur_key)
     coref = _get_coref(model, cur_key)
 
-    st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}")
+    # Anchored so the button at the foot of the page can jump back here. The
+    # sentence header rather than the very top: what an annotator wants after
+    # scrolling through the triplets is the sentence and the navigation, not the
+    # uploader above them.
+    st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}", anchor=_TOP_ANCHOR)
 
     # ---- layout -----------------------------------------------------
     # Triplet mode is one column: the entity list is dropped (types are edited
@@ -2946,9 +2991,14 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                 st.rerun()
 
     # ---- graph of this sentence -------------------------------------
-    # Outside the column context: full width under everything else, whichever
-    # layout the mode uses.
-    _render_graph(cur_key, st.session_state.rel_gold.get(cur_key, []))
+    # Triplet mode only, and outside the column context so it gets the full
+    # width under everything else. Relation mode is annotation from scratch,
+    # where the picture would be of work in progress rather than of something
+    # to review.
+    if triplet_mode:
+        _render_graph(cur_key, st.session_state.rel_gold.get(cur_key, []))
+
+    _render_back_to_top()
 
     # ---- Export -----------------------------------------------------
     st.divider()
