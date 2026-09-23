@@ -318,6 +318,52 @@ def _canonicalize_label_field(value):
     return canonicalize_entity_type(value) if isinstance(value, str) else value
 
 
+# The one value the deliberation loop reads as "delete this annotation"
+# (_disagreement_matches_relation compares against it). Models improvise their own
+# verdicts — REMOVE, REMOVE_SPAN, none, "IGNORE / not annotated" — and every one of
+# those silently failed to delete anything before they were mapped here.
+REMOVAL_SENTINEL = "invalid"
+
+_REMOVAL_VERDICTS = {
+    "INVALID", "REMOVE", "REMOVE SPAN", "REMOVE ANNOTATION", "DELETE", "DROP",
+    "NONE", "NO LABEL", "NOT ANNOTATED", "IGNORE", "IGNORE NOT ANNOTATED",
+}
+
+
+def _canonicalize_disagreement_label_field(value):
+    """Validator for the Critic's annotator_label / proposed_label.
+
+    These two fields are POLYMORPHIC — the Critic disputes entity types, relation
+    labels and whole annotations through the same pair of strings — so running the
+    entity canonicaliser over them unconditionally reports the other two kinds as
+    off-schema entity types. On one 5-sentence run that produced 78 warnings, 74 of
+    which described correct Critic behaviour.
+
+    Resolution order: entity type, then relation name, then a removal verdict
+    (mapped onto REMOVAL_SENTINEL so the deletion path actually fires). Only a value
+    that is none of those is counted as off-schema, and it is counted against the
+    entity vocabulary because that is what the field usually holds.
+    """
+    if not isinstance(value, str):
+        return value
+
+    as_entity = canonicalize_entity_type(value, record_off_schema=False)
+    if as_entity in _ALL_ENTITY_TYPES:
+        return as_entity
+
+    as_relation = canonicalize_relation_type(value, record_off_schema=False)
+    if as_relation in _ALL_RELATION_TYPES:
+        return as_relation
+
+    # Strip punctuation so "IGNORE / not annotated" reaches the verdict set.
+    flat = re.sub(r"[^A-Z0-9 ]+", " ", as_entity)
+    flat = re.sub(r"\s+", " ", flat).strip()
+    if flat in _REMOVAL_VERDICTS:
+        return REMOVAL_SENTINEL
+
+    return canonicalize_entity_type(value)
+
+
 def _canonicalize_relation_field(value):
     """Shared pydantic validator body for any relation-label string field.
 
@@ -620,7 +666,7 @@ class CriticDisagreement(BaseModel):
     explanation: str = ""
 
     _canon_labels = field_validator("annotator_label", "proposed_label")(
-        _canonicalize_label_field)
+        _canonicalize_disagreement_label_field)
 
 
 class CriticMissingAnnotation(BaseModel):
