@@ -1751,12 +1751,19 @@ def _inline_entity_type_editor(model: Dict, keys: List[Tuple], cur_key: Tuple,
         return
     current = sp.get("type", "")
     options = _entity_type_options(current)
-    # Keyed on the entity, so switching argument shows that entity's own type
-    # rather than the previous one's.
+    # The key carries the entity AND its CURRENT type. The entity so that
+    # switching argument shows that entity's own type; the type because one
+    # entity is usually picked by several of these at once — the Add form's E1
+    # and every current triplet it is the source of — and Streamlit restores
+    # each widget's own last value by key. Without the type in the key, changing
+    # one leaves the others holding the previous value, each rewrites it, and
+    # the page reruns forever. Including it remounts every picker for that
+    # entity on the new value, so the stale copies cannot fight back.
+    # (Same idiom as the relation-property picker keyed on its stored value.)
     chosen = st.selectbox(
         label, options=options,
         index=options.index(current) if current in options else 0,
-        key=f"{key_root}_enttype_{uid}",
+        key=f"{key_root}_enttype_{uid}_{current}",
     )
     if chosen and chosen != current:
         if "original" not in sp:
@@ -1955,8 +1962,17 @@ def _graph_dot(key: Tuple, rels: List[Dict]) -> str:
         nid = _dot_id("t", uid)
         if nid not in seen_nodes:
             seen_nodes.add(nid)
+            # The whole triplet, not just its relation: this node IS an argument
+            # of the edge pointing at it, and "CAUSES" alone says nothing about
+            # what causes what. _triplet_text recurses, so a triplet nested
+            # inside this one comes through in its own angle brackets.
+            #
+            # Its "a --REL--> b" arrow is rewritten to "a → REL → b": _dot_escape
+            # strips ">" (it is special inside a DOT HTML label), which would
+            # otherwise silently eat the arrowhead and leave "a --REL-- b".
+            text = re_mod.sub(r"--([A-Z0-9_]*)-->", r"→ \1 →", _triplet_text(key, rel))
             lines.append(
-                f'  {nid} [label="{_dot_escape(rel.get("relation", ""))}", '
+                f'  {nid} [label="{_dot_escape(text)}", tooltip="hyper-relation", '
                 f'shape=box style="rounded,dashed,filled" fillcolor="#eef1ff" '
                 f'fontcolor="#3949ab" color="#7986cb" fontsize=9];')
         return nid
@@ -1988,6 +2004,7 @@ def _dot_escape(text: str) -> str:
 
 
 _TOP_ANCHOR = "sentence-top"
+_GRAPH_ANCHOR = "sentence-graph"
 
 # Ceiling on the drawing, in inches at 96 dpi (~1150 x 620 px). Graphviz scales
 # down to fit this and never up, so small graphs keep their natural size.
@@ -2011,6 +2028,24 @@ def _render_back_to_top():
     )
 
 
+def _render_jump_to_graph():
+    """Link down to this sentence's graph, for when the triplets run long.
+
+    Counterpart of _render_back_to_top, and a link for the same reason: an
+    anchor scrolls for free where st.button would rerun the whole script to do
+    it. Drawn only when there is a graph to jump to — a link to an anchor that
+    was never emitted silently does nothing, which reads as the page being
+    broken.
+    """
+    st.markdown(
+        f'<div style="text-align:right;margin:2px 0 8px 0">'
+        f'<a href="#{_GRAPH_ANCHOR}" style="text-decoration:none;font-size:12px;'
+        f'color:#5c6bc0;border:1px solid #c5cae9;border-radius:6px;'
+        f'padding:3px 10px;background:#eef1ff">↓ Jump to graph</a></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_graph(cur_key: Tuple, rels: List[Dict]):
     """Small read-only picture of the sentence's triplets, under everything else.
 
@@ -2023,6 +2058,9 @@ def _render_graph(cur_key: Tuple, rels: List[Dict]):
     if not rels:
         return
     st.divider()
+    # Explicit anchor rather than st.subheader(anchor=...) so the heading keeps
+    # the #### size the rest of the page's section headings use.
+    st.markdown(f'<div id="{_GRAPH_ANCHOR}"></div>', unsafe_allow_html=True)
     st.markdown("#### Graph")
     try:
         # use_container_width=False so the chart is drawn at the size the DOT
@@ -2597,6 +2635,12 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
     # scrolling through the triplets is the sentence and the navigation, not the
     # uploader above them.
     st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}", anchor=_TOP_ANCHOR)
+
+    # Only when the graph will actually be drawn: _render_graph returns early
+    # with no triplets, and a link to an anchor that was never emitted does
+    # nothing when clicked, which reads as a broken page rather than an empty one.
+    if triplet_mode and st.session_state.rel_gold.get(cur_key):
+        _render_jump_to_graph()
 
     # ---- layout -----------------------------------------------------
     # Triplet mode is one column: the entity list is dropped (types are edited
