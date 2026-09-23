@@ -128,6 +128,17 @@ SYNONYM_MAP: Dict[str, str] = {
     "OCCURS_DURING": "DURING",
     "IS_EQUAL_TO":   "IS_THE_SAME_AS",
     "COMPARATIVE":   "COMPARES_TO",
+    # Spelling and morphology of one and the same label, typed free-hand into
+    # the "Custom relation" box by the two annotators (added 2026-09-23, when
+    # the September work brought all of these in). Purely lexical — no
+    # ontological claim is made here; anything that needs a judgement about
+    # what the labels MEAN stays unmapped and is listed in the report.
+    "CONNTAINS":       "CONTAINS",          # Mark's typo
+    "DEPENS_ON":       "DEPENDS_ON",        # Davnah's typo
+    "PART_OF":         "IS_PART_OF",
+    "SAME_AS":         "IS_THE_SAME_AS",
+    "CORRELATES_WITH": "CORRELATE_WITH",
+    "INCREASE_WITH":   "INCREASES_WITH",
 }
 
 # --label-view families: coarse semantic grouping. A negated label joins its
@@ -138,7 +149,7 @@ FAMILY_MAP: Dict[str, str] = {
     "HAS_PROPERTY": "PROPERTY", "DESCRIPTIVE": "PROPERTY",
     "INDICATIVE": "PROPERTY", "IS_SUBJECT_OF": "PROPERTY",
     # part–whole
-    "IS_PART_OF": "PART_WHOLE",
+    "IS_PART_OF": "PART_WHOLE", "PART_OF": "PART_WHOLE",
     # process
     "HAS_PROCESS": "PROCESS",
     # spatial
@@ -148,18 +159,25 @@ FAMILY_MAP: Dict[str, str] = {
     "ENABLING": "CAUSAL", "DEMONSTRATES": "CAUSAL",
     # association / correlation
     "RELATED_TO": "ASSOCIATION", "ASSOCIATIVE": "ASSOCIATION",
-    "CORRELATE_WITH": "ASSOCIATION", "POSITIVELY_RELATED_TO": "ASSOCIATION",
+    "CORRELATE_WITH": "ASSOCIATION", "CORRELATES_WITH": "ASSOCIATION",
+    "POSITIVELY_RELATED_TO": "ASSOCIATION",
     "NEGATIVELY_RELATED_TO": "ASSOCIATION", "VARIES_WITH": "ASSOCIATION",
-    "INCREASES_WITH": "ASSOCIATION", "INTERACTS_WITH": "ASSOCIATION",
+    "INCREASES_WITH": "ASSOCIATION", "INCREASE_WITH": "ASSOCIATION",
+    "INTERACTS_WITH": "ASSOCIATION",
     "INTERACTS_NOT_WITH": "ASSOCIATION", "DEPENDENCY": "ASSOCIATION",
     # comparison / identity
     "COMPARES_TO": "COMPARISON", "COMPARATIVE": "COMPARISON",
     "IS_EQUAL_TO": "COMPARISON", "IS_THE_SAME_AS": "COMPARISON",
+    "SAME_AS": "COMPARISON",
     # temporal
     "DURING": "TEMPORAL", "OCCURS_DURING": "TEMPORAL",
 }
 
 LABEL_VIEWS = ("raw", "synonyms", "families")
+
+# Deepest nesting followed when a relation is used as another's argument
+# (the page allows a few levels; Mark's deepest is 4).
+MAX_ARG_DEPTH = 8
 
 
 # ───────────────────────── data model ─────────────────────────
@@ -186,6 +204,29 @@ class Rel:
     e2: Arg
     note: str
     prop: str
+
+
+@dataclass(frozen=True)
+class RelArg:
+    """A relation used as the argument of another relation (a hyper-relation's
+    endpoint). Its own endpoints are entities or, deeper, further relations.
+
+    Hyper-relations carry no offsets of their own, so they are compared
+    structurally: two of them are the same argument when their endpoints match
+    recursively under the active argument mode (and, in the labeled view, when
+    every label down the tree matches).
+    """
+    label: str
+    raw_label: str
+    e1: Any
+    e2: Any
+
+
+def _leaves(node: Any) -> List["Arg"]:
+    """Entity endpoints at the bottom of an argument tree."""
+    if isinstance(node, RelArg):
+        return _leaves(node.e1) + _leaves(node.e2)
+    return [node] if isinstance(node, Arg) else []
 
 
 # Relation LABELS keep their own vocabulary (_norm_label below); span text
@@ -242,6 +283,24 @@ def _arg_of(raw: Any) -> Optional[Arg]:
                _norm_label(raw.get("type", "")), _norm_text(raw.get("text", "")))
 
 
+def _node_of(raw: Any, view: str, depth: int = 0) -> Optional[Any]:
+    """An endpoint as stored in the merged file: an entity span, or a nested
+    relation (`kind == "relation"`, with its own e1/e2). None = unusable."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("kind") == "relation" or raw.get("relation") is not None:
+        if depth >= MAX_ARG_DEPTH:
+            return None
+        e1 = _node_of(raw.get("e1"), view, depth + 1)
+        e2 = _node_of(raw.get("e2"), view, depth + 1)
+        if e1 is None or e2 is None:
+            return None
+        lab = _norm_label(raw.get("relation", ""))
+        return RelArg(apply_label_view(lab, view), lab, e1, e2)
+    arg = _arg_of(raw)
+    return arg if (arg is not None and arg.has_offsets) else None
+
+
 def sentence_relations(sent: dict, view: str) -> Tuple[List[Rel], int, int]:
     """
     (scorable relations, hyper-relation count, dropped-for-missing-offsets count).
@@ -272,13 +331,60 @@ def sentence_relations(sent: dict, view: str) -> Tuple[List[Rel], int, int]:
     return rels, hyper, dropped
 
 
+def sentence_relations_with_hyper(sent: dict, view: str) -> Tuple[List[Rel], int]:
+    """
+    Every relation of the sentence, hyper-relations included, as `Rel`s whose
+    endpoints may be nested `RelArg`s. Returns (relations, dropped).
+
+    Dropped = a relation with an endpoint that resolves to nothing usable (no
+    offsets anywhere at the bottom of the tree, or nesting past MAX_ARG_DEPTH).
+    """
+    rels: List[Rel] = []
+    dropped = 0
+    for r in sent.get("relations", []) or []:
+        e1 = _node_of(r.get("e1"), view)
+        e2 = _node_of(r.get("e2"), view)
+        if e1 is None or e2 is None:
+            dropped += 1
+            continue
+        raw = _norm_label(r.get("relation", ""))
+        rels.append(Rel(
+            label=apply_label_view(raw, view), raw_label=raw, e1=e1, e2=e2,
+            note=(r.get("note") or "").strip(),
+            prop=(r.get("property") or "").strip(),
+        ))
+    return rels, dropped
+
+
+def is_hyper(r: Rel) -> bool:
+    return isinstance(r.e1, RelArg) or isinstance(r.e2, RelArg)
+
+
 # ───────────────────────── argument matching ─────────────────────────
 
-def arg_score(a: Arg, b: Arg, mode: str) -> Optional[float]:
+def arg_score(a: Any, b: Any, mode: str, labeled: bool = True,
+              depth: int = 0) -> Optional[float]:
     """
     Score for identifying endpoint `a` with endpoint `b` under `mode`.
     None = not the same endpoint. Higher = better (used for tie-breaking).
+
+    An endpoint that is itself a relation (a hyper-relation's argument) is
+    compared structurally against the other's: same shape, endpoints matching
+    recursively, and — when `labeled` — the same relation label at every level.
+    An entity never matches a nested relation.
     """
+    if isinstance(a, RelArg) or isinstance(b, RelArg):
+        if not (isinstance(a, RelArg) and isinstance(b, RelArg)):
+            return None
+        if depth >= MAX_ARG_DEPTH:
+            return None
+        if labeled and a.label != b.label:
+            return None
+        s1 = arg_score(a.e1, b.e1, mode, labeled, depth + 1)
+        s2 = arg_score(a.e2, b.e2, mode, labeled, depth + 1)
+        if s1 is None or s2 is None:
+            return None
+        return (s1 + s2) / 2
     if mode == "strict":
         return 1.0 if (a.start == b.start and a.end == b.end and a.type == b.type) else None
     if mode == "boundary":
@@ -306,11 +412,13 @@ def relation_compat(
     """
     if labeled and ra.label != rb.label:
         return None
-    s1, s2 = arg_score(ra.e1, rb.e1, mode), arg_score(ra.e2, rb.e2, mode)
+    s1 = arg_score(ra.e1, rb.e1, mode, labeled)
+    s2 = arg_score(ra.e2, rb.e2, mode, labeled)
     if s1 is not None and s2 is not None:
         return (s1 + s2, False)
     if undirected:
-        r1, r2 = arg_score(ra.e1, rb.e2, mode), arg_score(ra.e2, rb.e1, mode)
+        r1 = arg_score(ra.e1, rb.e2, mode, labeled)
+        r2 = arg_score(ra.e2, rb.e1, mode, labeled)
         if r1 is not None and r2 is not None:
             return (r1 + r2 - 1e-6, True)   # tie-break: prefer a same-direction match
     return None
@@ -430,9 +538,16 @@ def compute(
     all_rows: List[Tuple[List[Rel], List[Rel], List[Arg], List[Arg]]] = []
     hyper_a = hyper_b = dropped_a = dropped_b = 0
     a_only = b_only = 0
+    rows_h: List[Tuple[List[Rel], List[Rel], List[Arg], List[Arg]]] = []
+    dropped_h_a = dropped_h_b = 0
     for sa, sb in aligned:
         ra, ha, da = sentence_relations(sa, view)
         rb, hb, db = sentence_relations(sb, view)
+        rah, dha = sentence_relations_with_hyper(sa, view)
+        rbh, dhb = sentence_relations_with_hyper(sb, view)
+        dropped_h_a += dha
+        dropped_h_b += dhb
+        rows_h.append((rah, rbh, entity_args(sa), entity_args(sb)))
         hyper_a += ha
         hyper_b += hb
         dropped_a += da
@@ -448,8 +563,10 @@ def compute(
 
     if scope == "all-aligned":
         scoped = [row for row in all_rows if row[0] or row[1]]
+        scoped_h = [row for row in rows_h if row[0] or row[1]]
     else:
         scoped = [row for row in all_rows if row[0] and row[1]]
+        scoped_h = [row for row in rows_h if row[0] and row[1]]
 
     rel_a_total = sum(len(ra) for ra, _ in rows)
     rel_b_total = sum(len(rb) for _, rb in rows)
@@ -518,6 +635,57 @@ def compute(
                 "ci95": [lo, hi],
             }
         result[tag] = per_mode
+
+    # ── 4b. the same two scores with hyper-relations included ──
+    # A relation used as another relation's argument has no offsets of its own,
+    # so the sections above leave it out. Both annotators now build them (they
+    # are 40% of Mark's relations), and they ARE comparable structurally: the
+    # nested relation matches when its own endpoints match recursively. Scored
+    # separately so the numbers above stay the flat-only ones they always were.
+    nh_a = sum(len(row[0]) for row in scoped_h)
+    nh_b = sum(len(row[1]) for row in scoped_h)
+    hyper_block: Dict[str, Any] = {
+        "note": "relations of every level; a relation-valued argument is "
+                "matched by structure (recursively), not by offsets",
+        f"{name_a}_relations_in_scope": nh_a,
+        f"{name_b}_relations_in_scope": nh_b,
+        f"{name_a}_hyper_in_scope": sum(1 for row in scoped_h for r in row[0]
+                                        if is_hyper(r)),
+        f"{name_b}_hyper_in_scope": sum(1 for row in scoped_h for r in row[1]
+                                        if is_hyper(r)),
+        f"{name_a}_unresolvable_excluded": dropped_h_a,
+        f"{name_b}_unresolvable_excluded": dropped_h_b,
+    }
+    for tag, labeled in (("detection_f1", False), ("labeled_f1", True)):
+        per_mode = {}
+        for mode in ARG_MODES:
+            per_sent, tp, tp_hyper = [], 0, 0
+            for ra, rb, _ea, _eb in scoped_h:
+                m = match_relations(ra, rb, mode, labeled=labeled)
+                tp += len(m)
+                tp_hyper += sum(1 for i, _j, _sw in m if is_hyper(ra[i]))
+                per_sent.append((len(m), len(ra), len(rb)))
+            lo, hi = bootstrap_f1_ci(per_sent)
+            per_mode[mode] = {
+                "f1": micro_f1(tp, nh_a, nh_b), "tp": tp, "tp_hyper": tp_hyper,
+                "n_a": nh_a, "n_b": nh_b, "ci95": [lo, hi],
+            }
+        hyper_block[tag] = per_mode
+    # ceiling over the same population: every leaf entity must exist on both
+    # sides, else the relation cannot match however it is scored.
+    hyper_ceiling = {}
+    for mode in ARG_MODES:
+        ok_a = sum(1 for ra, _rb, _ea, eb in scoped_h for r in ra
+                   if _endpoint_present(r, eb, mode))
+        ok_b = sum(1 for _ra, rb, ea, _eb in scoped_h for r in rb
+                   if _endpoint_present(r, ea, mode))
+        hyper_ceiling[mode] = {
+            f"{name_a}_matchable_frac": (ok_a / nh_a) if nh_a else None,
+            f"{name_b}_matchable_frac": (ok_b / nh_b) if nh_b else None,
+            "ceiling_f1": micro_f1(min(ok_a, ok_b), nh_a, nh_b),
+        }
+    hyper_block["argument_ceiling"] = hyper_ceiling
+    result["with_hyper_relations"] = hyper_block
 
     # ── 5. labeling agreement conditioned on a co-detected pair ──
     label_pairs: List[Tuple[str, str]] = []
@@ -620,9 +788,14 @@ def compute(
 
 
 def _endpoint_present(r: Rel, ents: List[Arg], mode: str) -> bool:
-    """Both endpoints of `r` exist in `ents` under `mode` (the ceiling test)."""
-    return (any(arg_score(r.e1, e, mode) is not None for e in ents)
-            and any(arg_score(r.e2, e, mode) is not None for e in ents))
+    """Every entity `r` ultimately rests on exists in `ents` under `mode` (the
+    ceiling test). For a hyper-relation that means all leaves of its argument
+    trees, since it can only be matched if they can."""
+    leaves = _leaves(r.e1) + _leaves(r.e2)
+    if not leaves:
+        return False
+    return all(any(arg_score(leaf, e, mode) is not None for e in ents)
+               for leaf in leaves)
 
 
 # ───────────────────────── reporting ─────────────────────────
@@ -679,6 +852,27 @@ def print_report(r: Dict[str, Any]) -> None:
 
     block("Pair detection agreement (unlabeled: same two entities linked?)", "detection_f1")
     block("Full relation agreement (labeled: same pair AND same label)", "labeled_f1")
+
+    hy = r.get("with_hyper_relations")
+    if hy and (hy[f"{a}_hyper_in_scope"] or hy[f"{b}_hyper_in_scope"]):
+        print("\n  Including hyper-relations (a relation used as an argument of")
+        print("  another; matched by structure, recursively — not by offsets)")
+        print(f"    Relations in scope:            {hy[f'{a}_relations_in_scope']}"
+              f" / {hy[f'{b}_relations_in_scope']}"
+              f"   of which hyper: {hy[f'{a}_hyper_in_scope']}"
+              f" / {hy[f'{b}_hyper_in_scope']}")
+        if hy[f"{a}_unresolvable_excluded"] or hy[f"{b}_unresolvable_excluded"]:
+            print(f"    Unresolvable excluded:         "
+                  f"{hy[f'{a}_unresolvable_excluded']}"
+                  f" / {hy[f'{b}_unresolvable_excluded']}")
+        for m in ARG_MODES:
+            c = hy["argument_ceiling"][m]
+            star = "  ← primary" if m == mode else ""
+            det, lab = hy["detection_f1"][m], hy["labeled_f1"][m]
+            print(f"    {m:<9} ceiling ≤ {_num(c['ceiling_f1'])}"
+                  f"   unlabeled F1={_num(det['f1'])}"
+                  f"   labeled F1={_num(lab['f1'])}"
+                  f"   [agree={lab['tp']:3d}, of them hyper={lab['tp_hyper']}]{star}")
 
     dec = r["decomposition"]
     print(f"\n  Where the disagreement lives (argument match: {mode})")
@@ -755,10 +949,13 @@ def _print_caveats(r: Dict[str, Any]) -> None:
             "the annotators used non-overlapping custom labels; compare --label-view raw "
             "with synonyms/families to see how much of the label disagreement is naming.")
     if cov[f"{a}_hyper_relations_excluded"] != cov[f"{b}_hyper_relations_excluded"]:
+        hy = r.get("with_hyper_relations") or {}
+        tp = ((hy.get("labeled_f1") or {}).get(r["primary_mode"]) or {}).get("tp_hyper")
         notes.append(
             f"hyper-relation use is asymmetric ({cov[f'{a}_hyper_relations_excluded']} vs "
-            f"{cov[f'{b}_hyper_relations_excluded']}) — that disagreement is invisible here "
-            "because hyper-relations are excluded from every metric.")
+            f"{cov[f'{b}_hyper_relations_excluded']}): they are left out of the sections "
+            "above, and the 'Including hyper-relations' section scores them structurally"
+            + (f" — only {tp} of them agree." if tp is not None else "."))
     if notes:
         print("\n  Read this before quoting any number")
         for n in notes:
