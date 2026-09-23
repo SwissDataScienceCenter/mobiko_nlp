@@ -237,7 +237,8 @@ Return a JSON object with exactly these fields:
 {{
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
-    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE",  "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}}
+    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE",  "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}},
+    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "", "severity": "major", "explanation": "why this triplet should not exist"}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY", "reasoning": "reason it should be annotated"}}
@@ -252,6 +253,12 @@ Output rules:
 "annotator_label", OR "target" must name a corrected (trimmed/expanded) span extent. If you \
 AGREE with a label, list it under "agreements" — never copy the annotator's label into \
 "proposed_label" and file it as a disagreement. Confirmations are NOT disagreements.
+- To DELETE an annotation rather than relabel it, set "proposed_label" to exactly \
+"invalid". That is the only value read as a removal request: "REMOVE", "none", \
+"IGNORE" and anything else you might invent leave the annotation in place.
+- "proposed_label" carries an ENTITY TYPE when you dispute a span's type and a \
+RELATION NAME when you dispute a triplet's label. Use the vocabulary that matches \
+what you are disputing; never put a whole triplet in this field.
 - Limit each disagreement to the minimal concrete correction needed.
 """
 
@@ -367,7 +374,8 @@ Return a JSON object with exactly these fields:
 {{
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
-    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}}
+    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}},
+    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "Step X", "severity": "major", "explanation": "why this triplet should not exist"}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY",  "reasoning": "reason it should be annotated"}}
@@ -382,6 +390,12 @@ Output rules:
 "annotator_label", OR "target" must name a corrected (trimmed/expanded) span extent. If you \
 AGREE with a label, list it under "agreements" — never copy the annotator's label into \
 "proposed_label" and file it as a disagreement. Confirmations are NOT disagreements.
+- To DELETE an annotation rather than relabel it, set "proposed_label" to exactly \
+"invalid". That is the only value read as a removal request: "REMOVE", "none", \
+"IGNORE" and anything else you might invent leave the annotation in place.
+- "proposed_label" carries an ENTITY TYPE when you dispute a span's type and a \
+RELATION NAME when you dispute a triplet's label. Use the vocabulary that matches \
+what you are disputing; never put a whole triplet in this field.
 - Limit each disagreement to the minimal concrete correction needed.
 """
 
@@ -595,7 +609,8 @@ Return a JSON object with exactly these fields:
 {{
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
-    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "", "severity": "major", "explanation": "distinguishing principle: X is CORRECT_TYPE not WRONG_TYPE because <cue in the sentence>"}}
+    {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "", "severity": "major", "explanation": "distinguishing principle: X is CORRECT_TYPE not WRONG_TYPE because <cue in the sentence>"}},
+    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "", "severity": "major", "explanation": "why this triplet should not exist"}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY", "reasoning": "reason it should be annotated"}}
@@ -610,6 +625,12 @@ Output rules:
 "annotator_label", OR "target" must name a corrected (trimmed/expanded) span extent. If you \
 AGREE with a label, list it under "agreements" — never copy the annotator's label into \
 "proposed_label" and file it as a disagreement. Confirmations are NOT disagreements.
+- To DELETE an annotation rather than relabel it, set "proposed_label" to exactly \
+"invalid". That is the only value read as a removal request: "REMOVE", "none", \
+"IGNORE" and anything else you might invent leave the annotation in place.
+- "proposed_label" carries an ENTITY TYPE when you dispute a span's type and a \
+RELATION NAME when you dispute a triplet's label. Use the vocabulary that matches \
+what you are disputing; never put a whole triplet in this field.
 - "guideline_reference" is OPTIONAL — leave it "" unless a definition genuinely applies; never fabricate it.
 - Each disagreement's "explanation" is REQUIRED and must read as a reusable rule (type vs alternative + the deciding cue).
 - Limit each disagreement to the minimal concrete correction needed.
