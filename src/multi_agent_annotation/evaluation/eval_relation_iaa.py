@@ -38,10 +38,14 @@ Mixing them yields an uninterpretable number. This report separates them:
 Argument matching runs at four strictnesses, reported side by side, because the
 right one depends on the question being asked:
 
-    strict    endpoints equal on (start_char, end_char, type)
-    boundary  endpoints equal on (start_char, end_char)        [default primary]
-    overlap   endpoint character ranges intersect
-    text      endpoint normalised surface form equal (position-agnostic)
+    strict      endpoints equal on (start_char, end_char, type)
+    boundary    endpoints equal on (start_char, end_char)        [primary until 2026-10]
+    normalized  ranges intersect AND the surface forms agree once punctuation
+                is dropped and plurals reduced — "well-being." = "well-being",
+                "assemblages" = "assemblage" (the rule the annotators agreed;
+                the default primary since 2026-10)
+    overlap     endpoint character ranges intersect
+    text        endpoint normalised surface form equal (position-agnostic)
 
 Matching is a greedy one-to-one alignment per sentence, so one relation can
 never be credited twice. "F1" is symmetric — 2·agree / (n_A + n_B) — which is
@@ -93,6 +97,7 @@ the annotators, not a mapping to make quietly — it is worth 0.06 kappa.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import sys
@@ -112,33 +117,68 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
 N_BOOT = 5000
 SEED = 42
 
-ARG_MODES: Tuple[str, ...] = ("strict", "boundary", "overlap", "text")
+ARG_MODES: Tuple[str, ...] = ("strict", "boundary", "normalized", "overlap", "text")
 
-# Mirrors relation_annotation_page.RELATION_TYPES (and the merge script): labels
-# outside this set were typed in by the annotator as a custom relation.
-FIXED_RELATION_TYPES = {
-    "HAS_PROPERTY", "IS_PART_OF", "LOCATED_IN", "AFFECTS", "HAS_PROCESS",
-    "COMPARES_TO", "RELATED_TO", "CAUSES", "DURING",
-}
+def _load_guide_relations() -> set:
+    """The relation vocabulary, read from the guide the page and the pipeline
+    both use (src/multi_agent_annotation/Relation schema.csv).
+
+    Read, never inlined: an inlined copy is what went stale here before — this
+    set still held the page's ORIGINAL nine options (IS_PART_OF, COMPARES_TO,
+    DURING …) long after the page adopted the guide's 41 relations, so every
+    report marked standard labels like PART_OF, SUBSET_OF and OCCURS_IN as
+    "custom". The page inlines the list because its container ships without the
+    CSV; this script always runs in a checkout, so it can just read it.
+    """
+    path = Path(__file__).resolve().parents[1] / "Relation schema.csv"
+    try:
+        with path.open(newline="", encoding="utf-8") as fh:
+            return {(r.get("Relation") or "").strip() for r in csv.DictReader(fh)
+                    if (r.get("Relation") or "").strip()}
+    except OSError:
+        return set()      # marking falls back to "nothing is custom"
+
+
+FIXED_RELATION_TYPES = _load_guide_relations()
+
 
 # --label-view synonyms: only labels whose equivalence is a naming difference,
 # not a semantic judgement. Deliberately short — anything arguable belongs in
 # the families view, where the coarsening is visible.
+# The annotation page's ORIGINAL nine options, and what the relation guide
+# renamed them to when it replaced that list with its own 41 (the page follows
+# the guide now; deploy_annotate/tests/test_relation_types_match_guide.py holds
+# it there). The gold spans that migration — sessions from July and August used
+# the old names, later ones the new — so 97 relations in the merged files
+# (Mark IS_PART_OF x39, Davnah IS_PART_OF x37 + DURING x20) carry a label the
+# page no longer offers. Two vintages of ONE label is not a disagreement, and
+# folding them is bookkeeping, not an ontological judgement: that is why this
+# is its own view rather than an entry in SYNONYM_MAP below.
+#
+# COMPARES_TO is deliberately absent: the guide replaced it with a family
+# (SIMILAR_TO / DIFFERS_FROM / GREATER_THAN / LESS_THAN / SAME_AS), so which
+# successor a given annotation meant is a judgement. It stays custom (x1).
+MIGRATION_MAP: Dict[str, str] = {
+    "IS_PART_OF": "PART_OF",
+    "DURING":     "OCCURS_DURING",
+}
+
+# Spelling and morphology of one and the same label, typed free-hand into the
+# "Custom relation" box by the two annotators. Purely lexical — no ontological
+# claim; anything needing a judgement about what the labels MEAN stays unmapped
+# and is listed in the report. Each pair canonicalises onto the GUIDE's name
+# where one of the two is a guide relation, so a folded label is a label the
+# page actually offers (added 2026-09-23; the direction was corrected once the
+# guide vocabulary was wired in, which does not move any number — both sides
+# land on the same string either way — but keeps the tables readable).
 SYNONYM_MAP: Dict[str, str] = {
-    "OCCURS_DURING": "DURING",
-    "IS_EQUAL_TO":   "IS_THE_SAME_AS",
-    "COMPARATIVE":   "COMPARES_TO",
-    # Spelling and morphology of one and the same label, typed free-hand into
-    # the "Custom relation" box by the two annotators (added 2026-09-23, when
-    # the September work brought all of these in). Purely lexical — no
-    # ontological claim is made here; anything that needs a judgement about
-    # what the labels MEAN stays unmapped and is listed in the report.
+    "COMPARATIVE":     "COMPARES_TO",       # neither is in the guide
     "CONNTAINS":       "CONTAINS",          # Mark's typo
     "DEPENS_ON":       "DEPENDS_ON",        # Davnah's typo
-    "PART_OF":         "IS_PART_OF",
-    "SAME_AS":         "IS_THE_SAME_AS",
-    "CORRELATES_WITH": "CORRELATE_WITH",
-    "INCREASE_WITH":   "INCREASES_WITH",
+    "IS_THE_SAME_AS":  "SAME_AS",
+    "IS_EQUAL_TO":     "SAME_AS",
+    "CORRELATE_WITH":  "CORRELATES_WITH",
+    "INCREASES_WITH":  "INCREASE_WITH",
 }
 
 # --label-view families: coarse semantic grouping. A negated label joins its
@@ -173,7 +213,7 @@ FAMILY_MAP: Dict[str, str] = {
     "DURING": "TEMPORAL", "OCCURS_DURING": "TEMPORAL",
 }
 
-LABEL_VIEWS = ("raw", "synonyms", "families")
+LABEL_VIEWS = ("raw", "migration", "synonyms", "families")
 
 # Deepest nesting followed when a relation is used as another's argument
 # (the page allows a few levels; Mark's deepest is 4).
@@ -232,6 +272,7 @@ def _leaves(node: Any) -> List["Arg"]:
 # Relation LABELS keep their own vocabulary (_norm_label below); span text
 # does not, so it uses the shared normaliser.
 from label_norm import normalize_text as _norm_text
+from label_norm import canonical_span_text
 
 
 def _norm_label(label: str) -> str:
@@ -239,8 +280,14 @@ def _norm_label(label: str) -> str:
 
 
 def apply_label_view(label: str, view: str) -> str:
+    """The views nest: `migration` only undoes the page's renames, `synonyms`
+    adds the spelling variants on top, `families` groups by meaning (and already
+    lists both vintages of every renamed label, so it needs no migration pass)."""
+    if view == "migration":
+        return MIGRATION_MAP.get(label, label)
     if view == "synonyms":
-        return SYNONYM_MAP.get(label, label)
+        migrated = MIGRATION_MAP.get(label, label)
+        return SYNONYM_MAP.get(migrated, migrated)
     if view == "families":
         return FAMILY_MAP.get(label, label)
     return label
@@ -362,6 +409,10 @@ def is_hyper(r: Rel) -> bool:
 
 # ───────────────────────── argument matching ─────────────────────────
 
+# Score of a normalized match between two occurrences of the same phrase.
+OTHER_OCCURRENCE_SCORE = 0.01
+
+
 def arg_score(a: Any, b: Any, mode: str, labeled: bool = True,
               depth: int = 0) -> Optional[float]:
     """
@@ -391,6 +442,29 @@ def arg_score(a: Any, b: Any, mode: str, labeled: bool = True,
         return 1.0 if (a.start == b.start and a.end == b.end) else None
     if mode == "text":
         return 1.0 if (a.text and a.text == b.text) else None
+    if mode == "normalized":
+        # The same mention, trimmed or inflected differently: the spans must
+        # overlap in the sentence AND read the same once punctuation is dropped
+        # and plurals reduced ("well-being." / "well-being", "assemblages" /
+        # "assemblage"). Agreed with the annotators 2026-10; see
+        # label_norm.canonical_span_text. Sits between boundary (exact offsets)
+        # and overlap (any intersection) — strictly looser than the first,
+        # strictly tighter than the second.
+        #
+        # A repeated phrase may be picked at a different occurrence by each
+        # annotator (sentence 140: "glacier soil" appears three times). Same
+        # canonical text elsewhere in the sentence still counts, with a low
+        # score so that the same-position reading wins any tie.
+        if not (a.has_offsets and b.has_offsets):
+            return None
+        ca = canonical_span_text(a.text)
+        if not ca or ca != canonical_span_text(b.text):
+            return None
+        lo, hi = max(a.start, b.start), min(a.end, b.end)
+        if hi <= lo:
+            return OTHER_OCCURRENCE_SCORE
+        union = max(a.end, b.end) - min(a.start, b.start)
+        return (hi - lo) / union if union else 1.0
     if mode == "overlap":
         if not (a.has_offsets and b.has_offsets):
             return None
@@ -666,9 +740,21 @@ def compute(
                 tp_hyper += sum(1 for i, _j, _sw in m if is_hyper(ra[i]))
                 per_sent.append((len(m), len(ra), len(rb)))
             lo, hi = bootstrap_f1_ci(per_sent)
+            # The same score computed within each population on its own, so the
+            # nested layer is not hidden inside an average dominated by the flat
+            # one: relations of one kind can only ever match relations of the
+            # same kind, so the two are disjoint and add up to the total.
+            nf_a = nh_a - hyper_block[f"{name_a}_hyper_in_scope"]
+            nf_b = nh_b - hyper_block[f"{name_b}_hyper_in_scope"]
+            n_ha = hyper_block[f"{name_a}_hyper_in_scope"]
+            n_hb = hyper_block[f"{name_b}_hyper_in_scope"]
             per_mode[mode] = {
                 "f1": micro_f1(tp, nh_a, nh_b), "tp": tp, "tp_hyper": tp_hyper,
                 "n_a": nh_a, "n_b": nh_b, "ci95": [lo, hi],
+                "flat": {"f1": micro_f1(tp - tp_hyper, nf_a, nf_b),
+                         "tp": tp - tp_hyper, "n_a": nf_a, "n_b": nf_b},
+                "hyper": {"f1": micro_f1(tp_hyper, n_ha, n_hb),
+                          "tp": tp_hyper, "n_a": n_ha, "n_b": n_hb},
             }
         hyper_block[tag] = per_mode
     # ceiling over the same population: every leaf entity must exist on both
@@ -778,10 +864,10 @@ def compute(
     # which view mappings actually fired on this data
     fired: Dict[str, str] = {}
     if view != "raw":
-        table = SYNONYM_MAP if view == "synonyms" else FAMILY_MAP
-        for label in set(raw_a) | set(raw_b):
-            if label in table:
-                fired[label] = table[label]
+        for label in sorted(set(raw_a) | set(raw_b)):
+            mapped = apply_label_view(label, view)
+            if mapped != label:
+                fired[label] = mapped
     result["label_view_mappings_applied"] = dict(sorted(fired.items()))
 
     return result
@@ -838,7 +924,7 @@ def print_report(r: Dict[str, Any]) -> None:
         c = r["argument_ceiling"][m]
         fa, fb = c[f"{a}_matchable_frac"], c[f"{b}_matchable_frac"]
         ceil = c["ceiling_f1"]
-        print(f"    {m:<9} {a}: {_pct(fa)}  {b}: {_pct(fb)}"
+        print(f"    {m:<11} {a}: {_pct(fa)}  {b}: {_pct(fb)}"
               f"   → ceiling F1 ≤ {_num(ceil)}")
 
     def block(title: str, key: str) -> None:
@@ -847,7 +933,7 @@ def print_report(r: Dict[str, Any]) -> None:
             d = r[key][m]
             star = "  ← primary" if m == mode else ""
             ci = d["ci95"]
-            print(f"    {m:<9} F1={_num(d['f1'])}  95% CI [{ci[0]:.3f}, {ci[1]:.3f}]"
+            print(f"    {m:<11} F1={_num(d['f1'])}  95% CI [{ci[0]:.3f}, {ci[1]:.3f}]"
                   f"   [agree={d['tp']:3d} | {a}={d['n_a']} | {b}={d['n_b']}]{star}")
 
     block("Pair detection agreement (unlabeled: same two entities linked?)", "detection_f1")
@@ -869,10 +955,30 @@ def print_report(r: Dict[str, Any]) -> None:
             c = hy["argument_ceiling"][m]
             star = "  ← primary" if m == mode else ""
             det, lab = hy["detection_f1"][m], hy["labeled_f1"][m]
-            print(f"    {m:<9} ceiling ≤ {_num(c['ceiling_f1'])}"
+            print(f"    {m:<11} ceiling ≤ {_num(c['ceiling_f1'])}"
                   f"   unlabeled F1={_num(det['f1'])}"
                   f"   labeled F1={_num(lab['f1'])}"
                   f"   [agree={lab['tp']:3d}, of them hyper={lab['tp_hyper']}]{star}")
+
+        # Flat and nested relations only ever match their own kind, so the two
+        # populations are disjoint: scored apart, they show that the nested
+        # layer, not the flat one, is where the two annotators diverge.
+        primary = hy["labeled_f1"][mode]
+        flat, hyp = primary["flat"], primary["hyper"]
+        print(f"\n    Flat vs nested, scored within each population "
+              f"(argument match: {mode})")
+        print(f"      {'':<9}{a + '/' + b:<16}unlabeled F1   labeled F1   agree")
+        for tag, key in (("flat", "flat"), ("nested", "hyper")):
+            d = hy["detection_f1"][mode][key]
+            l = hy["labeled_f1"][mode][key]
+            print(f"      {tag:<9}{str(d['n_a']) + ' / ' + str(d['n_b']):<16}"
+                  f"   {_num(d['f1'])}        {_num(l['f1'])}       {l['tp']:>3}")
+        if (hyp["n_a"] + hyp["n_b"]) and (flat["f1"] or 0) > (hyp["f1"] or 0):
+            print(f"      → {hyp['n_a'] + hyp['n_b']} nested relations "
+                  f"({(hyp['n_a'] + hyp['n_b']) / (flat['n_a'] + flat['n_b'] + hyp['n_a'] + hyp['n_b']):.0%}"
+                  f" of all annotated) yield {hyp['tp']} of the {primary['tp']} agreements:")
+            print("        they differ on WHEN to nest, which is a guideline "
+                  "decision, not a scoring artefact.")
 
     dec = r["decomposition"]
     print(f"\n  Where the disagreement lives (argument match: {mode})")
@@ -986,9 +1092,11 @@ def main() -> None:
                     help="raw (default) = labels as annotated; synonyms = unify "
                          "near-certain naming variants; families = coarse semantic "
                          "families. The active mapping is printed.")
-    ap.add_argument("--primary-mode", choices=ARG_MODES, default="boundary",
+    ap.add_argument("--primary-mode", choices=ARG_MODES, default="normalized",
                     help="Argument matching used for the kappa, per-label F1 and "
-                         "confusions (all four modes are always reported for F1).")
+                         "confusions (every mode is always reported for F1). "
+                         "Default 'normalized' since 2026-10: the annotators agreed "
+                         "that punctuation and plural endings are not disagreements.")
     ap.add_argument("--scope", choices=["both-annotated", "all-aligned"],
                     default="both-annotated",
                     help="both-annotated (default): score only sentences where BOTH "
