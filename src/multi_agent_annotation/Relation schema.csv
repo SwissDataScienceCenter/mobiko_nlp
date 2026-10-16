@@ -1,0 +1,45 @@
+Relation,Definition,Example,Comment
+HAS_PROPERTY,Links an entity/process to an attribute or characteristic it possesses. Qualitative property only.,lake HAS_PROPERTY temperature; plants HAS_PROPERTY medicinal,
+HAS_ROLE,"Links an entity to a functional, ecological, or social role it fulfils.",mountain system HAS_ROLE refuge; species HAS_ROLE pollinator,
+HAS_VALUE,Links a property/measurement to its explicitly stated value. Quantitative property only.,abundance HAS_VALUE 200,
+SUBSET_OF,"Indicates set, taxonomic, population, or categorical inclusion.",Diptera SUBSET_OF insects; endemic species SUBSET_OF regional species,"If we have a species and a group of species, use SUBSET_OF"
+PART_OF,"Indicates a physical, structural, or compositional part–whole relationship.",leaf PART_OF plant; tributary PART_OF river system,PART_OF only for a concrete part of the entire object.
+LOCATED_IN,"Indicates the spatial location of an entity within a geographic entity or spatial unit.
+Indicates that an organism, population, process, or phenomenon occurs under or within an ecological/environmental context
+","Mont Blanc LOCATED_IN European Alps; species LOCATED_IN northern Chile
+species LOCATED_IN grassland; plants LOCATED_IN high altitudes
+fish LOCATED_IN lake; endemic species LOCATED_IN forest
+",
+ASSOCIATED_WITH,"Indicates a general, non-specific association between entities or phenomena.","grassland ASSOCIATED_WITH mountain system;
+vicariance ASSOCIATED_WITH biogeographic barriers
+",
+USES,"Indicates that an organism, person, or system uses another entity as a resource, substrate, habitat, food, or for another purpose.",Aymara doctors USES medicinal plants; herbivores USES vegetation,
+CAUSES,Indicates a causal relationship in which the subject produces or brings about the object.,habitat loss CAUSES decline; predation CAUSES mortality,
+AFFECTS,Indicates that one entity/process influences or has an effect on another without necessarily asserting causality.,temperature AFFECTS abundance; predators AFFECT insect emergence,
+ENABLES,Indicates that the subject facilitates or makes the object/process possible.,habitat complexity ENABLES coexistence,
+INTERACTS_WITH,"Indicates an interaction between two entities, variables, processes, or drivers.",temperature INTERACTS_WITH predator presence,
+DEPENDS_ON,"Indicates that the occurrence, magnitude, or state of the subject depends on the object.",abundance DEPENDS_ON temperature,
+PARTICIPATES_IN,"Indicates participation of subject in a process, either actively or passively",common cranes PARTICIPATES_IN migration,
+REPLACES,"Indicates that one entity, state, or land-cover type takes the place of another.",grassland REPLACES forest,
+SEPARATES,"Indicates that an entity or feature creates spatial, ecological, or population separation between entities.",ridge SEPARATES valleys; barrier SEPARATES populations,
+CORRELATES_WITH,Indicates an explicitly stated statistical correlation or correlational relationship.,diversity CORRELATES_WITH elevation,
+GREATER_THAN,"Compares two quantities, magnitudes, rates, effects, or other ordered values and asserts that the first is greater.",[Culicidae abundance LOCATED_IN warmer lakes] GREATER_THAN [Culicidae abundance LOCATED_IN cooler lakes],
+LESS_THAN,"Compares two quantities, magnitudes, rates, effects, or other ordered values and asserts that the first is smaller.",[fish abundance LOCATED_IN acidic lakes] LESS_THAN [fish abundance LOCATED_IN neutral lakes],
+SIMILAR_TO,"Indicates similarity between entities, properties, communities, patterns, or processes.",community SIMILAR_TO community,
+SAME_AS,"Indicates that entities, properties, communities, patterns, or processes are identical",colour SAME_AS colour,
+DIFFERS_FROM,"Indicates that two entities, properties, communities, or processes differ.",community DIFFERS_FROM community,
+OCCURS_DURING,"Links an event, process, state, or phenomenon to a temporal period.",flowering OCCURS_DURING spring; migration OCCURS_DURING April,
+HAS_ORIGIN,"Identifies the geographical or conceptual starting point of a movement, lineage, or process.",migration HAS_ORIGIN Sahel,
+HAS_DESTINATION,Identifies the endpoint or destination of a movement or directed process.,migration HAS_DESTINATION Denmark,
+STARTS,Identifies the temporal or sequential starting point of an event/process.,migration STARTS April,
+ENDS,Identifies the temporal or sequential endpoint of an event/process.,migration ENDS May,
+INDICATES,"Links an observation, finding, pattern, or proposition to a conclusion, implication, or interpretation that it points toward, supports, or provides evidence for.",,
+VARIES_WITH,,,
+ADDING_TO,,,
+RESPONDS_TO,,,
+INCREASE_WITH,,Growth INCREASE_WITH temperature,
+LOCATED_BY,,,
+HAS_PROCESS,,Plants HAS_PROCESS_grow in meadows,
+OBSERVED,,Species OBSERVED in mountain,
+DOMINATE,,,
+REQUIRES,,,
