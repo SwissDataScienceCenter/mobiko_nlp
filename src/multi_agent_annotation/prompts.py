@@ -206,10 +206,13 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 
 ## Available Tools
 - guideline_search   : retrieve the exact guideline rule that applies to a disputed span
-- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
 - relation_search     : a relation's definition and examples, or the relation fitting a described link
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
 - schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
 "not catalogued", NEVER "invalid"{precedent_tool_line}
+
+
+
 
 ## Review Process
 Start by checking any items the Annotator flagged as low-confidence (< {LOW_CONFIDENCE_THRESHOLD}) \
