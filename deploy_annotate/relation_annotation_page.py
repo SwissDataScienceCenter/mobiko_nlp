@@ -72,7 +72,6 @@ RELATION_TYPES = [
     "HAS_VALUE",
     "SUBSET_OF",
     "PART_OF",
-    "CONTAINS",
     "LOCATED_IN",
     "ASSOCIATED_WITH",
     "USES",
@@ -99,10 +98,12 @@ RELATION_TYPES = [
     "VARIES_WITH",
     "ADDING_TO",
     "RESPONDS_TO",
-    "INCREASE_WITH",
+    "INCREASES_WITH",
     "LOCATED_BY",
     "HAS_PROCESS",
     "OBSERVED",
+    "DOMINATES",
+    "REQUIRES"
 ]
 
 
@@ -117,7 +118,6 @@ RELATION_PROPERTIES = [
 RE_SAVE_DIR = "/mydata/mobiko/anisia/data/aug_runs"
 RE_MAX_SNAPSHOTS = 50
 
-_CUSTOM_RELATION_SENTINEL = "＋ Custom relation…"
 _CUSTOM_TYPE_SENTINEL = "＋ Custom entity type…"
 _CUSTOM_PROPERTY_SENTINEL = "＋ Custom property…"
 _NO_PROPERTY = "(none)"
@@ -344,14 +344,6 @@ def _safe_dirname_re(name: str) -> str:
     stem = os.path.splitext(base)[0]
     safe = re_mod.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
     return safe or "re_upload"
-
-
-def _normalize_relation_label(text: str) -> str:
-    """Normalize a free-typed relation label to the UPPER_SNAKE_CASE
-    convention used by RELATION_TYPES, e.g. "migrates to" -> "MIGRATES_TO".
-    Returns "" if nothing usable remains."""
-    safe = re_mod.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_")
-    return safe.upper()
 
 
 def _normalize_relation_property(text: str) -> str:
@@ -850,7 +842,6 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
         if run not in stats["sources"]:
             stats["sources"].append(run)
 
-    customs = st.session_state.setdefault("re_custom_relation_types", [])
     for key, merge in merges.items():
         # Wholesale, including an empty list: the merged spans are the
         # annotator's working set, so an entity deleted in every snapshot that
@@ -864,14 +855,10 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
             rel_store[key] = merge.relations
             stats["relations"] += len(merge.relations)
             stats["sentences"] += 1
-            # Labels and properties typed in an earlier session have to be
-            # selectable again, or editing what they are on would mean
-            # re-typing them.
+            # Properties typed in an earlier session have to be selectable
+            # again. Relation labels do not: the dropdown is RELATION_TYPES only.
             for r in merge.relations:
                 _remember_relation_property(r.get("property", ""))
-                label = r.get("relation", "")
-                if label and label not in RELATION_TYPES and label not in customs:
-                    customs.append(label)
 
     comment_store = st.session_state.setdefault("re_comments", {})
     for key, comment in restored_comments.items():
@@ -2755,40 +2742,23 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                 ) if hints else 0
                 suggested_label = hints[hint_sel - 1]["label"] if hint_sel else None
 
-                # The guide is the vocabulary; anything else is an escape hatch
-                # for a genuine gap, not a routine choice. So the options are the
-                # guide, then whatever custom labels this session already typed,
-                # and the custom entry last.
-                custom_types = st.session_state.setdefault("re_custom_relation_types", [])
+                # The dropdown is RELATION_TYPES and nothing else.
                 rel_options = list(RELATION_TYPES)
-                for t in custom_types:
-                    if t not in rel_options:
-                        rel_options.append(t)
-                # A hint's label is pre-selected only when the guide has it:
+                # A hint's label is pre-selected only when the list has it:
                 # Mark's hint vocabulary (ASSOCIATIVE, DEPENDENCY, ...) is a
                 # different one and must not seed the picker with a label the
                 # annotator did not choose.
                 default_index = (rel_options.index(suggested_label)
                                  if suggested_label in rel_options else 0)
-                rel_type_sel = st.selectbox(
+                rel_type = st.selectbox(
                     "Relation type",
-                    options=rel_options + [_CUSTOM_RELATION_SENTINEL],
+                    options=rel_options,
                     index=default_index,
                     # Key varies with the chosen hint so a new hint pick
                     # refreshes the default, while the user can still
                     # freely override it without the selection resetting.
                     key=f"re_rel_{form_root}_{hint_sel}",
                 )
-                if rel_type_sel == _CUSTOM_RELATION_SENTINEL:
-                    custom_input = st.text_input(
-                        "New relation type (letters/numbers only, e.g. MIGRATES_TO)",
-                        key=f"re_rel_custom_{form_root}_{hint_sel}",
-                    )
-                    rel_type = _normalize_relation_label(custom_input)
-                    if custom_input and not rel_type:
-                        st.warning("Enter at least one letter or number for the new relation type.")
-                else:
-                    rel_type = rel_type_sel
                 # Second argument by default: a fresh form should not open on
                 # E1 → E1, which is the one combination it rejects.
                 _e2_index = 1 if len(arg_options) > 1 else 0
@@ -2839,22 +2809,17 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                 same_arg = (e1_ref == e2_ref)
                 if same_arg:
                     st.warning("Source and target must be different.")
-                missing_custom = rel_type_sel == _CUSTOM_RELATION_SENTINEL and not rel_type
-                if missing_custom:
-                    st.warning("Type a name for the new relation, or pick one from the list.")
                 if prop_pending:
                     st.warning(f"Type a name for the new relation property, or "
                                f"pick “{_NO_PROPERTY}”.")
 
-                can_add_rel = not (same_arg or missing_custom or prop_pending)
+                can_add_rel = not (same_arg or prop_pending)
                 if st.button(
                     "＋ Add relation",
                     type="primary",
                     disabled=not can_add_rel,
                     key=f"re_add_{cur_key}",
                 ) and can_add_rel:
-                    if rel_type not in custom_types and rel_type not in RELATION_TYPES:
-                        custom_types.append(rel_type)
                     _remember_relation_property(rel_prop)
                     new_rel = {
                         "uid": _uid(),
@@ -2948,21 +2913,13 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                     # Editable relation type + delete
                     c_type, c_saved, c_del = st.columns([3, 2, 1])
                     with c_type:
-                        # Include the saved value even if it's a custom label
-                        # (e.g. one of Mark's hints) not in the fixed list —
-                        # otherwise the selectbox would fall back to the first
-                        # option and silently overwrite it on the next edit.
+                        # RELATION_TYPES, plus this relation's own saved label
+                        # when it is an old one (e.g. SUBJECT_OF) — without it
+                        # the selectbox falls back to the first option and
+                        # silently rewrites the saved label.
                         type_options = list(RELATION_TYPES)
-                        # Custom labels typed this session, plus this relation's
-                        # own saved label — the latter matters even when it is in
-                        # neither list, because without it the selectbox falls
-                        # back to the first option and silently rewrites it.
-                        for label in (
-                            st.session_state.get("re_custom_relation_types", [])
-                            + [rel["relation"]]
-                        ):
-                            if label and label not in type_options:
-                                type_options.append(label)
+                        if rel["relation"] and rel["relation"] not in type_options:
+                            type_options.append(rel["relation"])
                         new_type = st.selectbox(
                             "Relation",
                             options=type_options,
