@@ -178,7 +178,7 @@ SYNONYM_MAP: Dict[str, str] = {
     "IS_THE_SAME_AS":  "SAME_AS",
     "IS_EQUAL_TO":     "SAME_AS",
     "CORRELATE_WITH":  "CORRELATES_WITH",
-    "INCREASES_WITH":  "INCREASE_WITH",
+    "INCREASE_WITH":   "INCREASES_WITH",
 }
 
 # --label-view families: coarse semantic grouping. A negated label joins its
