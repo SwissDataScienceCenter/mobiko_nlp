@@ -3912,30 +3912,60 @@ class MultiAgentAnnotator:
 
     # ── blind-pair task messages ────────────────────────────────────────────
     #
-    # In the blind-pair design every agent carries the SAME standalone annotator
-    # system prompt; all that distinguishes them is the task message. Annotator A
-    # and Annotator B get the sentence. The Critic gets the sentence plus the
-    # abstract, annotates blind, and only then sees the other two.
+    # Every agent carries the SAME standalone annotator system prompt, so all
+    # that distinguishes them is the task message — and in this design the
+    # context in that task message is IDENTICAL for all four (Annotator A,
+    # Annotator B, the Critic, the Adjudicator). The only thing separating the
+    # two annotators is sampling.
     #
-    # Putting the abstract here rather than in a system prompt is what lets the
-    # three agents share a byte-identical system message, so the only asymmetry
-    # in the design is per-sentence task content.
+    # WHY UNIFORM. An earlier version gave the whole abstract to the Critic
+    # alone, as a deliberate information asymmetry. Two things were wrong with
+    # it. It made the three votes in the majority rule non-exchangeable, so a
+    # 2-1 majority could mean "two less-informed agents outvote one
+    # better-informed agent". And it put the Adjudicator-vs-majority-vote
+    # comparison behind a confound: a context-equipped adjudicator beating a
+    # context-free vote tells you nothing about adjudication.
+    #
+    # WHY A WINDOW AND NOT THE WHOLE ABSTRACT. Mark and Davnah annotated one
+    # sentence at a time and could navigate to the previous and following
+    # sentences. The headline number is agent-agent agreement against their
+    # 0.497, so the agents have to work under their condition: sentence-only
+    # handicaps them, the whole abstract over-informs them. The +/-1 window is
+    # also ~121 tokens against ~2,700, which is why every agent can have it.
 
     @staticmethod
-    def _build_blind_annotation_msg(sentence: str,
-                                    abstract: Optional[str] = None) -> str:
-        """The task for an annotator that has seen nothing else.
+    def _build_blind_annotation_msg(
+        sentence: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """The task for an annotator that has seen no other annotation.
 
-        `abstract` is the Critic's extra context — the one deliberate information
-        asymmetry. A and B pass None and receive the sentence alone.
+        `context` is an abstract_context.ContextWindow.for_sentence() result.
+        Neighbours are rendered as clearly-labelled context and the target is
+        quoted on its own, because a window that does not say which sentence is
+        the target invites annotation of the neighbours.
         """
+        # This parameter used to be a bare abstract string. Passing one now
+        # would reach context.get() and raise somewhere unhelpful, or worse be
+        # silently falsy and drop the context for a whole run, so it is caught
+        # here where the message names the fix.
+        if isinstance(context, str):
+            raise TypeError(
+                "_build_blind_annotation_msg takes a ContextWindow."
+                "for_sentence() dict, not an abstract string. The whole-abstract"
+                " asymmetry was replaced by a uniform +/-1 sentence window.")
         msg = f'Annotate this sentence.\n\nSentence: "{sentence}"'
-        if abstract:
+        if context and (context.get("before") or context.get("after")):
+            msg += "\n\nSurrounding sentences, for reference only:"
+            for s in context.get("before") or []:
+                msg += f"\n  [before] {s}"
+            msg += "\n  [THE SENTENCE TO ANNOTATE] (above)"
+            for s in context.get("after") or []:
+                msg += f"\n  [after] {s}"
             msg += (
-                f"\n\nFor context, the abstract this sentence comes from is below. "
-                f"Use it to resolve what the sentence refers to. Annotate ONLY the "
-                f"sentence above — spans from elsewhere in the abstract are not part "
-                f"of your output.\n\nAbstract:\n{abstract}"
+                "\n\nUse these only to resolve what the sentence refers to. "
+                "Annotate ONLY the sentence quoted above — spans that occur in "
+                "the surrounding sentences are not part of your output."
             )
         return msg
 
@@ -3966,7 +3996,7 @@ class MultiAgentAnnotator:
         sentence: str,
         own_annotation_text: str,
         peer_pairs: List[Tuple[str, str]],
-        abstract: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Reveal the peers' annotations and ask for a final one.
 
@@ -3990,6 +4020,10 @@ class MultiAgentAnnotator:
         annotators disagree would make its behaviour partly a function of the
         number this pipeline exists to be compared against.
         """
+        if isinstance(context, str):
+            raise TypeError(
+                "_build_peer_revision_msg takes a ContextWindow.for_sentence() "
+                "dict, not an abstract string.")
         own = MultiAgentAnnotator._strip_terminate(own_annotation_text)
         msg = (
             f"You annotated the sentence below. {len(peer_pairs)} other annotator"
@@ -3998,8 +4032,14 @@ class MultiAgentAnnotator:
             f"annotation or each other's.\n\n"
             f'Sentence: "{sentence}"\n\n'
         )
-        if abstract:
-            msg += f"Abstract this sentence comes from:\n{abstract}\n\n"
+        if context and (context.get("before") or context.get("after")):
+            msg += "Surrounding sentences, for reference only:\n"
+            for c in context.get("before") or []:
+                msg += f"  [before] {c}\n"
+            msg += "  [THE SENTENCE TO ANNOTATE] (above)\n"
+            for c in context.get("after") or []:
+                msg += f"  [after] {c}\n"
+            msg += "\n"
         msg += f"Your annotation:\n{own}\n\n"
         for label, text in peer_pairs:
             msg += (f"{label} (another annotator, independent):\n"
