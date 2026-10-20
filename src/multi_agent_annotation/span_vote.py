@@ -64,8 +64,34 @@ def _pick(counts: Counter) -> Tuple[Any, bool]:
     return winners[0], len(winners) > 1
 
 
+def same_mention(a: Span, b: Span, threshold: float = 0.5,
+                 nested: bool = False) -> bool:
+    """Do two spans refer to the same mention?
+
+    IoU alone penalises NESTING, which is the commonest form of extent
+    disagreement in named-entity work. 'America' (10,17) inside 'Corporate
+    America' (0,17) scores IoU 7/17 = 0.41 and is therefore NOT merged at the
+    default threshold — yet it is plainly one mention annotated at two
+    granularities, and keeping them apart is exactly the error this clustering
+    was introduced to fix.
+
+    `nested=True` treats containment as identity. That is the right rule for a
+    corpus whose schema annotates one entity per mention (CoNLL: a name is a
+    name). It is NOT obviously right for MoBiKo, where 'species richness' inside
+    'centres of species richness' may be two legitimately distinct annotatable
+    entities rather than one disputed extent — so it is an option, measured both
+    ways, not a silent default.
+    """
+    if iou(a, b) >= threshold:
+        return True
+    if nested and (a[0] <= b[0] and a[1] >= b[1]) or (nested and b[0] <= a[0] and b[1] >= a[1]):
+        return True
+    return False
+
+
 def cluster_mentions(annotations: Sequence[List[Dict[str, Any]]],
-                     threshold: float = 0.5) -> List[List[Tuple[int, Dict[str, Any]]]]:
+                     threshold: float = 0.5,
+                     nested: bool = False) -> List[List[Tuple[int, Dict[str, Any]]]]:
     """Group spans across annotators into mentions.
 
     `annotations` is one list of span dicts per annotator; each dict needs
@@ -86,7 +112,8 @@ def cluster_mentions(annotations: Sequence[List[Dict[str, Any]]],
                 continue
             placed = False
             for m in mentions:
-                if any(iou((s, e), (o["start"], o["end"])) >= threshold
+                if any(same_mention((s, e), (o["start"], o["end"]),
+                                    threshold, nested)
                        for _, o in m):
                     m.append((ai, sp))
                     placed = True
