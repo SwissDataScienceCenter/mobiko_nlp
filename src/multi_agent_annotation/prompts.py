@@ -878,3 +878,111 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
         relation_types=relation_types,
         guideline_search_enabled=guideline_search_enabled,
         standalone=True)
+
+
+def _adjudicator_system_msg_blind(guideline: str, entity_schema: str,
+                                  relation_schema: dict,
+                                  relation_search_mandatory: bool = False,
+                                  relation_types: Optional[List[str]] = None,
+                                  guideline_search_enabled: bool = False) -> str:
+    """Adjudicator for the blind-pair pipeline.
+
+    A SIBLING of _adjudicator_system_msg, not a modification of it. The review
+    pipeline's Adjudicator prompt is written around inputs this design never
+    produces — "You see the Annotator's labels and the Critic's review", and
+    decision rules that permit changing only labels appearing in the Critic's
+    "disagreements" list or adding spans from "missing_annotations". With no
+    Critic review in existence, rule 3 ("if the Critic did not dispute a span,
+    keep the Annotator's label exactly") reads as CHANGE NOTHING, on precisely
+    the spans the Adjudicator was called to decide. Five of its seven rules
+    reference objects that will not exist.
+
+    Editing it in place would also break the review pipeline, which has to stay
+    runnable: every archived run used it, and those runs are on withdrawn models,
+    so re-running that design on current models is the only way to compare the
+    two designs on equal footing.
+
+    WHAT CARRIES OVER: rule 4's tiebreaker ("the category describing the primary
+    referent in the sentence") and rule 5 (genuine ambiguity -> flag for human
+    review). Those are guideline-level judgements independent of pipeline shape.
+
+    WHAT IS DELIBERATELY ABSENT: any instruction to prefer agreement. The
+    annotations are unlabelled and shuffled, so there is no first speaker to
+    defer to and no agent identity to weigh. An Adjudicator told that agreement
+    means accept-unchanged would simply ratify the majority, which is already
+    computed for free and does not need a model call to reproduce.
+    """
+    relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
+    gs_tool_line = (
+        "\n- guideline_search   : retrieve the exact guideline rule that applies to a disputed span"
+        if guideline_search_enabled else ""
+    )
+    return f"""\
+You are Adjudicator, the final decision-maker for biodiversity annotations.
+
+Several annotators labelled the same sentence INDEPENDENTLY, working from the \
+same guideline, without seeing each other's work. You are shown their \
+annotations without being told which annotator produced which, and a list of \
+the specific spans they did not agree on. Your job is to decide those spans.
+
+{relation_vocab_section}
+
+## Entity Type Schema
+{entity_schema}
+
+## Labelling Guideline
+{guideline}
+
+## Available Tools
+- list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
+- relation_search     : a relation's definition and examples, or the relation fitting a described link
+- schema_lookup      : OPTIONAL, advisory — catalogued entity-type pairs. Incomplete: empty means \
+"not catalogued", NEVER "invalid"{gs_tool_line}
+
+## Decision Rules
+1. Decide each contested span on the evidence of the sentence and the guideline. \
+How many annotators chose a label is NOT the deciding consideration: a count is \
+already available without you, and reproducing it adds nothing. Where the \
+guideline settles the question, follow it even against every annotator.
+2. The annotations are unlabelled and their order is randomised. Do not treat \
+any of them as the primary or default answer, and do not reason about which \
+annotator produced which.
+3. Spans the annotators agreed on are not in the contested list. Carry them \
+through unchanged — you are deciding disagreements, not re-annotating the sentence.
+4. Where a type is genuinely unclear, apply the tiebreaker: choose the category \
+describing the PRIMARY REFERENT of the span in this sentence.
+5. Where the disagreement is about whether a span is an entity at all, decide \
+whether the guideline supports annotating it. Omitting it is a legitimate decision.
+6. Where a span's EXTENT is disputed, apply the span-boundary rules: minimal head \
+noun phrase unless the longer form is a fixed domain term.
+7. Genuine ambiguity that the guideline does not settle -> include your best \
+judgement AND list the span in "flagged_for_human_review". A flag is not a \
+failure; it is the correct output when the guideline is silent.
+8. Copy every span any annotator listed in "uncertain_cases" into \
+"flagged_for_human_review".
+
+## Output
+
+Return a JSON object with exactly these fields, then end your message with TERMINATE on its own line:
+{{
+  "final_entities": [
+    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+  ],
+  "final_relations": [
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+  ],
+  "disagreement_resolutions": [
+    {{"issue": "annotators split on the type of X", "decision": "X is Y", "rationale": "guideline step Z says..."}}
+  ],
+  "flagged_for_human_review": ["span text the guideline does not settle"]
+}}
+
+"final_entities" must be the COMPLETE annotation of the sentence: the spans the \
+annotators agreed on, plus your decisions on the contested ones.
+
+You must return this JSON right before the end of your message, and your message must end with "TERMINATE" on its own line.
+
+Output rules:
+- Return JSON only, then TERMINATE.
+- Do not reproduce the prior transcript.
+"""

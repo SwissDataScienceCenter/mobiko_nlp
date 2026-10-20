@@ -320,11 +320,23 @@ def _patch_openai_for_streaming_logprobs() -> None:
                                     **{**kwargs,
                                        "stream_options": {"include_usage": True}})
             except Exception as exc:
+                # ONLY a request-level rejection means the gateway does not
+                # understand stream_options. Catching everything here meant a
+                # transient DNS or connection failure permanently disabled usage
+                # requests for that endpoint — silently degrading every later
+                # call in the run to tier-3 accounting, which is exactly the kind
+                # of invisible degradation this three-tier scheme exists to
+                # remove. A connection error is re-raised so the caller's own
+                # retry sees it.
+                _rejected = type(exc).__name__ in (
+                    "BadRequestError", "UnprocessableEntityError", "TypeError")
+                if not _rejected:
+                    raise
                 _NO_STREAM_OPTIONS.add(base)
                 logger.warning(
-                    "stream_options.include_usage rejected by %s (%s); token "
+                    "stream_options.include_usage rejected by %s (%s: %s); token "
                     "accounting for this endpoint falls back to counting "
-                    "streamed tokens.", base, exc)
+                    "streamed tokens.", base, type(exc).__name__, exc)
                 resp = _orig_create(self, *args, **kwargs)
         else:
             resp = _orig_create(self, *args, **kwargs)
@@ -728,6 +740,12 @@ class DeliberationRecord(BaseModel):
     # keeping rather than silently dropping.
     annotator_rounds: List[Dict[str, Any]] = Field(default_factory=list)
     critic_rounds: List[Dict[str, Any]] = Field(default_factory=list)
+    # Everything the blind-pair pipeline produces that the review pipeline has
+    # no equivalent for: the three independent annotations plus the Critic's
+    # revision, the majority vote with its mention-by-mention decision record,
+    # and the anonymisation maps. One field rather than many so a review-mode
+    # record is untouched and the two designs never collide in one schema.
+    blind_pair: Dict[str, Any] = Field(default_factory=dict)
     timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
@@ -2658,7 +2676,33 @@ class MultiAgentAnnotator:
         dependency_max_dep_distance: int = 4,
         dependency_max_candidates: int = 12,
         input_path: Optional[Path] = None,
+        deliberation_mode: str = "review",
+        guideline_search_enabled: bool = True,
+        context_radius: int = 1,
     ):
+        # deliberation_mode selects the whole pipeline shape.
+        #
+        #   review      Annotator -> Critic reviews its output -> Adjudicator.
+        #               The design every archived run used. Preserved unchanged
+        #               and still runnable, because those runs are on withdrawn
+        #               models and re-running this design on current ones is the
+        #               only way to compare the two designs on equal footing.
+        #
+        #   blind_pair  Two Annotators and a Critic annotate INDEPENDENTLY, then
+        #               the Critic sees the other two (anonymised, shuffled) and
+        #               revises; a majority vote and an Adjudicator both decide
+        #               the contested spans. Built because the review design's
+        #               Critic is anchored by construction — it never commits
+        #               before exposure, challenges spans the Annotator was
+        #               already unsure about (rho -0.09 to -0.28, 17/17 runs),
+        #               and adds +0.004 AUC over the Annotator's own confidence.
+        if deliberation_mode not in ("review", "blind_pair"):
+            raise ValueError(
+                f"deliberation_mode must be review|blind_pair, "
+                f"got {deliberation_mode!r}")
+        self.deliberation_mode = deliberation_mode
+        self.guideline_search_enabled = guideline_search_enabled
+        self.context_radius = context_radius
         self.max_rounds = max_rounds
         self._input_path = Path(input_path) if input_path else None
         self.use_precedent_memory = use_precedent_memory
@@ -2786,14 +2830,27 @@ class MultiAgentAnnotator:
             f"relation guide: {len(relation_guide)} relations"
         )
 
-        # Give the two roles DIFFERENT in-prompt references so they bring distinct
-        # perspectives to the deliberation: the Annotator works from the decision
-        # table (operational per-label decision tree), the Critic/Adjudicator from
-        # the narrative guideline (edge cases, rationale). Neither is blinded to the
-        # other document — the guideline_search tool indexes both combined, so each
-        # agent can consult the other source on demand.
-        annotator_guideline = _build_guideline_summary(decision_support_sections)
-        critic_guideline = _build_guideline_summary(guidance_sections)
+        # REVIEW MODE: the two roles get DIFFERENT in-prompt references so they
+        # bring distinct perspectives — the Annotator the decision table, the
+        # Critic/Adjudicator the narrative guideline. Neither is blinded to the
+        # other document: guideline_search indexes both combined.
+        #
+        # BLIND-PAIR MODE: every agent gets BOTH documents and guideline_search
+        # is off. The whole corpus is 18KB (~4.5k tokens), so retrieval over it
+        # answers a context-limit problem that does not exist — and compliance
+        # with the search instruction varied by model (490-690 calls per run on
+        # DeepSeek and Kimi, 0-2 on Qwen and GPT-OSS), which meant the compliant
+        # models effectively had both documents and the others had one. That is
+        # an uncontrolled information asymmetry reported as a model comparison.
+        # Here the agents must differ by SAMPLING ALONE, so the information they
+        # hold is identical and complete.
+        if deliberation_mode == "blind_pair":
+            _both = _build_guideline_summary(
+                decision_support_sections + guidance_sections)
+            annotator_guideline = critic_guideline = _both
+        else:
+            annotator_guideline = _build_guideline_summary(decision_support_sections)
+            critic_guideline = _build_guideline_summary(guidance_sections)
 
         # Build entity schema string for system prompts
         if entity_schema_str is None:
@@ -2902,6 +2959,19 @@ class MultiAgentAnnotator:
                         " (strict critic)" if strict_critic else "",
                         " [SINGLE-PASS: annotator only]" if single_pass else "")
 
+        if deliberation_mode == "blind_pair":
+            # All three annotating agents share ONE prompt — the standalone
+            # annotator prompt, with no over-generation mandate and no promise
+            # that a reviewer will correct them. The Critic is a third
+            # independent annotator here, not a reviewer, so it gets the
+            # annotator prompt too and _critic_system_msg is not used at all.
+            # Its two stages are driven by task messages.
+            _annotator_prompt_fn = _P._annotator_system_msg_solo
+            _critic_prompt_fn = _P._annotator_system_msg_solo
+            _adjudicator_prompt_fn = _P._adjudicator_system_msg_blind
+            logger.info("prompt set: blind_pair (standalone annotator prompt "
+                        "for Annotator A, Annotator B and Critic)")
+
         # The two prompt sets take different relation arguments because the two
         # corpora treat relations differently. Selecting the kwargs by prompt set
         # keeps each module's signature honest, rather than forcing a union of
@@ -2915,13 +2985,39 @@ class MultiAgentAnnotator:
                 "relation_types": [sec["title"] for sec in relation_guide],
             }
 
+        # guideline_search_enabled=False drops the tool from the prompt. Only the
+        # MoBiKo non-cold-start prompts take the parameter — the CoNLL siblings
+        # and all three *_coldstart variants have their own signatures and would
+        # raise on it — so it is passed where it is understood rather than
+        # unioned onto everything.
+        _gs_kwargs = ({"guideline_search_enabled": guideline_search_enabled}
+                      if (prompt_set != "conll" and not cold_start) else {})
+        if cold_start and not guideline_search_enabled:
+            logger.warning(
+                "guideline_search_enabled=False is ignored under cold_start: the "
+                "cold-start prompts have no such parameter and still describe "
+                "the tool.")
+
+        # In blind_pair mode the Critic is a third independent ANNOTATOR, so it
+        # takes the annotator prompt — which has no `precedent_memory` parameter
+        # and would raise on the critic's kwargs. Its termination check must also
+        # parse ANNOTATOR output, or the turn never ends: the agent emits
+        # {entities, relations, ...} and a check looking for {disagreements, ...}
+        # would not recognise it as finished.
+        if deliberation_mode == "blind_pair":
+            _critic_prompt_kwargs = dict(_rel_prompt_kwargs, **_gs_kwargs)
+            critic_is_done = annotator_is_done
+        else:
+            _critic_prompt_kwargs = dict(_rel_prompt_kwargs, **_gs_kwargs,
+                                         precedent_memory=use_precedent_memory)
+
         # ── Create agents ────────────────────────────────────
         self.annotator = ConversableAgent(
             name="Annotator",
             system_message=_annotator_prompt_fn(
                 annotator_guideline, entity_schema_str, relation_schema,
                 guideline_search_mandatory=guideline_search_mandatory,
-                **_rel_prompt_kwargs),
+                **_rel_prompt_kwargs, **_gs_kwargs),
             llm_config=annotator_llm,
             human_input_mode="NEVER",
             is_termination_msg=annotator_is_done,
@@ -2932,8 +3028,7 @@ class MultiAgentAnnotator:
             system_message=_critic_prompt_fn(
                 critic_guideline, entity_schema_str, relation_schema,
                 guideline_search_mandatory=guideline_search_mandatory,
-                precedent_memory=use_precedent_memory,
-                **_rel_prompt_kwargs),
+                **_critic_prompt_kwargs),
             llm_config=critic_llm,
             human_input_mode="NEVER",
             is_termination_msg=critic_is_done,
@@ -2943,7 +3038,7 @@ class MultiAgentAnnotator:
             name="Adjudicator",
             system_message=_adjudicator_prompt_fn(
                 critic_guideline, entity_schema_str, relation_schema,
-                **_rel_prompt_kwargs),
+                **_rel_prompt_kwargs, **_gs_kwargs),
             llm_config=adjudicator_llm,
             human_input_mode="NEVER",
             is_termination_msg=adjudicator_is_done,
@@ -3009,6 +3104,9 @@ class MultiAgentAnnotator:
             critic_temperature=critic_temp,
             adjudicator_temperature=adjudicator_temp,
             max_rounds=max_rounds,
+            deliberation_mode=deliberation_mode,
+            guideline_search_enabled=guideline_search_enabled,
+            context_radius=context_radius,
             strict_critic=strict_critic,
             cold_start=cold_start,
             use_precedent_memory=use_precedent_memory,
@@ -3087,6 +3185,24 @@ class MultiAgentAnnotator:
             # a full run are different systems, not different settings, so this
             # must be recoverable from the output.
             "single_pass": bool(cfg.get("single_pass")),
+            # WHICH PIPELINE SHAPE produced this record — "review" (Annotator ->
+            # Critic reviews -> Adjudicator) or "blind_pair" (two Annotators and
+            # a Critic annotate independently, then vote and adjudicate). These
+            # are different experiments, not different settings, and the point
+            # of building the second was to compare them on the same models and
+            # the same guideline. Having the design itself be the one unstamped
+            # variable would make two runs in one directory distinguishable only
+            # by file name — exactly the failure the pinned config exists to end.
+            "deliberation_mode": cfg.get("deliberation_mode"),
+            # guideline_search off means the guideline was pasted in full and no
+            # retrieval happened. Compliance with the search instruction varied
+            # by model (490-690 calls per run on some, 0-2 on others), so
+            # whether the tool was even offered has to be recoverable.
+            "guideline_search_enabled": bool(cfg.get("guideline_search_enabled")),
+            # How many neighbouring sentences each agent saw. The agent-agent
+            # agreement number is only comparable to the two-human ceiling under
+            # the humans' condition, and theirs was +/-1.
+            "context_radius": cfg.get("context_radius"),
             "annotator_prompt": cfg.get("annotator_prompt"),
             "annotator_prompt_requested": cfg.get("annotator_prompt_requested"),
             "annotator_prompt_fn": cfg.get("annotator_prompt_fn"),
@@ -3128,6 +3244,272 @@ class MultiAgentAnnotator:
                 "ON" if eff_hints else "OFF",
             )
         return meta
+
+    # ─────────────────────── blind-pair orchestration ───────────────────────
+
+    def _context_for(self, sentence: str) -> Dict[str, Any]:
+        """The matched-condition context window, built lazily and cached.
+
+        Mark and Davnah annotated one sentence at a time and could navigate to
+        the previous and following sentences, so the agents get a +/-1 window —
+        sentence-only would handicap them against the 0.497 ceiling and the whole
+        abstract would over-inform them. Identical for every agent: an earlier
+        design gave the abstract to the Critic alone, which made the three votes
+        non-exchangeable and put a context confound on the
+        Adjudicator-vs-majority comparison.
+        """
+        if getattr(self, "_ctx_window", None) is None:
+            try:
+                from abstract_context import ContextWindow
+                self._ctx_window = ContextWindow(radius=self.context_radius)
+                if not self._ctx_window.index.abstracts:
+                    logger.warning(
+                        "no abstracts loaded: every agent will see the sentence "
+                        "alone, which is NOT the condition the human annotators "
+                        "worked under and makes the agreement comparison to the "
+                        "0.497 ceiling optimistic for the humans.")
+            except Exception as exc:
+                logger.warning("context window unavailable (%s); sentences will "
+                               "be annotated without neighbours.", exc)
+                self._ctx_window = False
+        if not self._ctx_window:
+            return {"before": [], "after": [], "window": sentence,
+                    "n_before": 0, "n_after": 0}
+        return self._ctx_window.for_sentence(sentence)
+
+    def _blind_turn(self, agent, executor, message: str):
+        """One annotating turn, returning (text, parsed output, turn record).
+
+        Every blind-pair call goes through _run_agent_turn, so each inherits the
+        TASK_PROMPT_SENTINEL tagging. That matters more here than in the review
+        pipeline: the revision and adjudication messages embed parseable
+        annotator JSON, which is exactly what silently disabled round 2 for
+        months — is_termination_msg fired on the prompt's arrival and the turn
+        ended before the model was invoked.
+        """
+        agent.reset()
+        executor.reset()
+        text, rec = self._run_agent_turn(agent, executor, message)
+        return text, self._parse_annotator_output(text), rec
+
+    @staticmethod
+    def _entities_with_offsets(sentence: str, parsed) -> List[Dict[str, Any]]:
+        """Parsed output -> span dicts the vote can cluster.
+
+        Offsets are resolved here rather than trusted from the model: an LLM
+        cannot count characters reliably, and _span_occurrences is deterministic
+        and was verified bit-identical to the Adjudicator path on all 17,149
+        entities of the archived runs. n_candidates is carried so a cautious
+        analysis can decline to trust an ambiguous position.
+        """
+        out: List[Dict[str, Any]] = []
+        if parsed is None:
+            return out
+        for e in parsed.entities or []:
+            occ = _span_occurrences(sentence, e.text)
+            out.append({
+                "text": e.text,
+                "entity_type": e.entity_type,
+                "start": occ[0][0] if occ else None,
+                "end": occ[0][1] if occ else None,
+                "n_candidates": len(occ),
+                "confidence": e.confidence,
+            })
+        return out
+
+    def annotate_sentence_blind(self, sentence: str) -> DeliberationRecord:
+        """Blind-pair pipeline for one sentence.
+
+        Two Annotators and a Critic annotate INDEPENDENTLY — same model, same
+        byte-identical prompt, same context, differing only by sampling. The
+        Critic then sees the other two anonymised and shuffled, and revises. A
+        majority vote over the three INDEPENDENT annotations and an Adjudicator
+        both decide the contested spans, and both outputs are recorded.
+
+        Why each piece is shaped this way:
+
+        INDEPENDENCE. The review pipeline's Critic never commits before seeing
+        the Annotator's answer, so it cannot be independent; measured, it
+        challenges spans the Annotator was already less confident about (rho
+        -0.09 to -0.28 in 17/17 runs) and adds +0.004 AUC over that confidence.
+        Here all three commit blind first.
+
+        THE REVISION IS THE ANCHORING MEASUREMENT. Keeping the Critic's blind
+        annotation alongside its revised one makes the delta between them a
+        measured quantity rather than an inference — which is the mechanism the
+        paper would be claiming.
+
+        THE VOTE USES THE BLIND TRIPLE, NOT THE REVISION. critic_revised has
+        seen A and B, so including it would let one agent's view count twice and
+        turn a 2-1 "majority" into an agent agreeing with itself.
+
+        THE VOTE IS NOT A FALLBACK. On the archived K=10 draws a majority rule
+        settles 96.6% of type disagreements and the no-majority case is 2.6% of
+        mentions, so an Adjudicator that cannot beat a free deterministic rule is
+        cost and opacity with no decision content. Both run on the same
+        contested set so the comparison can be made against human gold.
+        """
+        from span_vote import summarise as _vote_summary
+        from span_vote import vote as _vote
+
+        record = DeliberationRecord(
+            sentence=sentence,
+            run_meta=dict(getattr(self, "run_meta", {}) or {}))
+        t0 = time.perf_counter()
+        ctx = self._context_for(sentence)
+        task = self._build_blind_annotation_msg(sentence, ctx)
+
+        roles: Dict[str, Any] = {}
+        usage: Dict[str, Any] = {}
+
+        # ── 1-3. three independent annotations ──
+        # Annotator A, Annotator B and the Critic are the SAME agent sampled
+        # three times, because they carry an identical system prompt and receive
+        # an identical task. Three separate agents would be three copies of one
+        # configuration and would invite the illusion that they differ by more
+        # than sampling.
+        for role, agent, executor in (
+            ("annotator_a", self.annotator, self.annotator_executor),
+            ("annotator_b", self.annotator, self.annotator_executor),
+            ("critic_blind", self.critic, self.critic_executor),
+        ):
+            text, parsed, turn = self._blind_turn(agent, executor, task)
+            roles[role] = {
+                "text": text,
+                "parsed": parsed,
+                "entities": self._entities_with_offsets(sentence, parsed),
+                "parse_ok": parsed is not None,
+            }
+            usage[role] = turn["token_usage"]
+            if role == "annotator_a":
+                record.annotator_mean_logprob = turn.get("mean_logprob")
+                record.annotator_mean_entropy = turn.get("mean_entropy")
+            elif role == "critic_blind":
+                record.critic_mean_logprob = turn.get("mean_logprob")
+                record.critic_mean_entropy = turn.get("mean_entropy")
+            record.messages.append(dict(turn, agent=role))
+            logger.info("  [blind] %s: %s", role,
+                        f"{len(roles[role]['entities'])} entities"
+                        if parsed is not None else "PARSE FAILED")
+
+        # ── 4. reveal A and B to the Critic, anonymised and shuffled ──
+        # Seeded per sentence so a rerun of the same input reproduces the same
+        # shuffle; derived from the sentence rather than a global counter so the
+        # order does not depend on how many sentences preceded this one.
+        rng = random.Random(hashlib.sha256(sentence.encode()).hexdigest())
+        peer_pairs, peer_map = self._anonymise_annotations(
+            [roles["annotator_a"]["text"], roles["annotator_b"]["text"]], rng)
+        rev_msg = self._build_peer_revision_msg(
+            sentence, roles["critic_blind"]["text"], peer_pairs, ctx)
+        text, parsed, turn = self._blind_turn(
+            self.critic, self.critic_executor, rev_msg)
+        roles["critic_revised"] = {
+            "text": text, "parsed": parsed,
+            "entities": self._entities_with_offsets(sentence, parsed),
+            "parse_ok": parsed is not None,
+        }
+        usage["critic_revised"] = turn["token_usage"]
+        record.messages.append(dict(turn, agent="critic_revised"))
+
+        # ── 5. majority vote over the three INDEPENDENT annotations ──
+        triple = [roles[r]["entities"] for r in
+                  ("annotator_a", "annotator_b", "critic_blind")]
+        # A span whose offsets could not be resolved cannot be clustered. It is
+        # dropped from the vote and counted, never silently discarded: an
+        # unresolvable surface form is a hallucinated span and the strongest kind
+        # of false positive.
+        unresolved = sum(1 for spans in triple for e in spans
+                         if e["start"] is None)
+        voted = _vote([[e for e in spans if e["start"] is not None]
+                       for spans in triple], n_annotators=3)
+
+        # ── 6. Adjudicator on the contested mentions ──
+        adj_pairs, adj_map = self._anonymise_annotations(
+            [roles[r]["text"] for r in
+             ("annotator_a", "annotator_b", "critic_blind")], rng)
+        adj_msg = self._build_blind_adjudication_msg(
+            sentence, adj_pairs, voted["contested"], ctx)
+        adj_text, adj_parsed, adj_turn = self._blind_turn(
+            self.adjudicator, self.adj_executor, adj_msg)
+        usage["adjudicator"] = adj_turn["token_usage"]
+        record.adjudicator_mean_logprob = adj_turn.get("mean_logprob")
+        record.adjudicator_mean_entropy = adj_turn.get("mean_entropy")
+        record.messages.append(dict(adj_turn, agent="adjudicator"))
+
+        # The Adjudicator emits the adjudicator schema, not the annotator one.
+        adj_out = self._parse_adjudicator_output(adj_text)
+
+        # ── 7. assemble ──
+        # final_entities stays the ADJUDICATED output so every existing eval
+        # reads this record unchanged; majority_entities sits beside it. Neither
+        # is privileged — the paper reports both, which is the point of running
+        # both.
+        if adj_out is not None:
+            record.final_entities = list(adj_out.final_entities)
+            record.final_relations = [
+                r.to_relation_annotation() if hasattr(r, "to_relation_annotation")
+                else r for r in (adj_out.final_relations or [])]
+            record.flagged_for_human_review = list(
+                adj_out.flagged_for_human_review or [])
+            record.adjudication_status = "blind_pair"
+        else:
+            # Fall back to the vote rather than to nothing: a failed Adjudicator
+            # parse must not cost the sentence, and the fallback is recorded so
+            # it can be excluded from the Adjudicator-vs-vote comparison.
+            record.final_entities = [
+                EntityAnnotation(text=e["text"], entity_type=e["entity_type"],
+                                 start=e["start"], end=e["end"])
+                for e in voted["entities"]]
+            record.adjudication_status = "blind_pair_adjudicator_parse_failed"
+            logger.warning("  [blind] Adjudicator parse failed; "
+                           "final_entities fall back to the majority vote")
+        _fill_char_offsets(sentence, record.final_entities, record.final_relations)
+
+        record.blind_pair = {
+            "context": {"n_before": ctx["n_before"], "n_after": ctx["n_after"]},
+            "annotations": {r: {"entities": roles[r]["entities"],
+                                "parse_ok": roles[r]["parse_ok"]}
+                            for r in roles},
+            "majority": {"entities": voted["entities"],
+                         "mentions": voted["mentions"],
+                         "contested": voted["contested"],
+                         "rule": voted["rule"],
+                         "summary": _vote_summary(voted)},
+            "unresolved_offsets": unresolved,
+            # Who was which, so analysis can recover identity although no agent
+            # could. Without this the anonymisation would also blind the
+            # experimenter.
+            "anonymisation": {"critic_revision": peer_map,
+                              "adjudication": adj_map},
+            "adjudicator_parse_ok": adj_out is not None,
+        }
+        record.rounds_used = 1
+        # Fraction of mentions all three annotators agreed on completely. This
+        # is the blind-pair analogue of an inter-annotator agreement rate and is
+        # the number compared against the 0.497 two-human ceiling.
+        _sm = _vote_summary(voted)
+        record.agreement_score = (_sm["unanimous"] / _sm["mentions"]
+                                  if _sm["mentions"] else None)
+
+        total: Dict[str, Any] = {}
+        for r in usage.values():
+            self._add_usage(total, r)
+        record.token_usage = {k: self._seal_usage(dict(v)) if isinstance(v, dict)
+                              else v for k, v in usage.items()}
+        record.token_usage["total"] = self._seal_usage(total)
+        record.timing = {"total_s": round(time.perf_counter() - t0, 2),
+                         "rounds": 1}
+
+        sm = _vote_summary(voted)
+        logger.info(
+            "Done (blind) in %.1fs | %d mentions, %d unanimous, %d contested "
+            "| majority %d entities, adjudicated %d | tokens %s [%s]",
+            record.timing["total_s"], sm["mentions"], sm["unanimous"],
+            len(voted["contested"]), len(voted["entities"]),
+            len(record.final_entities),
+            record.token_usage["total"].get("total_tokens"),
+            ",".join(record.token_usage["total"].get("token_source") or ["?"]))
+        return record
 
     def annotate_sentence(
         self,
@@ -3687,7 +4069,27 @@ class MultiAgentAnnotator:
                 self.adj_executor.reset()
 
                 try:
-                    record = self.annotate_sentence(sent, ents)
+                    # Dispatch on the pipeline shape. Hardcoding
+                    # annotate_sentence here made annotate_sentence_blind
+                    # unreachable from any batch run, so the blind design could
+                    # be constructed, prompted and tested but never actually
+                    # executed on a corpus.
+                    if self.deliberation_mode == "blind_pair":
+                        if ents:
+                            # pre_identified_entities seeds the Annotator with
+                            # spans to verify. Handing them to two "independent"
+                            # annotators would make them agree because they were
+                            # given the same answer, not because they judged
+                            # alike — which is the one measurement this design
+                            # exists to produce.
+                            raise ValueError(
+                                "pre_identified_entities is incompatible with "
+                                "deliberation_mode=blind_pair: seeding the "
+                                "annotators with the same spans manufactures "
+                                "the agreement being measured.")
+                        record = self.annotate_sentence_blind(sent)
+                    else:
+                        record = self.annotate_sentence(sent, ents)
                     break
                 except Exception as exc:
                     last_exc = exc
@@ -4061,6 +4463,82 @@ class MultiAgentAnnotator:
             "Return your full final annotation in the same JSON format as before, "
             "including every entity and relation you would keep — not only the ones "
             "that changed."
+        )
+        return msg
+
+    @staticmethod
+    def _build_blind_adjudication_msg(
+        sentence: str,
+        annotation_pairs: List[Tuple[str, str]],
+        contested: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Put the contested mentions to the Adjudicator.
+
+        `annotation_pairs` are the independent annotations, already shuffled and
+        anonymised. `contested` is span_vote's contested list, each entry
+        carrying the reasons it is contested and what was proposed.
+
+        WHY THE CONTESTED LIST IS SPELLED OUT rather than left for the model to
+        infer from the annotations. Three annotations of one sentence differ in
+        ways that are tedious and error-prone to diff by eye, and an Adjudicator
+        that misses a disagreement silently keeps one annotator's label by
+        default — which is the deference this design exists to remove. Naming
+        the disagreements also makes the Adjudicator's decisions directly
+        comparable to the majority vote's on the same set.
+
+        Support counts ARE shown. Withholding them would be odd given the
+        annotations are all present and countable, and the system prompt tells
+        the Adjudicator explicitly that a count is not the deciding
+        consideration since it is available without a model call.
+        """
+        if isinstance(context, str):
+            raise TypeError("_build_blind_adjudication_msg takes a "
+                            "ContextWindow.for_sentence() dict, not a string.")
+        msg = (
+            f"{len(annotation_pairs)} annotators labelled this sentence "
+            f"independently. Decide the spans they disagreed on.\n\n"
+            f'Sentence: "{sentence}"\n\n'
+        )
+        if context and (context.get("before") or context.get("after")):
+            msg += "Surrounding sentences, for reference only:\n"
+            for c in context.get("before") or []:
+                msg += f"  [before] {c}\n"
+            msg += "  [THE SENTENCE BEING ANNOTATED] (above)\n"
+            for c in context.get("after") or []:
+                msg += f"  [after] {c}\n"
+            msg += "\n"
+        for label, text in annotation_pairs:
+            msg += (f"{label} (annotator unidentified):\n"
+                    f"{MultiAgentAnnotator._strip_terminate(text)}\n\n")
+
+        if not contested:
+            msg += ("The annotators agreed on every span. Return their agreed "
+                    "annotation unchanged as \"final_entities\".")
+            return msg
+
+        msg += f"## Contested spans ({len(contested)})\n\n"
+        for i, m in enumerate(contested, 1):
+            why = ", ".join(m.get("contested_reasons") or [])
+            msg += (f"{i}. {m.get('text')!r}  "
+                    f"[{why}]  "
+                    f"produced by {m.get('support')} of {m.get('n_annotators')}")
+            types = m.get("types_proposed") or {}
+            if len(types) > 1:
+                msg += ("  types proposed: "
+                        + ", ".join(f"{t} x{c}" for t, c in sorted(types.items())))
+            elif types:
+                msg += f"  type: {next(iter(types))}"
+            msg += "\n"
+        msg += (
+            "\nFor each contested span decide, on the sentence and the "
+            "guideline, what the correct annotation is — including whether the "
+            "span should be annotated at all, and at what extent. Then return "
+            "the COMPLETE annotation of the sentence: the uncontested spans "
+            "unchanged, plus your decisions.\n\n"
+            "Record one entry in \"disagreement_resolutions\" per contested "
+            "span, and list in \"flagged_for_human_review\" any span the "
+            "guideline does not settle."
         )
         return msg
 

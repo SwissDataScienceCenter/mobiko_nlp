@@ -293,6 +293,9 @@ def run_live(
     dependency_max_candidates: int = 12,
     input_path: Path | None = None,
     corpus_kwargs: dict | None = None,
+    deliberation_mode: str = "review",
+    guideline_search_enabled: bool = True,
+    context_radius: int = 1,
 ) -> None:
     # Defaults to MoBiKo so existing callers that never heard of corpora keep
     # their exact previous behaviour.
@@ -318,6 +321,9 @@ def run_live(
         request_timeout=request_timeout,
         strict_critic=strict_critic,
         guideline_search_mandatory=guideline_search_mandatory,
+        guideline_search_enabled=guideline_search_enabled,
+        deliberation_mode=deliberation_mode,
+        context_radius=context_radius,
         relation_search_mandatory=relation_search_mandatory,
         include_relation_schema=include_relation_schema,
         tool_choice=tool_choice,
@@ -437,12 +443,39 @@ def main() -> None:
              "and temperature=0.5 (vs default 0.3). Default Critic mode is unchanged.",
     )
     parser.add_argument(
-        "--guideline-search", choices=["mandatory", "optional"], default="optional",
+        "--deliberation-mode", choices=["review", "blind_pair"], default="review",
+        help="Pipeline shape. 'review' (default) is Annotator -> Critic reviews "
+             "its output -> Adjudicator: the design every archived run used. "
+             "'blind_pair' has two Annotators and a Critic annotate the sentence "
+             "INDEPENDENTLY, then shows the Critic the other two (anonymised, "
+             "shuffled) for a revision, then decides contested spans by BOTH a "
+             "majority vote and the Adjudicator. Built because the review "
+             "design's Critic is anchored by construction — it never commits "
+             "before exposure, and it adds +0.004 AUC over the Annotator's own "
+             "self-reported confidence.",
+    )
+    parser.add_argument(
+        "--context-radius", type=int, default=1,
+        help="How many neighbouring sentences each agent sees (blind_pair only). "
+             "Default 1, matching the human annotators, who worked one sentence "
+             "at a time and could navigate to the previous and following ones. "
+             "0 handicaps the agents relative to the ceiling they are compared "
+             "with; the whole abstract over-informs them.",
+    )
+    parser.add_argument(
+        "--guideline-search", choices=["mandatory", "optional", "off"],
+        default="optional",
         help="Whether Annotator/Critic MUST call guideline_search before assigning/judging "
              "each entity type ('mandatory') or only when a label is unclear "
              "('optional', default). The full guideline is already injected into the system "
              "prompt, so 'optional' avoids redundant tool calls/latency; use 'mandatory' only "
-             "if you specifically want forced per-span guideline retrieval.",
+             "if you specifically want forced per-span guideline retrieval. 'off' "
+             "unregisters the tool and removes every mention of it from the "
+             "prompts: the whole guideline corpus is 18KB (~4.5k tokens), so "
+             "retrieval over it answers a context-limit problem that does not "
+             "exist, and compliance varied so much by model (490-690 calls per "
+             "run on some, 0-2 on others) that it became an uncontrolled "
+             "information asymmetry inside a model comparison.",
     )
     parser.add_argument(
         "--relation-search", choices=["mandatory", "optional"], default="optional",
@@ -573,6 +606,9 @@ def main() -> None:
             request_timeout=args.timeout,
             strict_critic=args.strict_critic,
             guideline_search_mandatory=(args.guideline_search == "mandatory"),
+            guideline_search_enabled=(args.guideline_search != "off"),
+            deliberation_mode=args.deliberation_mode,
+            context_radius=args.context_radius,
             relation_search_mandatory=(args.relation_search == "mandatory"),
             include_relation_schema=args.relation_schema_in_prompt,
             tool_choice=args.tool_choice,
