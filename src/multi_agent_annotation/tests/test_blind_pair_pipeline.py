@@ -71,6 +71,7 @@ def make(responses):
     a.annotator_executor = a.critic_executor = a.adj_executor = _Stub()
     a.run_meta = {"deliberation_mode": "blind_pair"}
     a.context_radius = 1
+    a.nested_spans = False         # IoU only, as the MoBiKo default
     a._ctx_window = False          # no abstracts: sentence-only context
     a.calls = []
 

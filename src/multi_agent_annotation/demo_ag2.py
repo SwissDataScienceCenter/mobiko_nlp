@@ -296,6 +296,7 @@ def run_live(
     deliberation_mode: str = "review",
     guideline_search_enabled: bool = True,
     context_radius: int = 1,
+    nested_spans: bool = False,
 ) -> None:
     # Defaults to MoBiKo so existing callers that never heard of corpora keep
     # their exact previous behaviour.
@@ -324,6 +325,7 @@ def run_live(
         guideline_search_enabled=guideline_search_enabled,
         deliberation_mode=deliberation_mode,
         context_radius=context_radius,
+        nested_spans=nested_spans,
         relation_search_mandatory=relation_search_mandatory,
         include_relation_schema=include_relation_schema,
         tool_choice=tool_choice,
@@ -453,6 +455,19 @@ def main() -> None:
              "design's Critic is anchored by construction — it never commits "
              "before exposure, and it adds +0.004 AUC over the Annotator's own "
              "self-reported confidence.",
+    )
+    parser.add_argument(
+        "--nested-spans", action="store_true",
+        help="In blind_pair mode, treat a span wholly containing another as the "
+             "SAME mention when the majority vote clusters annotations. IoU alone "
+             "penalises nesting — 'America' inside 'Corporate America' scores "
+             "0.41 and does not merge at the 0.5 threshold — so one mention "
+             "annotated at two granularities is otherwise recorded as two "
+             "mentions each missing from some annotators, turning an extent and "
+             "type dispute into a detection one. Right for CoNLL, where a name "
+             "is a name; not obviously right for a schema where 'species "
+             "richness' inside 'centres of species richness' may be two "
+             "distinct entities. Stamped into run_meta either way.",
     )
     parser.add_argument(
         "--context-radius", type=int, default=1,
@@ -609,6 +624,7 @@ def main() -> None:
             guideline_search_enabled=(args.guideline_search != "off"),
             deliberation_mode=args.deliberation_mode,
             context_radius=args.context_radius,
+            nested_spans=args.nested_spans,
             relation_search_mandatory=(args.relation_search == "mandatory"),
             include_relation_schema=args.relation_schema_in_prompt,
             tool_choice=args.tool_choice,

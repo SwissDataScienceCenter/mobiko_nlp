@@ -180,7 +180,8 @@ def test_the_rule_is_recorded_with_the_result():
     """A voted output whose rule is not stated cannot be reproduced or compared
     against a differently-parameterised vote."""
     v = vote([[sp("f", "BIOTIC ENTITY", 0, 1)]], n_annotators=3)
-    assert v["rule"] == {"min_support": 2, "n_annotators": 3, "iou_threshold": 0.5}
+    assert v["rule"] == {"min_support": 2, "n_annotators": 3,
+                         "iou_threshold": 0.5, "nested": False}
 
 
 def test_summarise_counts_each_disagreement_kind():
