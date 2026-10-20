@@ -2120,12 +2120,16 @@ def _render_last_annotated(keys: List[Tuple]):
     with c_txt:
         st.markdown(
             f'<div style="text-align:right;font-size:12px;color:#888;'
-            f'padding-top:8px">Last annotated: sentence <b>{pos + 1}</b> '
-            f'({html_mod.escape(str(last[0]))} · sentence {last[1]})</div>',
+            f'padding-top:8px">Last annotated: '
+            f'<b>{html_mod.escape(str(last[0]))} · sentence {last[1]}</b></div>',
             unsafe_allow_html=True,
         )
     with c_btn:
-        if st.button(f"↪ Go to sentence {pos + 1}", key="re_goto_last"):
+        # No number on the button: the header names a sentence by its index
+        # within the document (from 0), the counter and 'Jump to' by its
+        # position in the file (from 1), and a third number would match one
+        # of them and contradict the other.
+        if st.button("↪ Go to last annotated", key="re_goto_last"):
             _goto_sentence(pos)
             st.rerun()
 
@@ -2662,15 +2666,21 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
     with nav2:
         idx = st.session_state.re_sentence_idx
         rel_count = len(st.session_state.rel_gold.get(keys[idx], []))
+        # "sentence k" is only ever the index within the document (from 0, as
+        # in the header and the export); the running number through the file
+        # (from 1, what 'Jump to' takes) is called a position, so the two
+        # numbers never share a name.
+        doc_id, sent_idx = keys[idx]
         st.markdown(
             f"<div style='text-align:center;padding-top:6px'>"
-            f"Sentence {idx + 1} / {len(keys)} — "
+            f"{html_mod.escape(str(doc_id))} · sentence {sent_idx} — "
+            f"position {idx + 1} / {len(keys)} in file — "
             f"<b>{rel_count}</b> relation(s) annotated</div>",
             unsafe_allow_html=True,
         )
     with nav3:
         jump = st.number_input(
-            "Jump to", min_value=1, max_value=len(keys),
+            "Go to position", min_value=1, max_value=len(keys),
             value=st.session_state.re_sentence_idx + 1,
             step=1, label_visibility="collapsed",
             # A keyed number_input keeps the value the annotator last saw, and
