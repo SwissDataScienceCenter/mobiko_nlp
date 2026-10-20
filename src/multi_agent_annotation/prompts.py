@@ -1,4 +1,3 @@
-import re
 from typing import Annotated, Dict, List, Optional, Tuple, Any
 
 
@@ -51,25 +50,100 @@ def _relation_vocab_section(mandatory: bool = False,
 list_relation_types re-lists the names above."""
 
 
+# The two framings this prompt can open with. They are mutually exclusive, and
+# the difference between them is the difference between an annotator feeding a
+# reviewer and an annotator whose output stands as the answer.
+#
+# WHY THESE ARE CONSTANTS. The standalone framing used to be produced by regex-
+# substituting the pipeline framing out of the already-rendered prompt. That left
+# this file reading as the exact opposite of what shipped to a standalone
+# annotator, and made the substitution silently conditional on nobody ever
+# rewording the paragraph it matched — reword it and the mandate to over-produce
+# comes back with no error anywhere. Both framings are written out and selected.
+_FRAMING_PIPELINE = (
+    "You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM "
+    "COVERAGE: identify and annotate every possible entity and every valid relation "
+    "(triplet) in the given sentence. It is far better to over-annotate than to miss "
+    "entities or relations — the Critic will filter errors later."
+)
+_FRAMING_STANDALONE = (
+    "You are Annotator, a biodiversity NLP expert producing the FINAL annotation of a "
+    "sentence. No reviewer will see your output and no one will correct it, so it must "
+    "stand on its own. Aim for the annotation a careful domain expert would defend: "
+    "annotate what you believe is genuinely present, and do not annotate spans you "
+    "would not defend if challenged."
+)
+
+_STEP1_PIPELINE = ("1. Read the sentence carefully and identify ALL meaningful spans "
+                   "— err on the side of inclusion.")
+_STEP1_STANDALONE = ("1. Read the sentence carefully and identify the meaningful spans "
+                     "it contains.")
+
+# Only the pipeline arm gets this bullet. A standalone annotator asked to prefer
+# more entities is being pushed toward the over-production the framing just told
+# it not to do.
+_COVERAGE_PREFER_MORE = ("- Prefer more entities over fewer: if a span could plausibly "
+                         "be an entity, include it.\n")
+
+
 def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                           guideline_search_mandatory: bool = True,
                           relation_search_mandatory: bool = False,
-                          relation_types: Optional[List[str]] = None) -> str:
+                          relation_types: Optional[List[str]] = None,
+                          guideline_search_enabled: bool = True,
+                          standalone: bool = False) -> str:
+    """standalone=True renders the prompt for an annotator whose output is final.
+
+    Used by the single-pass arm and by the blind-pair pipeline, where Annotator A,
+    Annotator B and the Critic are independent annotators sharing one prompt. It
+    changes exactly three things: the opening framing, step 1, and whether the
+    "prefer more entities" coverage bullet appears.
+
+    Why it has to change them. An annotator told to over-produce because a Critic
+    will filter cannot be scored against two humans who were told no such thing;
+    and two blind annotators both told to over-produce disagree because they were
+    instructed to, which makes their agreement incomparable to a human ceiling.
+
+    guideline_search_enabled=False removes the tool from the prompt entirely.
+
+    The whole guideline corpus is 18KB (~4.5k tokens) across two documents, so
+    retrieval over it answers a context-limit problem that does not exist. Worse,
+    compliance with the search instruction varied by model — 490-690 calls per
+    run on DeepSeek and Kimi, 0-2 on Qwen and GPT-OSS — and because the tool
+    indexes BOTH documents while each agent was pasted only one, the compliant
+    models effectively had both and the others had one. That is an uncontrolled
+    information asymmetry reported as a model comparison.
+
+    With the tool off, the prompt must stop asking for it: an agent instructed to
+    call an unregistered function either fails the call or improvises. Every
+    reference is removed here rather than stripped from the rendered text,
+    because a regex over carefully written prose is the fragile option — and
+    test_blind_pair_prompts asserts the rendered prompt mentions the tool nowhere.
+    """
     gs_step = (
         "2. For EACH candidate span, you MUST call guideline_search with the span text before "
         "assigning its type. Do NOT assign an entity type you have not checked against the "
         "guideline. All valid types are listed in the Entity Type Schema above."
-        if guideline_search_mandatory else
+        if (guideline_search_enabled and guideline_search_mandatory) else
         "2. When a span's type is unclear or borderline, call guideline_search to retrieve the "
         "relevant rule before assigning its type. All valid types are listed in the Entity Type "
         "Schema above."
+        if guideline_search_enabled else
+        "2. Assign each span's type by applying the Labelling Decision Table above. It is "
+        "reproduced in full — there is nothing further to retrieve. All valid types are listed "
+        "in the Entity Type Schema above."
+    )
+    gs_tool_line = (
+        "\n- guideline_search    : retrieve the exact guideline rule that applies to a span/type"
+        if guideline_search_enabled else ""
     )
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
+    framing = _FRAMING_STANDALONE if standalone else _FRAMING_PIPELINE
+    step1 = _STEP1_STANDALONE if standalone else _STEP1_PIPELINE
+    prefer_more = "" if standalone else _COVERAGE_PREFER_MORE
     return f"""\
-You are Annotator, a biodiversity NLP expert. Your primary objective is MAXIMUM COVERAGE: identify \
-and annotate every possible entity and every valid relation (triplet) in the given sentence. \
-It is far better to over-annotate than to miss entities or relations — the Critic will filter errors later.
- 
+{framing}
+
 {relation_vocab_section}
 
 For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
@@ -82,13 +156,12 @@ For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLAR
 
 ## Available Tools
 - schema_lookup       : OPTIONAL, advisory — which entity-type pairs have been catalogued so far. \
-Incomplete: an empty result means "not catalogued", NEVER "invalid".
-- guideline_search    : retrieve the exact guideline rule that applies to a span/type
+Incomplete: an empty result means "not catalogued", NEVER "invalid".{gs_tool_line}
 - list_relation_types : the closed list of valid relation names — the vocabulary is not in this prompt
 - relation_search     : a relation's definition and examples, or the relation fitting a described link
 
 ## Process
-1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.
+{step1}
 {gs_step}
 3. Annotate every relation you judge to hold between two annotated entities. Relations have NO \
    entity-type restrictions — any entity type may relate to any other. Do NOT gate a relation on \
@@ -98,8 +171,7 @@ Incomplete: an empty result means "not catalogued", NEVER "invalid".
    stop you from annotating a relation the sentence supports.
 
 ## Coverage Rules
-- Prefer more entities over fewer: if a span could plausibly be an entity, include it.
-- All annotated entities must be linked to at least one relation. If an entity has no relations, it is likely a false positive and should be removed.
+{prefer_more}- All annotated entities must be linked to at least one relation. If an entity has no relations, it is likely a false positive and should be removed.
 
 ## Span boundary rule (apply top to bottom; stop at the first that decides)
 - Exclude leading determiners and demonstratives: "this species" → [species], "the frater complex" → [frater complex]. Never include "this/the/a/its/their".
@@ -766,7 +838,8 @@ Output rules:
 def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_schema: dict,
                                guideline_search_mandatory: bool = True,
                                relation_search_mandatory: bool = False,
-                               relation_types: Optional[List[str]] = None) -> str:
+                               relation_types: Optional[List[str]] = None,
+                               guideline_search_enabled: bool = True) -> str:
     """Single-pass annotator: no Critic, no Adjudicator, output is final.
 
     WHY THIS EXISTS. _annotator_system_msg tells the model its "primary objective
@@ -784,36 +857,24 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
     difference had nothing to do with deliberation and would have confounded the
     ablation.
 
-    ONLY Critic-dependent instructions are replaced:
-      * the MAXIMUM COVERAGE / over-annotate / "Critic will filter" framing,
-      * "err on the side of inclusion" in the reading step,
-      * "prefer more entities over fewer".
-    Everything else is inherited verbatim, INCLUDING the whole relation section
+    HOW. It selects standalone=True on the shared prompt body, which swaps three
+    pieces at the point they are written: the opening framing, step 1, and the
+    "prefer more entities over fewer" coverage bullet. It used to regex the
+    pipeline framing out of the rendered text instead, which meant this file
+    read as the opposite of what it sent and the removal would silently stop
+    working if anyone reworded the matched paragraph.
+
+    Everything else is shared verbatim, INCLUDING the whole relation section
     (the relation list, the exploratory framing, the advisory schema_lookup, the
     no-type-restrictions rule) and the rule that an unlinked entity is probably a
     false positive -- that one is a precision heuristic which stands on its own
     and mentions no reviewer, so removing it would change entity behaviour beyond
     the variable under test.
     """
-    base = _annotator_system_msg(
+    return _annotator_system_msg(
         guideline, entity_schema, relation_schema,
-        guideline_search_mandatory=guideline_search_mandatory)
-
-    base = re.sub(
-        r"You are Annotator, a biodiversity NLP expert\. Your primary objective is "
-        r"MAXIMUM COVERAGE:.*?the Critic will filter errors later\.",
-        "You are Annotator, a biodiversity NLP expert producing the FINAL annotation "
-        "of a sentence. No reviewer will see your output and no one will correct it, "
-        "so it must stand on its own. Aim for the annotation a careful domain expert "
-        "would defend: annotate what you believe is genuinely present, and do not "
-        "annotate spans you would not defend if challenged.",
-        base, count=1, flags=re.S)
-
-    base = base.replace(
-        "1. Read the sentence carefully and identify ALL meaningful spans — err on the side of inclusion.",
-        "1. Read the sentence carefully and identify the meaningful spans it contains.")
-
-    base = base.replace(
-        "- Prefer more entities over fewer: if a span could plausibly be an entity, include it.\n", "")
-
-    return base
+        guideline_search_mandatory=guideline_search_mandatory,
+        relation_search_mandatory=relation_search_mandatory,
+        relation_types=relation_types,
+        guideline_search_enabled=guideline_search_enabled,
+        standalone=True)
