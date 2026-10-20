@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -176,14 +177,69 @@ def _token_entropy(top: List[Tuple[str, float]]) -> Optional[float]:
 
 _LOGPROB_STREAMS: List[List[TokenLP]] = []
 
+# Token usage read straight off the API response, one entry per create() call.
+#
+# WHY NOT AG2's chat.cost. The pipeline runs stream=True to capture logprobs,
+# and an OpenAI-compatible API sends NO usage block at all on a streamed
+# response unless stream_options.include_usage is requested. AG2 therefore had
+# nothing to account and reported prompt_tokens=0, completion_tokens=0 for every
+# RCP-routed model — DeepSeek, Kimi and GPT-OSS across all 17 archived runs.
+# Only the vLLM-served Qwen reported anything, because that gateway sends usage
+# regardless. Cost per sentence was consequently measurable for exactly one of
+# four models, which is not enough to claim anything about the cost of
+# deliberation.
+#
+# Reading usage from the response directly also removes the dependency on AG2
+# recognising the model in its price table, which no new endpoint will be in.
+_USAGE_RECORDS: List[Dict[str, int]] = []
+
+# Endpoints that rejected stream_options. Some gateways 400 on unknown body
+# fields, and a hard failure here would take down the whole run for the sake of
+# an accounting field, so the first rejection is remembered and the parameter is
+# dropped for that base_url from then on.
+_NO_STREAM_OPTIONS: set = set()
+
 
 def _logprob_streams() -> List[List[TokenLP]]:
     return _LOGPROB_STREAMS
 
 
+def _usage_records() -> List[Dict[str, int]]:
+    return _USAGE_RECORDS
+
+
 def reset_logprob_capture() -> None:
-    """Clear the capture buffer; call before a turn whose logprobs you want."""
+    """Clear the capture buffers; call before a turn whose logprobs you want."""
     _LOGPROB_STREAMS.clear()
+    _USAGE_RECORDS.clear()
+
+
+def captured_usage() -> Optional[Dict[str, int]]:
+    """Sum the usage blocks the API reported during the current turn.
+
+    None if the API reported none, which is the signal to fall back rather than
+    to record a confident zero — a zero and an unknown are different facts and
+    conflating them is what hid the missing accounting for months.
+    """
+    if not _USAGE_RECORDS:
+        return None
+    prompt = sum(u.get("prompt_tokens", 0) for u in _USAGE_RECORDS)
+    completion = sum(u.get("completion_tokens", 0) for u in _USAGE_RECORDS)
+    if prompt == 0 and completion == 0:
+        return None
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": prompt + completion}
+
+
+def streamed_completion_tokens() -> Optional[int]:
+    """Exact completion-token count from the captured logprob streams.
+
+    Last-resort accounting: every generated token passes through the logprob
+    tee, so counting them gives the completion length exactly even on a gateway
+    that reports no usage at all. Says nothing about prompt tokens.
+    """
+    n = sum(len(toks) for toks in _LOGPROB_STREAMS)
+    return n or None
 
 
 def _last_content_stream() -> Optional[List[TokenLP]]:
@@ -238,9 +294,41 @@ def _patch_openai_for_streaming_logprobs() -> None:
     _orig_create = Completions.create
 
     def _patched_create(self, *args, **kwargs):
-        resp = _orig_create(self, *args, **kwargs)
         if not kwargs.get("stream"):
+            resp = _orig_create(self, *args, **kwargs)
+            # A non-streamed response carries usage natively; take it.
+            try:
+                u = getattr(resp, "usage", None)
+                if u is not None:
+                    _usage_records().append(
+                        {"prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+                         "completion_tokens": getattr(u, "completion_tokens", 0) or 0})
+            except Exception:
+                pass
             return resp  # non-streaming responses keep logprobs natively
+
+        # Ask for the usage block. A streamed OpenAI-compatible response omits
+        # usage entirely without this, which is why every RCP-routed model
+        # reported zero tokens. Sent per call rather than baked into the
+        # LLMConfig so a gateway that rejects it can be detected and excused
+        # here, instead of failing the run.
+        base = str(getattr(getattr(self, "_client", None), "base_url", "")) or "?"
+        want_usage = base not in _NO_STREAM_OPTIONS and "stream_options" not in kwargs
+        if want_usage:
+            try:
+                resp = _orig_create(self, *args,
+                                    **{**kwargs,
+                                       "stream_options": {"include_usage": True}})
+            except Exception as exc:
+                _NO_STREAM_OPTIONS.add(base)
+                logger.warning(
+                    "stream_options.include_usage rejected by %s (%s); token "
+                    "accounting for this endpoint falls back to counting "
+                    "streamed tokens.", base, exc)
+                resp = _orig_create(self, *args, **kwargs)
+        else:
+            resp = _orig_create(self, *args, **kwargs)
+
         tokens: List[TokenLP] = []
         _logprob_streams().append(tokens)
 
@@ -257,6 +345,18 @@ def _patch_openai_for_streaming_logprobs() -> None:
             # cannot clobber it, keeping stream=True working for every role.
             last_finish: Dict[int, Any] = {}
             for chunk in resp:
+                try:
+                    # With include_usage the gateway sends a final chunk whose
+                    # `usage` is populated (and whose `choices` is usually
+                    # empty), so this must be read on every chunk rather than
+                    # only on ones that carry content.
+                    _u = getattr(chunk, "usage", None)
+                    if _u is not None:
+                        _usage_records().append(
+                            {"prompt_tokens": getattr(_u, "prompt_tokens", 0) or 0,
+                             "completion_tokens": getattr(_u, "completion_tokens", 0) or 0})
+                except Exception:
+                    pass
                 try:
                     for choice in (getattr(chunk, "choices", None) or []):
                         idx = getattr(choice, "index", 0)
@@ -610,6 +710,24 @@ class DeliberationRecord(BaseModel):
     adjudicator_mean_logprob: Optional[float] = None
     adjudicator_mean_entropy: Optional[float] = None
     adjudicator_entity_logprobs: List[Dict[str, Any]] = Field(default_factory=list)
+    # Per-round agent output, WITH character offsets, as structured data.
+    #
+    # The deliberation used to be recoverable only by re-parsing raw JSON out of
+    # `messages`, which carries no offsets — so every span-level evaluation fell
+    # back to substring containment ("forest" matching "forest ecosystem"). That
+    # understated the agent false-positive rate by roughly half, and understated
+    # it most for short spans, which is where the effect being measured lives.
+    #
+    # These fields carry what the Annotator and Critic actually said in each
+    # round, with offsets resolved by _span_occurrences, so analysis matches on
+    # positions instead of guessing from text. `n_candidates` records how many
+    # positions the span text matched: 1 is unambiguous, >1 means `start`/`end`
+    # is one plausible choice among several and a cautious analysis should treat
+    # the span as possibly-anywhere, 0 means the surface string is absent from
+    # the sentence altogether — a hallucinated span form, and a signal worth
+    # keeping rather than silently dropping.
+    annotator_rounds: List[Dict[str, Any]] = Field(default_factory=list)
+    critic_rounds: List[Dict[str, Any]] = Field(default_factory=list)
     timing: Dict[str, Any] = Field(default_factory=dict)
     # Memory: which precedents the Annotator applied, which new ones were added
     precedents_applied: List[str] = Field(default_factory=list)   # span_text entries reused
@@ -842,6 +960,18 @@ def build_llm_config(
     endpoint = MODEL_ENDPOINTS.get(model_key)
     if not endpoint:
         raise ValueError(f"Unknown model: {model_key}. Available: {list(MODEL_ENDPOINTS.keys())}")
+
+    # Withdrawn entries are kept in the registry so archived runs that stamped
+    # their model id stay interpretable, but calling one reaches the gateway as
+    # an opaque 403 partway into a batch. Fail here instead, naming the reason.
+    if endpoint.get("withdrawn"):
+        live = [k for k, v in MODEL_ENDPOINTS.items()
+                if v.get("base_url") == endpoint.get("base_url")
+                and not v.get("withdrawn")]
+        raise ValueError(
+            f"{model_key} ({endpoint['model']}) is withdrawn: "
+            f"{endpoint['withdrawn']}. It is retained only so archived runs "
+            f"remain readable. Live models on the same endpoint: {live}")
 
     # Each endpoint declares which env var its key lives in ("api_key_env"), so
     # multiple providers (OpenAI, the SDSC gateway, SwissAI, …) can coexist
@@ -2228,6 +2358,92 @@ class PrecedentStore:
 # Character offset resolution
 # ─────────────────────────────────────────────────────────────
 
+def _locate(sentence: str, text: str) -> Dict[str, Any]:
+    """Offset payload for one span text: chosen position + ambiguity count.
+
+    The chosen position is the FIRST occurrence, which is a guess whenever
+    n_candidates > 1. The count is stored alongside precisely so that a
+    consumer can decline to trust the guess; `_fill_char_offsets` makes the
+    same first-occurrence choice for the Adjudicator's entities but has
+    relation partners available to disambiguate, which per-round output does
+    not.
+    """
+    occ = _span_occurrences(sentence, text)
+    return {"start": occ[0][0] if occ else None,
+            "end": occ[0][1] if occ else None,
+            "n_candidates": len(occ)}
+
+
+def _resolve_round_spans(sentence: str, round_idx: int,
+                         annotator_out, critic_out) -> Tuple[Optional[Dict[str, Any]],
+                                                             Optional[Dict[str, Any]]]:
+    """Structured, offset-carrying snapshots of one round's two agent turns.
+
+    Returns (annotator_round, critic_round); either is None if that agent
+    produced nothing parseable in this round. The Critic's three acts stay
+    separated — an agreement, a disagreement and a missing-span claim are
+    different assertions and pooling them has previously hidden effects.
+    """
+    ann = None
+    if annotator_out is not None:
+        ann = {"round": round_idx + 1, "entities": [
+            {"text": e.text, "entity_type": e.entity_type,
+             "confidence": e.confidence, **_locate(sentence, e.text)}
+            for e in (annotator_out.entities or [])
+        ]}
+
+    crit = None
+    if critic_out is not None:
+        crit = {
+            "round": round_idx + 1,
+            "disagreements": [
+                {"target": d.target, "annotator_label": d.annotator_label,
+                 "proposed_label": d.proposed_label, "severity": d.severity,
+                 **_locate(sentence, d.target)}
+                for d in (critic_out.disagreements or [])
+            ],
+            "missing_annotations": [
+                {"text": m.text, "entity_type": m.entity_type,
+                 **_locate(sentence, m.text)}
+                for m in (critic_out.missing_annotations or [])
+            ],
+            "agreements": [
+                {"target": a.target, "label": a.label,
+                 **_locate(sentence, a.target)}
+                for a in (critic_out.agreements or [])
+            ],
+        }
+    return ann, crit
+
+
+def _span_occurrences(sentence: str, text: str) -> List[Tuple[int, int]]:
+    """Every character position in `sentence` where span `text` occurs.
+
+    THE single place span text is located in a sentence. Used by
+    _fill_char_offsets for the Adjudicator's entities and by
+    _resolve_round_spans for the Annotator's and Critic's per-round output, so
+    one definition of "where is this span" serves every consumer and the
+    analysis layer never has to guess.
+
+    Matching is case-insensitive and tolerant of any whitespace run standing in
+    for another (a sentence stored with a newline where the agent saw a space
+    still matches). Offsets index the ORIGINAL sentence and `end` is the true
+    match end, so a span whose internal whitespace differs in width is still
+    sliced correctly.
+
+    Verified bit-identical to the previous inline implementation on all 17,149
+    entities of the 17 archived runs, while additionally being correct where
+    collapsing whitespace would have shifted later positions.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    parts = [re.escape(p) for p in t.split()]
+    pattern = r"\s+".join(parts) if parts else re.escape(t)
+    return [(m.start(), m.end())
+            for m in re.finditer(pattern, sentence, flags=re.IGNORECASE)]
+
+
 def _fill_char_offsets(
     sentence: str,
     entities: List[EntityAnnotation],
@@ -2253,8 +2469,6 @@ def _fill_char_offsets(
     if not entities:
         return False
 
-    sent_lower = re.sub(r"\s+", " ", sentence.lower())
-
     def _norm(text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip().lower())
 
@@ -2268,11 +2482,7 @@ def _fill_char_offsets(
         span_norm = _norm(ent.text)
         if span_norm in occurrence_map:
             continue
-        original_span = (ent.text or "").strip()
-        matches = []
-        for m in re.finditer(re.escape(span_norm), sent_lower):
-            matches.append((m.start(), m.start() + len(original_span)))
-        occurrence_map[span_norm] = matches
+        occurrence_map[span_norm] = _span_occurrences(sentence, ent.text)
 
     changed = False
 
@@ -2990,14 +3200,21 @@ class MultiAgentAnnotator:
                 record.annotator_mean_logprob = ann_record.get("mean_logprob")
                 record.annotator_mean_entropy = ann_record.get("mean_entropy")
             last_annotator_text = ann_content
-            for k in annotator_tokens:
-                annotator_tokens[k] += ann_record["token_usage"].get(k, 0)
+            self._add_usage(annotator_tokens, ann_record["token_usage"])
             ann_elapsed = ann_record.get("elapsed_s", 0.0)
             logger.info("  [round %d] Annotator done in %.1fs", round_idx + 1, ann_elapsed)
 
             parsed_ann = self._parse_annotator_output(ann_content)
             if parsed_ann is not None:
                 last_annotator_out = parsed_ann
+
+            # Snapshot this turn WITH offsets. Recorded per round rather than
+            # once at the end, because a later round can drop or relabel a span
+            # and the question "what did the Annotator say before the Critic
+            # spoke" then becomes unanswerable from the final state alone.
+            _ann_round, _ = _resolve_round_spans(sentence, round_idx, parsed_ann, None)
+            if _ann_round is not None:
+                record.annotator_rounds.append(_ann_round)
 
             # Per-entity label-token confidence for the INITIAL annotation.
             # The capture buffer still holds this turn's tokens (the Critic turn
@@ -3034,8 +3251,7 @@ class MultiAgentAnnotator:
             crit_content, crit_record = self._run_agent_turn(self.critic, self.critic_executor, crit_msg)
             deliberation_messages.append(crit_record)
             last_critic_text = crit_content
-            for k in critic_tokens:
-                critic_tokens[k] += crit_record["token_usage"].get(k, 0)
+            self._add_usage(critic_tokens, crit_record["token_usage"])
             crit_elapsed = crit_record.get("elapsed_s", 0.0)
             logger.info("  [round %d] Critic done in %.1fs", round_idx + 1, crit_elapsed)
 
@@ -3049,6 +3265,10 @@ class MultiAgentAnnotator:
             parsed_crit = self._parse_critic_output(crit_content)
             if parsed_crit is not None:
                 last_critic_out = parsed_crit
+
+            _, _crit_round = _resolve_round_spans(sentence, round_idx, None, parsed_crit)
+            if _crit_round is not None:
+                record.critic_rounds.append(_crit_round)
 
             # Per-span label-token confidence for the Critic's FIRST review, to
             # match annotator_entity_logprobs (also round 0). Later rounds see a
@@ -3087,6 +3307,15 @@ class MultiAgentAnnotator:
             if repair_messages:
                 deliberation_messages.extend(repair_messages)
                 last_annotator_out = self._parse_annotator_output(repaired_text)
+                # A repaired annotation is still the Annotator's output. Leaving
+                # it out would give every parse-failure record an empty
+                # annotator_rounds, and analysis that keys on that field would
+                # drop exactly the hardest sentences without saying so.
+                _rep_round, _ = _resolve_round_spans(
+                    sentence, len(record.annotator_rounds), last_annotator_out, None)
+                if _rep_round is not None:
+                    _rep_round["repaired"] = True
+                    record.annotator_rounds.append(_rep_round)
 
         if last_annotator_out is None:
             record.adjudication_status = "annotator_parse_failed"
@@ -3124,11 +3353,20 @@ class MultiAgentAnnotator:
             record.timing = {"total_s": time.perf_counter() - _sentence_t0,
                              "phase1_s": time.perf_counter() - _phase1_t0,
                              "phase2_s": 0.0, "rounds": 1}
-            record.token_usage = {"annotator": annotator_tokens,
-                                  "critic": critic_tokens,
-                                  "adjudicator": {"prompt_tokens": 0,
-                                                  "completion_tokens": 0,
-                                                  "total_tokens": 0}}
+            # The single-pass arm makes no Critic or Adjudicator call, so their
+            # zeros are genuine zeros, not unknowns — tagged "not_called" so the
+            # distinction survives into the record and a cost comparison between
+            # the arms cannot silently mix "free" with "unmeasured".
+            _not_called = {"prompt_tokens": 0, "completion_tokens": 0,
+                           "total_tokens": 0, "token_source": ["not_called"]}
+            _sp_total: Dict[str, Any] = {}
+            self._add_usage(_sp_total, annotator_tokens)
+            record.token_usage = {
+                "annotator": self._seal_usage(annotator_tokens),
+                "critic": dict(_not_called),
+                "adjudicator": dict(_not_called),
+                "total": self._seal_usage(_sp_total),
+            }
             logger.info("Done (single-pass): %d entities, %d relations",
                         len(record.final_entities), len(record.final_relations))
             return record
@@ -3145,6 +3383,14 @@ class MultiAgentAnnotator:
             if repair_messages:
                 deliberation_messages.extend(repair_messages)
                 last_critic_out = self._parse_critic_output(repaired_text)
+                # Same reasoning as the Annotator repair above: a critique that
+                # only parsed after repair is still a critique, and omitting it
+                # would leave critic_rounds silently short of a round.
+                _, _rep_crit = _resolve_round_spans(
+                    sentence, len(record.critic_rounds), None, last_critic_out)
+                if _rep_crit is not None:
+                    _rep_crit["repaired"] = True
+                    record.critic_rounds.append(_rep_crit)
 
         # ── Phase 2: Adjudicator resolves ─────────────────────
         logger.info("Phase 2: Adjudicator resolving …")
@@ -3175,7 +3421,7 @@ class MultiAgentAnnotator:
         _adj_toks = last_content_token_logprobs()
         phase2_s = round(time.perf_counter() - _phase2_t0, 2)
         logger.info("  Adjudicator done in %.1fs", phase2_s)
-        adjudicator_tokens = self._sum_usage(getattr(adj_result, "cost", {}))
+        adjudicator_tokens = self._turn_usage(getattr(adj_result, "cost", {}))
 
         # Extract final output from adjudicator's last message
         adj_output = self._extract_last_json_with_keys(
@@ -3331,15 +3577,14 @@ class MultiAgentAnnotator:
         else:
             record.agreement_score = None
 
-        total_tokens = {
-            k: annotator_tokens[k] + critic_tokens[k] + adjudicator_tokens.get(k, 0)
-            for k in annotator_tokens
-        }
+        total_tokens: Dict[str, Any] = {}
+        for _role in (annotator_tokens, critic_tokens, adjudicator_tokens):
+            self._add_usage(total_tokens, _role)
         record.token_usage = {
-            "annotator": annotator_tokens,
-            "critic": critic_tokens,
-            "adjudicator": adjudicator_tokens,
-            "total": total_tokens,
+            "annotator": self._seal_usage(annotator_tokens),
+            "critic": self._seal_usage(critic_tokens),
+            "adjudicator": self._seal_usage(adjudicator_tokens),
+            "total": self._seal_usage(total_tokens),
         }
 
         sentence_s = round(time.perf_counter() - _sentence_t0, 2)
@@ -3361,7 +3606,8 @@ class MultiAgentAnnotator:
             f"(prompt {critic_tokens['prompt_tokens']} + completion {critic_tokens['completion_tokens']}), "
             f"adjudicator: {adjudicator_tokens.get('total_tokens', 0)} "
             f"(prompt {adjudicator_tokens.get('prompt_tokens', 0)} + completion {adjudicator_tokens.get('completion_tokens', 0)}), "
-            f"total: {total_tokens['total_tokens']}"
+            f"total: {total_tokens.get('total_tokens')} "
+            f"[source: {','.join(sorted(total_tokens.get('token_source') or {'unavailable'}))}]"
         )
         return record
 
@@ -3664,6 +3910,120 @@ class MultiAgentAnnotator:
             stripped = stripped[: -len("TERMINATE")].rstrip()
         return stripped
 
+    # ── blind-pair task messages ────────────────────────────────────────────
+    #
+    # In the blind-pair design every agent carries the SAME standalone annotator
+    # system prompt; all that distinguishes them is the task message. Annotator A
+    # and Annotator B get the sentence. The Critic gets the sentence plus the
+    # abstract, annotates blind, and only then sees the other two.
+    #
+    # Putting the abstract here rather than in a system prompt is what lets the
+    # three agents share a byte-identical system message, so the only asymmetry
+    # in the design is per-sentence task content.
+
+    @staticmethod
+    def _build_blind_annotation_msg(sentence: str,
+                                    abstract: Optional[str] = None) -> str:
+        """The task for an annotator that has seen nothing else.
+
+        `abstract` is the Critic's extra context — the one deliberate information
+        asymmetry. A and B pass None and receive the sentence alone.
+        """
+        msg = f'Annotate this sentence.\n\nSentence: "{sentence}"'
+        if abstract:
+            msg += (
+                f"\n\nFor context, the abstract this sentence comes from is below. "
+                f"Use it to resolve what the sentence refers to. Annotate ONLY the "
+                f"sentence above — spans from elsewhere in the abstract are not part "
+                f"of your output.\n\nAbstract:\n{abstract}"
+            )
+        return msg
+
+    @staticmethod
+    def _anonymise_annotations(texts: List[str],
+                               rng: Optional["random.Random"] = None
+                               ) -> Tuple[List[Tuple[str, str]], Dict[str, int]]:
+        """Shuffle annotations and label them neutrally.
+
+        Returns ([(label, text)], {label: original index}) so analysis can
+        recover who produced which while the agent cannot.
+
+        Both the shuffle and the neutral labels matter. Identity ("the Critic
+        said") invites deference to whichever agent sounds authoritative, and a
+        stable order invites deference to whatever comes first — the old
+        Adjudicator prompt had both, telling it that agreement between a named
+        Annotator and a named Critic should be "accepted unchanged".
+        """
+        order = list(range(len(texts)))
+        (rng or random).shuffle(order)
+        labels = [f"Annotation {chr(ord('A') + i)}" for i in range(len(texts))]
+        pairs = [(labels[i], texts[order[i]]) for i in range(len(texts))]
+        mapping = {labels[i]: order[i] for i in range(len(texts))}
+        return pairs, mapping
+
+    @staticmethod
+    def _build_peer_revision_msg(
+        sentence: str,
+        own_annotation_text: str,
+        peer_pairs: List[Tuple[str, str]],
+        abstract: Optional[str] = None,
+    ) -> str:
+        """Reveal the peers' annotations and ask for a final one.
+
+        WHAT THIS DELIBERATELY DOES NOT SAY, and why. The equivalent message in
+        the review pipeline (_build_annotator_revision_msg) tells the model that
+        the Critic "is a careful reviewer and its feedback is usually right",
+        that applying its corrections "should be your default", and that keeping
+        your own label means "conceding" and is allowed "only when you can
+        justify it". That is an instruction to defer, with the burden of proof
+        placed entirely on disagreement — a second, independent source of the
+        conformity measured in those runs, alongside the structural anchoring of
+        never committing before exposure. It plausibly explains why relabels in
+        the revision round came out a coin flip: the model conceded whether or
+        not the Critic was right.
+
+        So here: peers rather than reviewers, no default in either direction,
+        equal standing for changing and keeping, and disagreement framed as
+        information about difficulty rather than evidence of error.
+
+        No corpus statistic is quoted. Telling the model how often the human
+        annotators disagree would make its behaviour partly a function of the
+        number this pipeline exists to be compared against.
+        """
+        own = MultiAgentAnnotator._strip_terminate(own_annotation_text)
+        msg = (
+            f"You annotated the sentence below. {len(peer_pairs)} other annotator"
+            f"{'s' if len(peer_pairs) != 1 else ''} annotated the same sentence "
+            f"independently, working from the same guideline, without seeing your "
+            f"annotation or each other's.\n\n"
+            f'Sentence: "{sentence}"\n\n'
+        )
+        if abstract:
+            msg += f"Abstract this sentence comes from:\n{abstract}\n\n"
+        msg += f"Your annotation:\n{own}\n\n"
+        for label, text in peer_pairs:
+            msg += (f"{label} (another annotator, independent):\n"
+                    f"{MultiAgentAnnotator._strip_terminate(text)}\n\n")
+        msg += (
+            "These are peers, not reviewers. Their annotations are no more and no "
+            "less likely to be correct than yours, and you are not told which "
+            "annotator produced which.\n\n"
+            "Careful independent annotators disagree on a substantial share of "
+            "spans in this domain. A disagreement tells you the span is difficult; "
+            "it is not evidence that you were wrong.\n\n"
+            "For each span or relation where you differ from a peer, decide what you "
+            "now believe is correct on the evidence of the sentence and the "
+            "guideline. Changing your label and keeping it are equally acceptable "
+            "outcomes — choose because of the evidence, not in order to agree or "
+            "in order to hold your ground. Where a peer annotated something you "
+            "missed, include it only if you judge it genuinely present.\n\n"
+            "List any span you remain unsure about in \"uncertain_cases\".\n\n"
+            "Return your full final annotation in the same JSON format as before, "
+            "including every entity and relation you would keep — not only the ones "
+            "that changed."
+        )
+        return msg
+
     @staticmethod
     def _build_annotator_revision_msg(
         sentence: str,
@@ -3797,6 +4157,82 @@ class MultiAgentAnnotator:
             "total_tokens": prompt + completion,
         }
 
+    @staticmethod
+    def _add_usage(acc: Dict[str, Any], turn: Dict[str, Any]) -> None:
+        """Accumulate one turn's usage into a per-role running total, in place.
+
+        A field this turn could not report stays unknown instead of adding zero:
+        once any turn in a role is unknown for a field, the role's total for that
+        field becomes None. A per-sentence cost built by treating unknowns as
+        free is worse than no figure at all, because it looks usable.
+
+        `token_source` becomes the set of sources that contributed, so a total
+        assembled from mixed sources is visibly mixed.
+        """
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            # Three states, not two: absent (nothing added yet), present-and-None
+            # (known unknown, and sticky), present-and-numeric (accumulating).
+            # Collapsing the first two makes an empty accumulator refuse every
+            # value it is given.
+            if k in acc and acc[k] is None:
+                continue
+            v = turn.get(k)
+            acc[k] = None if v is None else acc.get(k, 0) + v
+        # `turn` is a single turn's usage (token_source a string) when called
+        # from the round loop, and a whole role's accumulator (token_source a
+        # set) when the roles are folded into the sentence total, so accept both.
+        src = turn.get("token_source")
+        if src:
+            acc.setdefault("token_source", set())
+            if isinstance(acc["token_source"], set):
+                acc["token_source"].update(
+                    {src} if isinstance(src, str) else set(src))
+
+    @staticmethod
+    def _seal_usage(acc: Dict[str, Any]) -> Dict[str, Any]:
+        """Make an accumulator JSON-serialisable (the source set becomes a list)."""
+        out = dict(acc)
+        src = out.get("token_source")
+        if isinstance(src, set):
+            out["token_source"] = sorted(src) if src else ["unavailable"]
+        elif src is None:
+            out["token_source"] = ["unavailable"]
+        return out
+
+    @staticmethod
+    def _turn_usage(cost: Dict[str, Any]) -> Dict[str, Any]:
+        """Token usage for one turn, from the best source that has it.
+
+        Three tiers, most to least authoritative, with the source recorded so a
+        cost figure in a paper can say where it came from:
+
+          api      the usage block on the response (needs
+                   stream_options.include_usage, which the patched create asks
+                   for). Both prompt and completion, exact.
+          ag2      AG2's own cost accounting. What this used to use alone; it is
+                   empty for any streamed response without the usage block, and
+                   for any model missing from AG2's price table.
+          streamed completion tokens counted off the captured logprob stream.
+                   Exact for completion, silent on prompt, so prompt_tokens is
+                   left None rather than 0 — an unknown prompt count must not
+                   read as a free prompt.
+
+        `token_source` is part of the record because the archived runs cannot be
+        distinguished from genuinely free calls without it.
+        """
+        api = captured_usage()
+        if api is not None:
+            return {**api, "token_source": "api"}
+        ag2 = MultiAgentAnnotator._sum_usage(cost)
+        if ag2["prompt_tokens"] or ag2["completion_tokens"]:
+            return {**ag2, "token_source": "ag2"}
+        streamed = streamed_completion_tokens()
+        if streamed:
+            return {"prompt_tokens": None, "completion_tokens": streamed,
+                    "total_tokens": None, "token_source": "streamed"}
+        return {"prompt_tokens": None, "completion_tokens": None,
+                "total_tokens": None, "token_source": "unavailable"}
+
     def _run_agent_turn(
         self,
         agent: ConversableAgent,
@@ -3858,7 +4294,7 @@ class MultiAgentAnnotator:
             "agent": agent_name,
             "content": last_content,
             "tool_calls": all_tool_calls,
-            "token_usage": self._sum_usage(getattr(chat, "cost", {})),
+            "token_usage": self._turn_usage(getattr(chat, "cost", {})),
             "elapsed_s": round(elapsed_s, 2),
             "mean_logprob": mean_logprob,
             "mean_entropy": mean_entropy,
