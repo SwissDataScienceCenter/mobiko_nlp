@@ -405,7 +405,13 @@ def _re_current_paths():
     return run_path, latest_path
 
 
-def _maybe_autosave_re(model, keys):
+def _maybe_autosave_re(model, keys, touched: bool = True):
+    """Write the snapshot. `touched` marks the sentence on screen as the last
+    one annotated; it is False for saves that are bookkeeping rather than an
+    edit (consolidating merged sessions), which happen on whatever sentence
+    the page opened on."""
+    if touched:
+        _mark_last_annotated(keys)
     run_path, latest_path = _re_current_paths()
     if not run_path or not latest_path:
         return
@@ -469,6 +475,9 @@ def _record_run(save_dir: str):
     entry["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     entry["relations"] = sum(
         len(v) for v in st.session_state.get("rel_gold", {}).values())
+    last = st.session_state.get("re_last_key")
+    if last is not None:
+        entry["last_key"] = list(last)
     try:
         _atomic_write_re(
             json.dumps({"runs": runs}, ensure_ascii=False, indent=1),
@@ -478,6 +487,34 @@ def _record_run(save_dir: str):
         # The index is an optimisation, not the data: losing it costs a
         # redundant merge next time, never an annotation.
         pass
+
+
+# ------------------------------------------------------------------ #
+#  Last annotated sentence                                            #
+# ------------------------------------------------------------------ #
+#  So an annotator coming back to a file — or one who wandered off with
+#  Prev/Next to look at context — can find where they stopped.  Kept in
+#  session state while working and in the run index across sessions;
+#  a resumed run inherits it until its own first edit replaces it.
+# ------------------------------------------------------------------ #
+
+def _mark_last_annotated(keys: List[Tuple]):
+    idx = st.session_state.get("re_sentence_idx")
+    if isinstance(idx, int) and 0 <= idx < len(keys):
+        st.session_state.re_last_key = keys[idx]
+
+
+def _last_annotated_from_index(save_dir: str, keys: List[Tuple]) -> Optional[Tuple]:
+    """The sentence of the most recently saved run that recorded one, if it
+    is still in this file. Runs from before this was recorded have none."""
+    by_list = {tuple(k): k for k in keys}
+    best_at, best = "", None
+    for entry in _load_runs_index(save_dir).values():
+        last = entry.get("last_key")
+        at = str(entry.get("saved_at", ""))
+        if isinstance(last, list) and tuple(last) in by_list and at >= best_at:
+            best_at, best = at, by_list[tuple(last)]
+    return best
 
 
 def _merged_run_ids(save_dir: str) -> set:
@@ -2028,7 +2065,9 @@ def _render_jump_to_graph():
     )
 
 
-def _render_graph(cur_key: Tuple, rels: List[Dict]):
+def _render_graph(cur_key: Tuple, rels: List[Dict], text: str = "",
+                  spans: List[Dict] | None = None,
+                  hints: List[Dict] | None = None):
     """Small read-only picture of the sentence's triplets, under everything else.
 
     Read-only on purpose: the lists above are where annotation happens, and a
@@ -2044,6 +2083,15 @@ def _render_graph(cur_key: Tuple, rels: List[Dict]):
     # the #### size the rest of the page's section headings use.
     st.markdown(f'<div id="{_GRAPH_ANCHOR}"></div>', unsafe_allow_html=True)
     st.markdown("#### Graph")
+    # The sentence again, so the graph can be read against it without
+    # scrolling back up past the triplets. No coref glosses: this copy is for
+    # reading the arguments, and the toggle and breakdown live with the first.
+    if text:
+        if hasattr(st, "html"):
+            st.html(_build_entity_html(text, spans or [], hints))
+        else:
+            st.components.v1.html(_build_entity_html(text, spans or [], hints),
+                                  height=120, scrolling=True)
     try:
         # use_container_width=False so the chart is drawn at the size the DOT
         # asks for. With it on, Streamlit stretches the SVG to the full column
@@ -2052,6 +2100,34 @@ def _render_graph(cur_key: Tuple, rels: List[Dict]):
         st.graphviz_chart(_graph_dot(cur_key, rels), use_container_width=False)
     except Exception as exc:                      # pragma: no cover - display only
         st.caption(f"Could not draw the graph: {exc}")
+
+
+def _render_last_annotated(keys: List[Tuple]):
+    """One line under the navigation: where the last edit was made, with a
+    button back there when the annotator is looking at another sentence."""
+    last = st.session_state.get("re_last_key")
+    if last not in keys:
+        return
+    pos = keys.index(last)
+    if pos == st.session_state.re_sentence_idx:
+        st.markdown(
+            '<div style="text-align:center;font-size:12px;color:#1D9E75">'
+            '● You annotated this sentence last</div>',
+            unsafe_allow_html=True,
+        )
+        return
+    c_txt, c_btn = st.columns([5, 2])
+    with c_txt:
+        st.markdown(
+            f'<div style="text-align:right;font-size:12px;color:#888;'
+            f'padding-top:8px">Last annotated: sentence <b>{pos + 1}</b> '
+            f'({html_mod.escape(str(last[0]))} · sentence {last[1]})</div>',
+            unsafe_allow_html=True,
+        )
+    with c_btn:
+        if st.button(f"↪ Go to sentence {pos + 1}", key="re_goto_last"):
+            _goto_sentence(pos)
+            st.rerun()
 
 
 def _render_sentence_comment(model: Dict, keys: List[Tuple], cur_key: Tuple):
@@ -2420,7 +2496,7 @@ def _render_legacy_import(model: Dict, keys: List[Tuple]):
         st.session_state.re_resume_stats = stats
         # Those runs are now inside this one, so they are not merged again.
         st.session_state.re_run_parents = stats["sources"]
-        _maybe_autosave_re(model, keys)   # now under this annotator's name
+        _maybe_autosave_re(model, keys, touched=False)   # now under this annotator's name
         st.rerun()
 
 
@@ -2523,7 +2599,14 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
         st.session_state.pop("re_resume_note", None)
         st.session_state.pop("re_resume_stats", None)
         st.session_state.re_run_parents = []
+        st.session_state.pop("re_last_key", None)
         _goto_sentence(0)   # also remounts 'Jump to', whose max is now this file's
+        # Reopen where the annotator stopped rather than on sentence 1.
+        last = _last_annotated_from_index(
+            st.session_state.get("re_upload_dir"), keys)
+        if last is not None:
+            st.session_state.re_last_key = last
+            _goto_sentence(keys.index(last))
 
         # Every session whose work is not already inside a newer one, merged
         # oldest first: sessions from before resuming existed each hold only
@@ -2551,7 +2634,7 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                     _init_ent_state(model, keys)
                     _init_rel_state(keys, model, seed_from_file=triplet_mode)
                     _init_comment_state(model, keys)
-                    _maybe_autosave_re(model, keys)
+                    _maybe_autosave_re(model, keys, touched=False)
 
     _init_ent_state(model, keys)
     _init_rel_state(keys, model, seed_from_file=triplet_mode)
@@ -2604,6 +2687,8 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                      disabled=st.session_state.re_sentence_idx == len(keys) - 1):
             _goto_sentence(st.session_state.re_sentence_idx + 1)
             st.rerun()
+
+    _render_last_annotated(keys)
 
     idx = st.session_state.re_sentence_idx
     cur_key = keys[idx]
@@ -2992,7 +3077,8 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
     # where the picture would be of work in progress rather than of something
     # to review.
     if triplet_mode:
-        _render_graph(cur_key, st.session_state.rel_gold.get(cur_key, []))
+        _render_graph(cur_key, st.session_state.rel_gold.get(cur_key, []),
+                      text, _cur_spans(cur_key), hints)
 
     _render_back_to_top()
 
