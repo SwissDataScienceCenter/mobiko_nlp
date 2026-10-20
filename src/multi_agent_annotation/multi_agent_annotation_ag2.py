@@ -2679,6 +2679,7 @@ class MultiAgentAnnotator:
         deliberation_mode: str = "review",
         guideline_search_enabled: bool = True,
         context_radius: int = 1,
+        nested_spans: bool = False,
     ):
         # deliberation_mode selects the whole pipeline shape.
         #
@@ -2703,6 +2704,21 @@ class MultiAgentAnnotator:
         self.deliberation_mode = deliberation_mode
         self.guideline_search_enabled = guideline_search_enabled
         self.context_radius = context_radius
+        # Whether a span wholly containing another counts as the SAME mention
+        # when the blind-pair vote clusters annotations.
+        #
+        # IoU alone penalises nesting: 'America' (10,17) inside 'Corporate
+        # America' (0,17) scores 0.41 and does not merge at the usual 0.5
+        # threshold, so one mention annotated at two granularities is recorded as
+        # two mentions each missing from some annotators — a detection
+        # disagreement where the real dispute is extent and type.
+        #
+        # Right for CoNLL, where a name is a name. NOT obviously right for
+        # MoBiKo, where 'species richness' inside 'centres of species richness'
+        # may be two legitimately distinct annotatable entities. So it is an
+        # explicit setting rather than inferred from the corpus, and it is
+        # stamped into run_meta because it changes what the vote counts.
+        self.nested_spans = nested_spans
         self.max_rounds = max_rounds
         self._input_path = Path(input_path) if input_path else None
         self.use_precedent_memory = use_precedent_memory
@@ -2990,8 +3006,10 @@ class MultiAgentAnnotator:
         # and all three *_coldstart variants have their own signatures and would
         # raise on it — so it is passed where it is understood rather than
         # unioned onto everything.
+        # Both prompt sets now take the parameter; only the three *_coldstart
+        # variants do not, and passing it to them raises.
         _gs_kwargs = ({"guideline_search_enabled": guideline_search_enabled}
-                      if (prompt_set != "conll" and not cold_start) else {})
+                      if not cold_start else {})
         if cold_start and not guideline_search_enabled:
             logger.warning(
                 "guideline_search_enabled=False is ignored under cold_start: the "
@@ -3107,6 +3125,7 @@ class MultiAgentAnnotator:
             deliberation_mode=deliberation_mode,
             guideline_search_enabled=guideline_search_enabled,
             context_radius=context_radius,
+            nested_spans=nested_spans,
             strict_critic=strict_critic,
             cold_start=cold_start,
             use_precedent_memory=use_precedent_memory,
@@ -3203,6 +3222,9 @@ class MultiAgentAnnotator:
             # agreement number is only comparable to the two-human ceiling under
             # the humans' condition, and theirs was +/-1.
             "context_radius": cfg.get("context_radius"),
+            # Changes what the majority vote treats as one mention, so two runs
+            # differing only on this are not comparable.
+            "nested_spans": bool(cfg.get("nested_spans")),
             "annotator_prompt": cfg.get("annotator_prompt"),
             "annotator_prompt_requested": cfg.get("annotator_prompt_requested"),
             "annotator_prompt_fn": cfg.get("annotator_prompt_fn"),
@@ -3258,6 +3280,14 @@ class MultiAgentAnnotator:
         non-exchangeable and put a context confound on the
         Adjudicator-vs-majority comparison.
         """
+        if self.context_radius == 0:
+            # Sentence-only by request. This is the matched condition for a
+            # corpus whose annotators saw one sentence at a time with no
+            # navigation — CoNLL-MTurk was crowdsourced per sentence — so it is
+            # a deliberate setting, not a degraded fallback, and must not drag in
+            # MoBiKo's abstracts or warn about missing them.
+            return {"before": [], "after": [], "window": sentence,
+                    "n_before": 0, "n_after": 0}
         if getattr(self, "_ctx_window", None) is None:
             try:
                 from abstract_context import ContextWindow
@@ -3421,7 +3451,8 @@ class MultiAgentAnnotator:
         unresolved = sum(1 for spans in triple for e in spans
                          if e["start"] is None)
         voted = _vote([[e for e in spans if e["start"] is not None]
-                       for spans in triple], n_annotators=3)
+                       for spans in triple], n_annotators=3,
+                      nested=self.nested_spans)
 
         # ── 6. Adjudicator on the contested mentions ──
         adj_pairs, adj_map = self._anonymise_annotations(

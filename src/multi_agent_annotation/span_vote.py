@@ -126,7 +126,8 @@ def cluster_mentions(annotations: Sequence[List[Dict[str, Any]]],
 def vote(annotations: Sequence[List[Dict[str, Any]]],
          n_annotators: Optional[int] = None,
          threshold: float = 0.5,
-         min_support: Optional[int] = None) -> Dict[str, Any]:
+         min_support: Optional[int] = None,
+         nested: bool = False) -> Dict[str, Any]:
     """Majority vote over independent annotations of one sentence.
 
     min_support defaults to a simple majority of annotators (2 of 3). A mention
@@ -147,7 +148,7 @@ def vote(annotations: Sequence[List[Dict[str, Any]]],
     out_entities: List[Dict[str, Any]] = []
     records: List[Dict[str, Any]] = []
 
-    for m in cluster_mentions(annotations, threshold):
+    for m in cluster_mentions(annotations, threshold, nested):
         producers = sorted({ai for ai, _ in m})
         extents = Counter((sp["start"], sp["end"]) for _, sp in m)
         types = Counter(sp.get("entity_type") for _, sp in m
@@ -193,7 +194,7 @@ def vote(annotations: Sequence[List[Dict[str, Any]]],
         "mentions": records,
         "contested": [r for r in records if r["contested_reasons"]],
         "rule": {"min_support": need, "n_annotators": n,
-                 "iou_threshold": threshold},
+                 "iou_threshold": threshold, "nested": nested},
     }
 
 

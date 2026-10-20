@@ -89,24 +89,62 @@ Iraqi, British) and named events and competitions (World Cup, World War II).
 are not entities."""
 
 
+# The two framings, written out and selected rather than regex-substituted out
+# of the rendered text afterwards — the same change made in prompts.py, for the
+# same reason: the old approach left this file reading as the opposite of what it
+# sent to a standalone annotator, and the substitution silently stopped working
+# if anyone reworded the matched paragraph.
+_FRAMING_PIPELINE = (
+    "You are Annotator, a named-entity annotation expert working on English newswire. "
+    "Your primary objective is MAXIMUM COVERAGE: identify and annotate every named "
+    "entity in the given sentence. It is far better to over-annotate than to miss "
+    "entities — the Critic will filter errors later."
+)
+_FRAMING_STANDALONE = (
+    "You are Annotator, a named-entity annotation expert working on English newswire, "
+    "producing the FINAL annotation of a sentence. No reviewer will see your output "
+    "and no one will correct it, so it must stand on its own. Annotate the named "
+    "entities you believe are genuinely present, and do not annotate spans you would "
+    "not defend if challenged."
+)
+_STEP1_PIPELINE = ("1. Read the sentence carefully and identify ALL named entities "
+                   "— err on the side of inclusion.")
+_STEP1_STANDALONE = ("1. Read the sentence carefully and identify the named entities "
+                     "it contains.")
+_COVERAGE_PREFER_MORE = ("- Prefer more entities over fewer: if a span could plausibly "
+                         "be a named entity, include it.\n")
+
+
 def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                           guideline_search_mandatory: bool = True,
-                          include_relation_schema: bool = True) -> str:
+                          include_relation_schema: bool = True,
+                          guideline_search_enabled: bool = True,
+                          standalone: bool = False) -> str:
     gs_step = (
         "2. For EACH candidate span, you MUST call guideline_search with the span text before "
         "assigning its type. Do NOT assign an entity type you have not checked against the "
         "guideline. All valid types are listed in the Entity Type Schema above."
-        if guideline_search_mandatory else
+        if (guideline_search_enabled and guideline_search_mandatory) else
         "2. When a span's type is unclear or borderline, call guideline_search to retrieve the "
         "relevant rule before assigning its type. All valid types are listed in the Entity Type "
         "Schema above."
+        if guideline_search_enabled else
+        "2. Assign each span's type by applying the Labelling Decision Table above. It is "
+        "reproduced in full — there is nothing further to retrieve. All valid types are listed "
+        "in the Entity Type Schema above."
     )
+    # guideline_search is the ONLY tool this prompt offers, so with it disabled the
+    # heading would introduce an empty list. Drop the whole section.
+    tools_section = ("## Available Tools\n"
+                     "- guideline_search    : retrieve the exact guideline rule "
+                     "that applies to a span/type\n\n"
+                     if guideline_search_enabled else "")
+    framing = _FRAMING_STANDALONE if standalone else _FRAMING_PIPELINE
+    step1 = _STEP1_STANDALONE if standalone else _STEP1_PIPELINE
+    prefer_more = "" if standalone else _COVERAGE_PREFER_MORE
     relation_schema_section = _relation_schema_section(relation_schema, include_relation_schema)
     return f"""\
-You are Annotator, a named-entity annotation expert working on English newswire. \
-Your primary objective is MAXIMUM COVERAGE: identify and annotate every named entity \
-in the given sentence. It is far better to over-annotate than to miss entities — the \
-Critic will filter errors later.
+{framing}
 
 ## Entity Type Schema
 {entity_schema}
@@ -114,17 +152,13 @@ Critic will filter errors later.
 {relation_schema_section}## Labelling Decision Table
 {guideline}
 
-## Available Tools
-- guideline_search    : retrieve the exact guideline rule that applies to a span/type
-
-## Process
-1. Read the sentence carefully and identify ALL named entities — err on the side of inclusion.
+{tools_section}## Process
+{step1}
 {gs_step}
 3. Fix each span's extent using the boundary rules below before you record it.
 
 ## Coverage Rules
-- Prefer more entities over fewer: if a span could plausibly be a named entity, include it.
-- Every mention counts. If the same name appears twice in the sentence, annotate both.
+{prefer_more}- Every mention counts. If the same name appears twice in the sentence, annotate both.
 
 {_SPAN_RULES}
 
@@ -381,35 +415,123 @@ def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relati
 
 def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_schema: dict,
                                guideline_search_mandatory: bool = True,
-                               include_relation_schema: bool = True) -> str:
-    """Single-pass annotator for CoNLL: no Critic, no Adjudicator, output is final.
+                               include_relation_schema: bool = True,
+                               guideline_search_enabled: bool = True) -> str:
+    """Standalone annotator for CoNLL: no reviewer, output is final.
 
-    Same reasoning as prompts._annotator_system_msg_solo -- the pipeline annotator
-    is told to favour coverage because something downstream prunes, which makes it
-    the wrong prompt for a system running alone. Built from this module's own
-    annotator message so the CoNLL boundary rules and category confusions are
-    preserved, with only the coverage framing replaced.
+    Used by the single-pass arm and by the blind-pair pipeline, where both
+    Annotators and the Critic are independent annotators sharing one prompt.
+
+    Selects standalone=True on the shared body rather than regex-substituting
+    the coverage framing out of the rendered text, which is what this did
+    before. That substitution had to match the RENDERED string because the
+    source f-string uses line continuations — a fragility noted in its own
+    comment — and it would silently stop working the moment anyone reworded the
+    paragraph, handing two "independent" annotators a mandate to over-produce.
+    Two annotators told to over-produce disagree because they were instructed
+    to, which makes their agreement incomparable to a human ceiling.
     """
-    base = _annotator_system_msg(guideline, entity_schema, relation_schema,
-                                 guideline_search_mandatory=guideline_search_mandatory,
-                                 include_relation_schema=include_relation_schema)
-    # Replace against the RENDERED text: the source f-string uses line-continuation
-    # backslashes, so the opening paragraph is one long line at runtime and a
-    # multi-line match silently fails.
-    base = re.sub(
-        r"You are Annotator, a named-entity annotation expert working on English "
-        r"newswire\. Your primary objective is MAXIMUM COVERAGE.*?Critic will filter "
-        r"errors later\.",
-        "You are Annotator, a named-entity annotation expert working on English newswire, "
-        "producing the FINAL annotation of a sentence. No reviewer will see your output and "
-        "no one will correct it, so it must stand on its own. Annotate the named entities you "
-        "believe are genuinely present, and do not annotate spans you would not defend if "
-        "challenged.",
-        base, flags=re.S)
-    base = base.replace(
-        "## Coverage Rules\n"
-        "- Prefer more entities over fewer: if a span could plausibly be a named entity, include it.\n"
-        "- Every mention counts. If the same name appears twice in the sentence, annotate both.",
-        "## Coverage Rules\n"
-        "- Every mention counts. If the same name appears twice in the sentence, annotate both.")
-    return base
+    return _annotator_system_msg(
+        guideline, entity_schema, relation_schema,
+        guideline_search_mandatory=guideline_search_mandatory,
+        include_relation_schema=include_relation_schema,
+        guideline_search_enabled=guideline_search_enabled,
+        standalone=True)
+
+
+def _adjudicator_system_msg_blind(guideline: str, entity_schema: str,
+                                  relation_schema: dict,
+                                  include_relation_schema: bool = True,
+                                  guideline_search_enabled: bool = False) -> str:
+    """Adjudicator for the blind-pair pipeline on CoNLL.
+
+    Sibling of _adjudicator_system_msg, parallel to prompts.
+    _adjudicator_system_msg_blind, and NOT a modification of it: the review
+    pipeline's Adjudicator prompt is written around a Critic review with
+    "disagreements" and "missing_annotations" lists that the blind pipeline never
+    produces, and its rule "if the Critic did not dispute a span, keep the
+    Annotator's label exactly" would then read as CHANGE NOTHING on exactly the
+    spans it was called to decide.
+
+    WHAT DIFFERS FROM THE MoBiKo SIBLING, and only what the corpus forces:
+      * newswire named entities rather than biodiversity spans
+      * CoNLL boundary conventions (whole proper name, possessive excluded,
+        titles excluded) rather than MoBiKo's minimal head noun phrase
+      * "final_relations" is always empty — CoNLL-2003 annotates no relations.
+        The MoBiKo prompt's rule that an unlinked entity is probably a false
+        positive is NOT carried over: on a corpus with no relations it would
+        instruct the Adjudicator to delete every entity it was given.
+
+    The absence of any instruction to prefer agreement is deliberate and shared
+    with the MoBiKo sibling. The annotations are unlabelled and shuffled, so
+    there is no first speaker to defer to; and an Adjudicator told that agreement
+    means accept-unchanged would simply ratify the majority, which is computed
+    for free and needs no model call to reproduce.
+    """
+    relation_schema_section = _relation_schema_section(relation_schema,
+                                                       include_relation_schema)
+    tools_section = ("## Available Tools\n"
+                     "- guideline_search   : retrieve the exact guideline rule "
+                     "that applies to a disputed span\n\n"
+                     if guideline_search_enabled else "")
+    return f"""\
+You are Adjudicator, the final decision-maker for named-entity annotation of \
+English newswire.
+
+Several annotators labelled the same sentence INDEPENDENTLY, working from the \
+same guideline, without seeing each other's work. You are shown their \
+annotations without being told which annotator produced which, and a list of the \
+specific spans they did not agree on. Your job is to decide those spans.
+
+## Entity Type Schema
+{entity_schema}
+
+{relation_schema_section}## Labelling Guideline
+{guideline}
+
+{tools_section}## Decision Rules
+1. Decide each contested span on the evidence of the sentence and the guideline. \
+How many annotators chose a label is NOT the deciding consideration: a count is \
+already available without you, and reproducing it adds nothing. Where the \
+guideline settles the question, follow it even against every annotator.
+2. The annotations are unlabelled and their order is randomised. Do not treat any \
+of them as the primary or default answer, and do not reason about which annotator \
+produced which.
+3. Spans the annotators agreed on are not in the contested list. Carry them \
+through unchanged — you are deciding disagreements, not re-annotating the sentence.
+4. Where the disagreement is about TYPE, apply the guideline's distinctions \
+directly; LOC/ORG/MISC is where annotators disagree most, so check which reading \
+the sentence actually supports rather than which label is more common.
+5. Where the disagreement is about whether a span is a named entity at all, \
+decide whether the guideline supports annotating it. Omitting it is a legitimate \
+decision.
+6. Where a span's EXTENT is disputed, apply the CoNLL boundary rules: the whole \
+proper name, the possessive marker excluded, titles and honorifics excluded.
+7. Genuine ambiguity the guideline does not settle -> include your best judgement \
+AND list the span in "flagged_for_human_review". A flag is not a failure; it is \
+the correct output when the guideline is silent.
+8. Copy every span any annotator listed in "uncertain_cases" into \
+"flagged_for_human_review".
+
+## Output
+
+Return a JSON object with exactly these fields, then end your message with TERMINATE on its own line:
+{{
+  "final_entities": [
+    {{"text": "Reuters", "entity_type": "ORG", "confidence": 0.9, "reasoning": "..."}}
+  ],
+  "final_relations": [],
+  "disagreement_resolutions": [
+    {{"issue": "annotators split on the type of X", "decision": "X is ORG", "rationale": "the guideline says..."}}
+  ],
+  "flagged_for_human_review": ["span text the guideline does not settle"]
+}}
+
+"final_entities" must be the COMPLETE annotation of the sentence: the spans the \
+annotators agreed on, plus your decisions on the contested ones.
+
+Output rules:
+- Return JSON only, then TERMINATE.
+- "final_relations" must always be the empty list: this corpus annotates no relations.
+- Do not reproduce the prior transcript.
+"""
