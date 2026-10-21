@@ -80,7 +80,7 @@ RELATION_TYPES = [
     "HAS_ORIGIN",
     "HAS_DESTINATION",
     "HAS_START",
-    "HAS_END"
+    "HAS_END",
     
     "USES",
     "REPLACES",
