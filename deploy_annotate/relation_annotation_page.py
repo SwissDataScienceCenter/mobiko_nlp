@@ -68,42 +68,41 @@ import streamlit as st
 # deploy_annotate/tests/test_relation_types_match_guide.py fails if the two drift.
 RELATION_TYPES = [
     "HAS_PROPERTY",
+    "HAS_PROCESS",
     "HAS_ROLE",
     "HAS_VALUE",
+
     "SUBSET_OF",
     "PART_OF",
     "LOCATED_IN",
-    "ASSOCIATED_WITH",
+    "OCCURS_DURING",
+
+    "HAS_ORIGIN",
+    "HAS_DESTINATION",
+    "HAS_START",
+    "HAS_END"
+    
     "USES",
-    "CAUSES",
-    "AFFECTS",
-    "ENABLES",
-    "INTERACTS_WITH",
-    "DEPENDS_ON",
-    "PARTICIPATES_IN",
     "REPLACES",
-    "SEPARATES",
+    "INDICATES",
+
+    "ASSOCIATED_WITH",
     "CORRELATES_WITH",
+    "INCREASES_WITH",
+    "DECREASES_WITH",
+
     "GREATER_THAN",
     "LESS_THAN",
     "SIMILAR_TO",
     "SAME_AS",
     "DIFFERS_FROM",
-    "OCCURS_DURING",
-    "HAS_ORIGIN",
-    "HAS_DESTINATION",
-    "STARTS",
-    "ENDS",
-    "INDICATES",
-    "VARIES_WITH",
-    "ADDING_TO",
-    "RESPONDS_TO",
-    "INCREASES_WITH",
-    "LOCATED_BY",
-    "HAS_PROCESS",
-    "OBSERVED",
-    "DOMINATES",
-    "REQUIRES"
+
+    "PARTICIPATES_IN",
+    "INTERACTS_WITH",
+    "CAUSES",
+    "AFFECTS",
+    "ENABLES",
+    "OBJECT_OF"
 ]
 
 
@@ -111,8 +110,10 @@ RELATION_TYPES = [
 #  sentence states that the relation does NOT hold.  Free additions are kept
 #  for the rest of the session, like custom relation types.
 RELATION_PROPERTIES = [
-    "Negative_polarity",
     "Negation",
+    "Negative_polarity",
+    "Exclusive",
+    "Dominance",
 ]
 
 RE_SAVE_DIR = "/mydata/mobiko/anisia/data/aug_runs"
@@ -781,6 +782,9 @@ class _SentenceMerge:
                 # copy has is kept.
                 if rel.get("property"):
                     kept["property"] = rel["property"]
+                # Doubt raised in either copy is kept.
+                if rel.get("uncertain"):
+                    kept["uncertain"] = True
                 if rel.get("uid"):
                     rel_uid_map[rel["uid"]] = kept_uid
                 deduped += 1
@@ -842,6 +846,7 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
     rel_store = st.session_state.setdefault("rel_gold", {})
     merges: Dict[Tuple, _SentenceMerge] = {}
     restored_comments: Dict[Tuple, str] = {}
+    restored_flags: Dict[str, Dict[Tuple, bool]] = {f: {} for f in SENTENCE_FLAGS}
     stats = {"sentences": 0, "relations": 0, "added": 0, "edited": 0,
              "skipped": 0, "deduped": 0, "comments": 0, "files": [], "sources": []}
 
@@ -868,6 +873,13 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
             # concatenated would read as one garbled note.
             if rec.get("comment"):
                 restored_comments[key] = str(rec["comment"])
+            # OR, not newest-wins: the heads merged here are sessions that ran
+            # side by side (a resumed session supersedes its parents, so
+            # those are never merged), and a sentence confirmed in either was
+            # confirmed — the same union relations get.
+            for flag in SENTENCE_FLAGS:
+                restored_flags[flag][key] = (restored_flags[flag].get(key, False)
+                                             or bool(rec.get(flag)))
             uid_map = merge.add_spans(rec.get("spans") or [], run)
             added, deduped = merge.add_relations(
                 rec.get("relations") or [], uid_map, run)
@@ -901,6 +913,9 @@ def _restore_re_progress(model: Dict, keys: List[Tuple],
     for key, comment in restored_comments.items():
         comment_store[key] = comment
     stats["comments"] = len(restored_comments)
+    for flag in SENTENCE_FLAGS:
+        _flag_store(flag).update(restored_flags[flag])
+    stats["confirmed"] = sum(restored_flags["confirmed"].values())
     return stats
 
 
@@ -1130,6 +1145,50 @@ def _init_comment_state(model: Dict, keys: List[Tuple]):
     store = st.session_state.setdefault("re_comments", {})
     for k in keys:
         store.setdefault(k, _get_comment(model, k))
+    _init_flag_state(model, keys)
+
+
+# ------------------------------------------------------------------ #
+#  Sentence flags: confirmed / uncertain                              #
+# ------------------------------------------------------------------ #
+#  "confirmed" — the annotator is done with the sentence; "uncertain" —
+#  they want it looked at again. Independent of each other: a sentence
+#  can be finished and still doubtful. Exported as `"confirmed": true` /
+#  `"uncertain": true` only when set, like the comment. A triplet carries
+#  its own `"uncertain": true` the same way.
+# ------------------------------------------------------------------ #
+
+SENTENCE_FLAGS = ("confirmed", "uncertain")
+
+
+def _flag_store(flag: str) -> Dict[Tuple, bool]:
+    return st.session_state.setdefault(f"re_{flag}", {})
+
+
+def _cur_flag(key: Tuple, flag: str) -> bool:
+    return bool(st.session_state.get(f"re_{flag}", {}).get(key, False))
+
+
+def _set_flag(key: Tuple, flag: str, value: bool):
+    _flag_store(flag)[key] = bool(value)
+
+
+def _init_flag_state(model: Dict, keys: List[Tuple]):
+    """Seed from the uploaded file (an exported file read back in carries
+    them), once per key, so nothing restored from disk is overwritten."""
+    for flag in SENTENCE_FLAGS:
+        store = _flag_store(flag)
+        for k in keys:
+            store.setdefault(k, any(bool(d.get(flag)) for d in model.get(k, [])))
+
+
+def _first_unconfirmed(keys: List[Tuple]) -> Optional[int]:
+    """Position of the first sentence in the file not yet confirmed — where
+    the work stopped, whatever was skipped ahead to after it."""
+    for i, k in enumerate(keys):
+        if not _cur_flag(k, "confirmed"):
+            return i
+    return None
 
 
 def _get_coref(model: Dict, key: Tuple) -> List[Dict]:
@@ -1481,6 +1540,9 @@ def export_relations_jsonl(model: Dict, keys: List[Tuple]) -> str:
             comment = _cur_comment(key)
             if comment:
                 sent_out["comment"] = comment
+            for flag in SENTENCE_FLAGS:
+                if _cur_flag(key, flag):
+                    sent_out[flag] = True
             sentences.append(sent_out)
         buf.write(json.dumps({"doc_id": doc_id, "sentences": sentences},
                               ensure_ascii=False) + "\n")
@@ -2102,9 +2164,48 @@ def _render_graph(cur_key: Tuple, rels: List[Dict], text: str = "",
         st.caption(f"Could not draw the graph: {exc}")
 
 
+def _render_progress(keys: List[Tuple]):
+    """Under the navigation: how many sentences are confirmed, with a way back
+    to the first one that is not, then where the last edit was made."""
+    _render_first_unconfirmed(keys)
+    _render_last_annotated(keys)
+
+
+def _render_first_unconfirmed(keys: List[Tuple]):
+    n_conf = sum(_cur_flag(k, "confirmed") for k in keys)
+    n_unc = sum(_cur_flag(k, "uncertain") for k in keys)
+    pos = _first_unconfirmed(keys)
+    summary = f"Confirmed: <b>{n_conf}</b> / {len(keys)}"
+    if n_unc:
+        summary += f" · ⚑ uncertain: <b>{n_unc}</b>"
+    if pos is None:
+        st.markdown(f'<div style="text-align:center;font-size:12px;'
+                    f'color:#1D9E75">{summary} — all sentences confirmed</div>',
+                    unsafe_allow_html=True)
+        return
+    if pos == st.session_state.re_sentence_idx:
+        st.markdown(f'<div style="text-align:center;font-size:12px;color:#888">'
+                    f'{summary} — this is the first unconfirmed sentence</div>',
+                    unsafe_allow_html=True)
+        return
+    first = keys[pos]
+    c_txt, c_btn = st.columns([5, 2])
+    with c_txt:
+        st.markdown(
+            f'<div style="text-align:right;font-size:12px;color:#888;'
+            f'padding-top:8px">{summary} — first unconfirmed: '
+            f'<b>{html_mod.escape(str(first[0]))} · sentence {first[1]}</b></div>',
+            unsafe_allow_html=True,
+        )
+    with c_btn:
+        if st.button("⏮ Go to first unconfirmed", key="re_goto_unconfirmed"):
+            _goto_sentence(pos)
+            st.rerun()
+
+
 def _render_last_annotated(keys: List[Tuple]):
-    """One line under the navigation: where the last edit was made, with a
-    button back there when the annotator is looking at another sentence."""
+    """Where the last edit was made, with a button back there when the
+    annotator is looking at another sentence."""
     last = st.session_state.get("re_last_key")
     if last not in keys:
         return
@@ -2132,6 +2233,65 @@ def _render_last_annotated(keys: List[Tuple]):
         if st.button("↪ Go to last annotated", key="re_goto_last"):
             _goto_sentence(pos)
             st.rerun()
+
+
+def _render_status_badges(cur_key: Tuple):
+    """Next to the sentence header, so the state is visible without scrolling
+    to the Confirm button."""
+    badges = []
+    if _cur_flag(cur_key, "confirmed"):
+        badges.append('<span style="color:#1D9E75;background:#e6f6f0;'
+                      'border:1px solid #b5e3d2;border-radius:4px;'
+                      'padding:1px 7px">✓ Confirmed</span>')
+    if _cur_flag(cur_key, "uncertain"):
+        badges.append('<span style="color:#b26a00;background:#fff4e0;'
+                      'border:1px solid #f3d29b;border-radius:4px;'
+                      'padding:1px 7px">⚑ Uncertain</span>')
+    if badges:
+        st.markdown('<div style="font-size:12px;display:flex;gap:6px;'
+                    'margin:-6px 0 6px 0">' + "".join(badges) + '</div>',
+                    unsafe_allow_html=True)
+
+
+def _render_sentence_uncertain(model: Dict, keys: List[Tuple], cur_key: Tuple):
+    current = _cur_flag(cur_key, "uncertain")
+    checked = st.checkbox(
+        "⚑ I am uncertain about this sentence",
+        value=current,
+        key=f"re_unc_sent_{cur_key}_{_session_gen()}",
+        help="Flags the sentence for a second look. Independent of Confirm: "
+             "a sentence can be finished and still doubtful.",
+    )
+    if checked != current:
+        _set_flag(cur_key, "uncertain", checked)
+        _maybe_autosave_re(model, keys)
+        st.rerun()
+
+
+def _render_confirm(model: Dict, keys: List[Tuple], cur_key: Tuple):
+    """At the foot of the sentence, where the annotator ends up once done.
+    Confirming does not lock anything: the sentence stays editable, and
+    'Undo' takes the confirmation back."""
+    st.divider()
+    if _cur_flag(cur_key, "confirmed"):
+        c_txt, c_btn = st.columns([5, 2])
+        with c_txt:
+            st.markdown('<div style="color:#1D9E75;padding-top:6px">'
+                        '✓ You confirmed this sentence.</div>',
+                        unsafe_allow_html=True)
+        with c_btn:
+            if st.button("Undo confirm", key=f"re_unconfirm_{cur_key}"):
+                _set_flag(cur_key, "confirmed", False)
+                _maybe_autosave_re(model, keys)
+                st.rerun()
+        return
+    if st.button("✓ Confirm sentence", type="primary",
+                 key=f"re_confirm_{cur_key}", width="stretch",
+                 help="Mark this sentence as done. 'Go to first unconfirmed' "
+                      "skips it from now on."):
+        _set_flag(cur_key, "confirmed", True)
+        _maybe_autosave_re(model, keys)
+        st.rerun()
 
 
 def _render_sentence_comment(model: Dict, keys: List[Tuple], cur_key: Tuple):
@@ -2595,6 +2755,8 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
         st.session_state.rel_gold = {}
         st.session_state.ent_gold = {}
         st.session_state.re_comments = {}
+        for flag in SENTENCE_FLAGS:
+            st.session_state[f"re_{flag}"] = {}
         st.session_state.re_ent_ver = {}
         st.session_state.re_rel_ver = {}
         # Namespaces the add-form widget keys, so a half-filled form from the
@@ -2624,7 +2786,8 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                 st.warning(f"Could not read your previous annotations from "
                            f"{st.session_state.get('re_upload_dir')}: {exc}")
             else:
-                if stats["relations"] or stats["added"] or stats["edited"]:
+                if (stats["relations"] or stats["added"] or stats["edited"]
+                        or stats["confirmed"]):
                     st.session_state.re_resume_note = _resume_summary(stats)
                     st.session_state.re_resume_stats = stats
                     # This run now contains those sessions, so the next load
@@ -2698,7 +2861,7 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
             _goto_sentence(st.session_state.re_sentence_idx + 1)
             st.rerun()
 
-    _render_last_annotated(keys)
+    _render_progress(keys)
 
     idx = st.session_state.re_sentence_idx
     cur_key = keys[idx]
@@ -2712,6 +2875,7 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
     # scrolling through the triplets is the sentence and the navigation, not the
     # uploader above them.
     st.subheader(f"{cur_key[0]} · sentence {cur_key[1]}", anchor=_TOP_ANCHOR)
+    _render_status_badges(cur_key)
 
     # Only when the graph will actually be drawn: _render_graph returns early
     # with no triplets, and a link to an anchor that was never emitted does
@@ -2764,6 +2928,7 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
 
     # ---- RIGHT: comment + add form + current relations --------------
     with col_right:
+        _render_sentence_uncertain(model, keys, cur_key)
         _render_sentence_comment(model, keys, cur_key)
 
         st.markdown("#### Add triplets" if triplet_mode else "#### Add relation")
@@ -2885,6 +3050,10 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                     "Note / reasoning (optional)",
                     key=f"re_note_{form_root}",
                 )
+                rel_uncertain = st.checkbox(
+                    "⚑ I am uncertain about this triplet",
+                    key=f"re_unc_add_{form_root}",
+                )
 
                 def _snapshot(ref: Tuple[str, str]) -> Dict:
                     """Frozen copy of an argument, so a relation stays readable
@@ -2929,6 +3098,8 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                         "note": note.strip(),
                         "annotator": username,
                     }
+                    if rel_uncertain:
+                        new_rel["uncertain"] = True
                     st.session_state.rel_gold[cur_key].append(new_rel)
                     _bump_rel_ver(cur_key)
                     add_vers[cur_key] = form_ver + 1   # remount → clears the form
@@ -2966,6 +3137,13 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                         f'<span style="color:#5c6bc0;font-size:10px;'
                         f'font-weight:600;margin-right:2px">T{j+1}</span>'
                     )
+                    if rel.get("uncertain"):
+                        header += (
+                            '<span style="font-size:10px;color:#b26a00;'
+                            'background:#fff4e0;border:1px solid #f3d29b;'
+                            'border-radius:3px;padding:1px 5px;margin-right:2px"'
+                            ' title="Flagged as uncertain">⚑ uncertain</span>'
+                        )
                     if _is_hyper(rel):
                         header += (
                             '<span style="font-size:10px;color:#3949ab;'
@@ -3070,6 +3248,22 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
                         st.session_state["re_just_saved"] = uid
                         st.rerun()
 
+                    was_uncertain = bool(rel.get("uncertain"))
+                    now_uncertain = st.checkbox(
+                        "⚑ I am uncertain about this triplet",
+                        value=was_uncertain,
+                        key=f"re_unc_{uid}_{_session_gen()}",
+                    )
+                    if now_uncertain != was_uncertain:
+                        # Absent rather than false when cleared, so the export
+                        # only carries the key on triplets that use it.
+                        if now_uncertain:
+                            st.session_state.rel_gold[cur_key][j]["uncertain"] = True
+                        else:
+                            st.session_state.rel_gold[cur_key][j].pop("uncertain", None)
+                        _maybe_autosave_re(model, keys)
+                        st.rerun()
+
                     if rel.get("note"):
                         st.caption(f'📝 {rel["note"]}')
 
@@ -3090,6 +3284,7 @@ def render_relation_page(_unused_model: Dict = None, triplet_mode: bool = False)
         _render_graph(cur_key, st.session_state.rel_gold.get(cur_key, []),
                       text, _cur_spans(cur_key), hints)
 
+    _render_confirm(model, keys, cur_key)
     _render_back_to_top()
 
     # ---- Export -----------------------------------------------------
