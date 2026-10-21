@@ -118,13 +118,49 @@ DEFAULT_ARMS = ["blind"]
 # run per cell reproduces both problems on clean data.
 REPLICATES = 3
 
-INPUT = ROOT / "data" / "manually_labeled_last"
-
-# Guideline v4, asserted by check() below against the file the run will load.
-# A guideline that silently moved is the confound the old DeepSeek pair could not
-# rule out, which is the whole reason this constant exists — it was declared here
-# and never actually compared to anything until the check was added.
-GUIDELINE_SECTIONS_HASH = "09db658b91fcc806f5594f0661b22911"
+# ── corpus ──────────────────────────────────────────────────────────────────
+#
+# The corpus decides the input, the guideline whose hash is asserted, and how
+# much context each agent sees. It used to be implicit: INPUT and
+# GUIDELINE_SECTIONS_HASH were MoBiKo constants and the generated commands
+# carried no --corpus at all, so a CoNLL run would have annotated newswire with
+# the biodiversity schema and guideline. That does not error — it produces 400
+# sentences of confidently wrong output.
+#
+# context_radius is the MATCHED CONDITION, not a preference. MoBiKo's annotators
+# worked one sentence at a time and could navigate to the previous and following
+# ones, so the agents get +/-1; sentence-only would handicap them against the
+# 0.497 ceiling and the whole abstract would over-inform them. CoNLL-MTurk was
+# crowdsourced per sentence with no navigation, so 0 is correct there — a
+# deliberate setting, not a degraded fallback.
+#
+# nested_spans is NOT here: it lives in corpora.CORPORA and demo_ag2 resolves it,
+# because it is a property of the annotation schema. conll on, mobiko off.
+CORPUS_SETUP = {
+    "mobiko": {
+        "input": ROOT / "data" / "manually_labeled_last",
+        # Guideline v4 + the decision table, hashed the way the pipeline hashes
+        # them (decision_support + guidance, in that order). A guideline that
+        # silently moved is the confound the old DeepSeek pair could not rule
+        # out, which is the whole reason this is pinned — it was declared here
+        # and never actually compared to anything until check() grew teeth.
+        "guideline_hash": "09db658b91fcc806f5594f0661b22911",
+        "context_radius": 1,
+        "guideline_desc": "Decision_support.csv + MoBiKo_label_guidance_v4.md",
+    },
+    "conll": {
+        # The curated sample: 400 sentences, exactly 5 annotators each, >=10
+        # words, stratified on gold entity count, duplicate texts excluded.
+        # Gold sits alongside in gold.jsonl, which MoBiKo has no equivalent of.
+        "input": ROOT / "data" / "conll_mturk" / "sample_n5_w10_400" / "sentences.txt",
+        # CoNLL has no decision-support table, so the hash covers the guideline
+        # alone (14 sections).
+        "guideline_hash": "39b635064aced612de7746c68737798d",
+        "context_radius": 0,
+        "guideline_desc": "CoNLL_label_guidance.md",
+    },
+}
+DEFAULT_CORPUS = "mobiko"
 
 # Every flag that changes behaviour. Absent = the pipeline default, which is
 # exactly the ambiguity this file removes, so nothing is left implicit.
@@ -168,22 +204,29 @@ FLAGS = {
 OUT_DIR = ROOT / "data" / "auto_annotated"
 
 
-def out_path(model: str, arm: str, rep: int) -> Path:
-    return OUT_DIR / f"grid_{model}_{arm}_r{rep}.jsonl"
+def out_path(model: str, arm: str, rep: int, corpus: str = DEFAULT_CORPUS) -> Path:
+    # The corpus is in the FILENAME as well as in run_meta: two corpora writing
+    # grid_<model>_<arm>_r<n>.jsonl would overwrite each other, and a resumed run
+    # would silently append newswire records to a biodiversity file.
+    return OUT_DIR / f"grid_{corpus}_{model}_{arm}_r{rep}.jsonl"
 
 
-def build_command(model: str, arm: str, rep: int) -> list:
+def build_command(model: str, arm: str, rep: int,
+                  corpus: str = DEFAULT_CORPUS) -> list:
     """argv for one run. Temperature and seeds stay at pipeline defaults; the
     replicate index is carried by the output path, not by a config change, so
     the three runs of a cell are genuine replicates of one configuration."""
     flags = {**FLAGS, **ARMS[arm]}
+    setup = CORPUS_SETUP[corpus]
     cmd = [
         sys.executable, str(ROOT / "src" / "multi_agent_annotation" / "demo_ag2.py"),
         "--annotator-model", model,
         "--critic-model", model,
         "--adjudicator-model", model,
-        "--input", str(INPUT),
-        "--output", str(out_path(model, arm, rep)),
+        "--corpus", corpus,
+        "--input", str(setup["input"]),
+        "--output", str(out_path(model, arm, rep, corpus)),
+        "--context-radius", str(setup["context_radius"]),
         "--max-rounds", str(flags["max_rounds"]),
         "--tool-choice", flags["tool_choice"],
         "--guideline-search", flags["guideline_search"],
@@ -207,9 +250,13 @@ def build_command(model: str, arm: str, rep: int) -> list:
 
 # ── preflight ───────────────────────────────────────────────────────────────
 
-def check(arms=None) -> int:
+def check(arms=None, corpus: str = DEFAULT_CORPUS) -> int:
     """Fail loudly BEFORE burning GPU hours on runs that cannot be cited."""
     arms = list(arms or DEFAULT_ARMS)
+    setup = CORPUS_SETUP[corpus]
+    INPUT = setup["input"]
+    print(f"  ok    corpus {corpus}  (context_radius {setup['context_radius']}, "
+          f"guideline {setup['guideline_desc']})")
     import multi_agent_annotation_ag2 as M
     problems, warnings = [], []
 
@@ -281,29 +328,38 @@ def check(arms=None) -> int:
     # NARRATIVE GUIDELINE TOGETHER, in that order — not the .md alone. Hashing
     # only the guideline file gives a different digest and a false alarm.
     try:
-        ds, gl = M._DEFAULT_DECISION_SUPPORT, M._DEFAULT_GUIDELINE
-        missing = [str(x) for x in (ds, gl) if not x.exists()]
+        from src.multi_agent_annotation.corpora import CORPORA as _C
+        _preset = _C[corpus]
+        gl = _preset["guideline"] or M._DEFAULT_GUIDELINE
+        ds = M._DEFAULT_DECISION_SUPPORT if _preset["decision_support"] else None
+        missing = [str(x) for x in (ds, gl) if x is not None and not x.exists()]
         if missing:
             problems.append(f"guideline material missing: {missing}")
         else:
-            sections = M.load_decision_support(ds) + (
+            sections = (M.load_decision_support(ds) if ds else []) + (
                 M.load_guideline_from_docx(gl) if gl.suffix.lower() == ".docx"
                 else M.load_guideline_from_md(gl))
             got = M._guideline_sections_hash(sections)
-            if got != GUIDELINE_SECTIONS_HASH:
+            if got != setup["guideline_hash"]:
                 problems.append(
-                    f"guideline hash moved: {ds.name} + {gl.name} now hash to {got}, "
-                    f"pinned {GUIDELINE_SECTIONS_HASH}. Either the guideline "
+                    f"guideline hash moved: {setup['guideline_desc']} now hashes "
+                    f"to {got}, pinned {setup['guideline_hash']}. Either the guideline "
                     f"changed (the grid would not be comparable to the archived "
                     f"runs) or the pin is stale — decide which, do not just "
                     f"update the constant.")
             else:
-                print(f"  ok    guideline {ds.name} + {gl.name} "
+                print(f"  ok    guideline {setup['guideline_desc']} "
                       f"({len(sections)} sections) hash {got[:8]}")
     except Exception as exc:
         warnings.append(f"could not verify the guideline hash: {exc}")
 
-    if "blind" in arms:
+    if "blind" in arms and setup["context_radius"] == 0:
+        # Sentence-only is the matched condition here (CoNLL-MTurk was
+        # crowdsourced per sentence with no navigation), so there is no context
+        # window to verify and no abstracts to require.
+        print(f"  ok    context: sentence-only (radius 0) — matches how this "
+              f"corpus was annotated")
+    elif "blind" in arms:
         # Without abstracts the context window falls back to sentence-only with
         # a log warning, the run completes, the output looks normal — and every
         # agent had LESS context than Mark and Davnah did, which biases the
@@ -319,9 +375,10 @@ def check(arms=None) -> int:
                     "every agent sees the sentence alone, which is NOT the "
                     "condition the human annotators worked under")
             else:
-                sents = [l.strip() for l in INPUT.joinpath(
-                    "overlap_sentences.txt").read_text().splitlines()
-                    if l.strip()] if INPUT.is_dir() else []
+                _txt = (INPUT.joinpath("overlap_sentences.txt") if INPUT.is_dir()
+                        else INPUT)
+                sents = [l.strip() for l in _txt.read_text().splitlines()
+                         if l.strip()] if _txt.exists() else []
                 res = [cw.for_sentence(x) for x in sents]
                 none = sum(1 for r in res if not r["n_before"] and not r["n_after"])
                 both = sum(1 for r in res if r["n_before"] and r["n_after"])
@@ -345,9 +402,9 @@ def check(arms=None) -> int:
             warnings.append(f"{role}_top_logprobs is off: no {role} uncertainty, so "
                             f"the deliberation-vs-single-model question stays open")
 
-    existing = [out_path(m, a, r) for m in MODELS for a in arms
+    existing = [out_path(m, a, r, corpus) for m in MODELS for a in arms
                 for r in range(1, REPLICATES + 1)
-                if out_path(m, a, r).exists()]
+                if out_path(m, a, r, corpus).exists()]
     if existing:
         warnings.append(f"{len(existing)} output file(s) already exist and would be "
                         f"resumed or overwritten, e.g. {existing[0].name}")
@@ -356,7 +413,7 @@ def check(arms=None) -> int:
         print(f"  WARN  {w}")
     for p in problems:
         print(f"  FAIL  {p}")
-    print(f"\n  arms: {', '.join(arms)}")
+    print(f"\n  corpus: {corpus}   arms: {', '.join(arms)}")
     print(f"  {len(MODELS)} models x {len(arms)} arm(s) x {REPLICATES} "
           f"replicates = {len(MODELS) * len(arms) * REPLICATES} runs")
     return 1 if problems else 0
@@ -368,6 +425,9 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="preflight the environment")
     ap.add_argument("--print", action="store_true", dest="show",
                     help="emit the run commands")
+    ap.add_argument("--corpus", choices=sorted(CORPUS_SETUP), default=DEFAULT_CORPUS,
+                    help="selects the input, the guideline whose hash is "
+                         "asserted, and the context radius together")
     ap.add_argument("--arms", nargs="+", default=DEFAULT_ARMS,
                     choices=sorted(ARMS) + ["all"],
                     help=f"which arms to cover (default: {DEFAULT_ARMS})")
@@ -382,9 +442,9 @@ def main() -> int:
         for model in MODELS:
             for arm in arms:
                 for rep in range(1, REPLICATES + 1):
-                    print(" ".join(build_command(model, arm, rep)))
+                    print(" ".join(build_command(model, arm, rep, args.corpus)))
         return 0
-    return check(arms)
+    return check(arms, args.corpus)
 
 
 if __name__ == "__main__":
