@@ -2679,6 +2679,7 @@ class MultiAgentAnnotator:
         deliberation_mode: str = "review",
         guideline_search_enabled: bool = True,
         context_radius: int = 1,
+        nested_spans: bool = False,
     ):
         # deliberation_mode selects the whole pipeline shape.
         #
@@ -2703,6 +2704,19 @@ class MultiAgentAnnotator:
         self.deliberation_mode = deliberation_mode
         self.guideline_search_enabled = guideline_search_enabled
         self.context_radius = context_radius
+        # Whether the blind-pair vote treats a span containing another as the
+        # SAME mention. IoU alone penalises nesting: 'America' (10,17) inside
+        # 'Corporate America' (0,17) scores 0.41 and does not merge at the usual
+        # threshold, so one mention annotated at two granularities is recorded as
+        # two mentions each missing from some annotators — a detection
+        # disagreement where the real dispute is extent and type.
+        #
+        # Set from the CORPUS, not per run (corpora.CORPORA): right for CoNLL,
+        # where not one of 3,288 within-annotator span pairs nests, so nesting
+        # across annotators can only be an extent disagreement; wrong for MoBiKo,
+        # whose annotators nest deliberately (74 pairs) because the schema
+        # annotates properties inside entities.
+        self.nested_spans = nested_spans
         self.max_rounds = max_rounds
         self._input_path = Path(input_path) if input_path else None
         self.use_precedent_memory = use_precedent_memory
@@ -3107,6 +3121,7 @@ class MultiAgentAnnotator:
             deliberation_mode=deliberation_mode,
             guideline_search_enabled=guideline_search_enabled,
             context_radius=context_radius,
+            nested_spans=nested_spans,
             strict_critic=strict_critic,
             cold_start=cold_start,
             use_precedent_memory=use_precedent_memory,
@@ -3203,6 +3218,9 @@ class MultiAgentAnnotator:
             # agreement number is only comparable to the two-human ceiling under
             # the humans' condition, and theirs was +/-1.
             "context_radius": cfg.get("context_radius"),
+            # Changes what the vote treats as one mention, so two runs differing
+            # only on this are not comparable.
+            "nested_spans": bool(cfg.get("nested_spans")),
             "annotator_prompt": cfg.get("annotator_prompt"),
             "annotator_prompt_requested": cfg.get("annotator_prompt_requested"),
             "annotator_prompt_fn": cfg.get("annotator_prompt_fn"),
@@ -3421,7 +3439,8 @@ class MultiAgentAnnotator:
         unresolved = sum(1 for spans in triple for e in spans
                          if e["start"] is None)
         voted = _vote([[e for e in spans if e["start"] is not None]
-                       for spans in triple], n_annotators=3)
+                       for spans in triple], n_annotators=3,
+                      nested=self.nested_spans)
 
         # ── 6. Adjudicator on the contested mentions ──
         adj_pairs, adj_map = self._anonymise_annotations(
