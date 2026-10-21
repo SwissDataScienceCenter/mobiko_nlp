@@ -108,14 +108,39 @@ def load_human_annotations(path: Path) -> Dict[str, Dict[str, dict]]:
 
 
 def _load_native_json_annotations(doc: dict, annotator: str) -> Dict[str, Dict[str, dict]]:
-    """Convert native {doc_id, sentences:[{text, spans}]} format."""
+    """Convert native {doc_id, sentences:[{text, spans}]} format.
+
+    CHARACTER OFFSETS ARE PRESERVED. This function used to build
+    {"text", "entity_type"} and drop start_char/end_char, which silently
+    disabled every position-based measure for any corpus stored in native JSON —
+    MoBiKo's human files included. A position matcher handed spans without
+    positions returns ZERO mentions, after which
+
+        human_disagreed = h.get("disagreed", True)
+
+    scores every failed lookup as "the humans disagreed": 1,393 entries by text
+    against 0 by position on multi_pass_deepseek_1, producing an odds ratio of
+    0.47 at p=1.0000 that looked like a result. The JSONL branch above never had
+    this problem because it spreads the source dict (`{**e, ...}`).
+
+    Both offset spellings are emitted — start_char/end_char as the human files
+    use, and start/end as the agent records do — so a consumer written against
+    either shape works without having to know which loader produced the data.
+    See evaluation/MEASURING_HUMAN_DISAGREEMENT.md.
+    """
     data: Dict[str, Dict[str, dict]] = {}
     for sent_obj in doc.get("sentences", []):
         sent = sent_obj["text"].strip()
-        entities = [
-            {"text": span["text"], "entity_type": _normalize_label(span["type"])}
-            for span in sent_obj.get("spans", [])
-        ]
+        entities = []
+        for span in sent_obj.get("spans", []):
+            start = span.get("start_char", span.get("start"))
+            end = span.get("end_char", span.get("end"))
+            entities.append({
+                "text": span["text"],
+                "entity_type": _normalize_label(span["type"]),
+                "start_char": start, "end_char": end,
+                "start": start, "end": end,
+            })
         data[sent] = {annotator: {"entities": entities, "relations": []}}
     return data
 
@@ -142,12 +167,89 @@ _normalize_label = normalize_label
 # Human disagreement computation
 # ─────────────────────────────────────────────────────────────
 
-def compute_human_span_disagreements(
+# ── which matcher defines "the humans disagreed" ──────────────────────────────
+#
+# Two defensible answers, and the eval reports BOTH rather than committing
+# silently, because the choice IS the measurement: the dependent variable in
+# RQ2 is where the humans disagreed, and the matchers do not agree about that.
+#
+#   position  PRIMARY. Spans grouped by overlap, so two annotators marking one
+#             mention at different extents are one mention with an extent and
+#             possibly a type conflict. Finds 182 type disagreements on MoBiKo
+#             and 198 on CoNLL-MTurk.
+#   text      LEGACY. Spans keyed by normalised text, so the same pair becomes
+#             two unrelated entities, each internally unanimous, and the type
+#             conflict is not recorded. Finds 128 and 154. Reported because
+#             every previously published number used it, so a reader can check
+#             the earlier results against the new ones.
+#
+# Reporting both also makes the sensitivity analysis free instead of a separate
+# script somebody has to remember to run.
+# See evaluation/MEASURING_HUMAN_DISAGREEMENT.md for the full decision record.
+#
+# Both matchers are computed and reported. "position" is primary: it groups
+# spans by overlap, so two annotators marking one mention at different extents
+# are one mention carrying their extent and type conflict, rather than two
+# entities each internally unanimous. "text" is the legacy matcher every
+# published number used, kept so those stay checkable.
+#
+# This was blocked until _load_native_json_annotations stopped discarding
+# start_char/end_char. Without them the position matcher returned ZERO mentions,
+# every lookup missed, and
+#     human_disagreed = h.get("disagreed", True)
+# scored each miss as "the humans disagreed" — 1,393 entries by text against 0 by
+# position, odds ratio 0.47 at p=1.0000. An empty input, not a measurement.
+#
+# RESIDUAL: the human/agent join is still by TEXT. A position-grouped mention is
+# keyed by its MODAL text, so an agent span using a co-annotator's wording can
+# still miss, and two mentions sharing a modal text collide (2.1% of MoBiKo
+# mentions, flagged `key_collision`). Joining by position on both sides needs
+# extract_agent_span_disagreements to carry offsets, which the rebuilt grid's
+# records will supply natively. The grouping is right now; the join is next.
+HUMAN_MATCHERS = ("text", "position")
+PRIMARY_MATCHER = "position"
+
+
+def human_disagreements(annotators: Dict[str, dict], matcher: str = PRIMARY_MATCHER,
+                        nested: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Human span disagreement under the named matcher. Same shape either way."""
+    if matcher == "text":
+        return compute_human_span_disagreements_by_text(annotators)
+    if matcher == "position":
+        from human_agreement import disagreements_by_position
+        return disagreements_by_position(annotators, nested=nested)
+    raise ValueError(f"matcher must be one of {HUMAN_MATCHERS}, got {matcher!r}")
+
+
+def compute_human_span_disagreements_by_text(
     annotators: Dict[str, dict],
 ) -> Dict[str, Dict[str, Any]]:
     """
-    For each unique entity span text across all annotators, determine
-    whether annotators agreed on its type.
+    For each unique entity span TEXT across all annotators, determine whether
+    annotators agreed on its type.
+
+    THE NAME CARRIES "_by_text" BECAUSE THE MATCHER IS THE MEASUREMENT. Keying
+    by text means two annotators marking one mention at different extents become
+    two unrelated entities, each internally unanimous — so the type conflict
+    between them is not recorded at all:
+
+        a12  'America'           (10-17)  LOC
+        a24  'Corporate America' (0-17)   MISC
+        a33  'America'           (10-17)  LOC
+
+    yields {"america": LOC x3} and {"corporate america": MISC x1}, both
+    unanimous, no type disagreement. On MoBiKo's 154 doubly-annotated sentences
+    this finds 128 type disagreements where position-based clustering finds
+    180-233, and it cannot represent extent disagreement at all.
+
+    KEPT, not deleted: every archived number was produced with it, so removing it
+    would make those unreproducible. NOT the measure to use for new work —
+    human_agreement.mention_disagreements groups by position instead. The name
+    says which one a call site chose, which is the whole point of the rename:
+    this function had the neutral name and so got used in twelve places by
+    default.
+
+    See evaluation/MEASURING_HUMAN_DISAGREEMENT.md.
 
     Returns {normalized_text: {"types": {type: count}, "disagreed": bool,
              "present_in": int, "total_annotators": int}}
@@ -265,6 +367,8 @@ def extract_agent_span_disagreements(record: dict) -> Dict[str, Dict[str, Any]]:
 def build_contingency_table(
     agent_records: List[dict],
     human_data: Dict[str, Dict[str, dict]],
+    matcher: str = PRIMARY_MATCHER,
+    nested: bool = False,
 ) -> Dict[str, Any]:
     """
     Build a 2×2 contingency table:
@@ -288,7 +392,7 @@ def build_contingency_table(
         if len(annotators) < 2:
             continue  # need ≥2 annotators for human disagreement
 
-        human_spans = compute_human_span_disagreements(annotators)
+        human_spans = human_disagreements(annotators, matcher, nested)
         agent_spans = extract_agent_span_disagreements(rec)
 
         # Union of all spans mentioned by either side
@@ -398,6 +502,8 @@ def build_contingency_table(
 def compute_sentence_level_correlation(
     agent_records: List[dict],
     human_data: Dict[str, Dict[str, dict]],
+    matcher: str = PRIMARY_MATCHER,
+    nested: bool = False,
 ) -> Dict[str, Any]:
     """
     For each sentence, compute:
@@ -424,7 +530,7 @@ def compute_sentence_level_correlation(
         if len(annotators) < 2:
             continue
 
-        human_spans = compute_human_span_disagreements(annotators)
+        human_spans = human_disagreements(annotators, matcher, nested)
         if not human_spans:
             continue
 
@@ -491,6 +597,8 @@ def compute_sentence_level_correlation(
 def correlate_history_signals(
     agent_records: List[dict],
     human_data: Dict[str, Dict[str, dict]],
+    matcher: str = PRIMARY_MATCHER,
+    nested: bool = False,
 ) -> Dict[str, Any]:
     """
     Correlate per-sentence history signals — number of rounds, round-1
@@ -512,7 +620,7 @@ def correlate_history_signals(
         annotators = human_data.get(sent)
         if not annotators or len(annotators) < 2:
             continue
-        human_spans = compute_human_span_disagreements(annotators)
+        human_spans = human_disagreements(annotators, matcher, nested)
         if not human_spans:
             continue
         h_rate = sum(1 for s in human_spans.values() if s["disagreed"]) / len(human_spans)
@@ -576,9 +684,22 @@ def main():
     agent_records = load_agent_records(args.agent_jsonl)
     human_data = load_all_human_annotations(args.human_jsonl)
 
-    ct = build_contingency_table(agent_records, human_data)
-    corr = compute_sentence_level_correlation(agent_records, human_data)
-    hist = correlate_history_signals(agent_records, human_data)
+    # Run every matcher. The primary drives the printed report and the
+    # top-level output keys; the others are reported alongside under
+    # "by_matcher" so the sensitivity analysis cannot be forgotten and the
+    # previously published numbers stay checkable.
+    nested = getattr(args, "nested_spans", False)
+    per_matcher = {}
+    for _m in HUMAN_MATCHERS:
+        per_matcher[_m] = {
+            "ct": build_contingency_table(agent_records, human_data, _m, nested),
+            "corr": compute_sentence_level_correlation(agent_records, human_data,
+                                                       _m, nested),
+            "hist": correlate_history_signals(agent_records, human_data, _m, nested),
+        }
+    ct = per_matcher[PRIMARY_MATCHER]["ct"]
+    corr = per_matcher[PRIMARY_MATCHER]["corr"]
+    hist = per_matcher[PRIMARY_MATCHER]["hist"]
 
     print(f"\n{'='*60}")
     print(f"  LAYER 2 — Disagreement Correlation (history-based, all rounds)")
@@ -629,6 +750,28 @@ def main():
         print(f"    {t:35s}  {cells['aa']:3d}/{cells['ad']:3d}/{cells['da']:3d}/{dd:3d}  "
               f"(co-disagree: {dd/total_t:.0%})" if total_t > 0 else "")
 
+    print(f"\n  HUMAN MATCHER SENSITIVITY  (primary: {PRIMARY_MATCHER}"
+          f"{', nested' if nested else ''})")
+    print(f"    {'matcher':10s} {'spans':>7s} {'odds ratio':>11s} {'fisher p':>10s} "
+          f"{'rho':>8s}")
+    for _m, _v in per_matcher.items():
+        _c = _v["ct"]
+        _mark = " <- primary" if _m == PRIMARY_MATCHER else ""
+        # spearman_rho is None when too few sentences carry a usable pair, so
+        # format defensively — a crash here would take out a whole eval over a
+        # sensitivity row.
+        _rho = _v["corr"].get("spearman_rho")
+        _rho_s = f"{_rho:8.3f}" if isinstance(_rho, (int, float)) else f"{'-':>8s}"
+        _or = _c.get("odds_ratio")
+        _or_s = f"{_or:11.2f}" if isinstance(_or, (int, float)) else f"{'-':>11s}"
+        print(f"    {_m:10s} {_c['total_spans']:7d} {_or_s} "
+              f"{fmt_p(_c.get('fisher_p_value')):>10s} {_rho_s}{_mark}")
+    print("    'text' is the legacy matcher every published number used: it keys "
+          "spans by\n    text, so one mention annotated at two extents becomes "
+          "two unanimous entities.\n    The human/agent join is still by text, "
+          "so a span using a co-annotator's\n    wording can still miss — see "
+          "MEASURING_HUMAN_DISAGREEMENT.md.")
+
     if args.output:
         out = {
             "contingency": ct["contingency"],
@@ -642,6 +785,22 @@ def main():
             "history_signal_correlations": hist["correlations"],
             "per_type_contingency": ct["per_type_contingency"],
             "sentence_correlations": corr["sentence_details"],
+            # WHICH matcher the numbers above came from. Without this the output
+            # is ambiguous between two measurements that disagree by ~40% on how
+            # many type disagreements exist.
+            "human_matcher": PRIMARY_MATCHER,
+            "nested_spans": nested,
+            "by_matcher": {
+                m: {"contingency": v["ct"]["contingency"],
+                    "concordance": v["ct"]["concordance"],
+                    "odds_ratio": v["ct"]["odds_ratio"],
+                    "odds_ratio_ci95": v["ct"].get("odds_ratio_ci95"),
+                    "fisher_p_value": v["ct"].get("fisher_p_value"),
+                    "spearman_rho": v["corr"]["spearman_rho"],
+                    "spearman_p_value": v["corr"].get("spearman_p_value"),
+                    "history_signal_correlations": v["hist"]["correlations"]}
+                for m, v in per_matcher.items()
+            },
         }
         with args.output.open("w") as f:
             stamp_provenance(out, args.agent_jsonl)

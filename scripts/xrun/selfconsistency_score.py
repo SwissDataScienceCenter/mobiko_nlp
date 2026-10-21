@@ -3,7 +3,7 @@
 
 Pairs each agent span against the two humans exactly as
 eval_logprob_uncertainty.span_level does (same normalisation, same
-compute_human_span_disagreements, same _group_compare), so the rho printed here
+compute_human_span_disagreements_by_text, same _group_compare), so the rho printed here
 is directly comparable to the span:logprob / span:entropy point-biserials
 already in the RQ2 tables (+0.158 … +0.272 where headroom exists, null where not).
 
@@ -235,7 +235,7 @@ def score(records, human, min_detections, target="binary", min_span_annotators=1
             continue
         n_sent += 1
         ann_counts[len(anns)] += 1
-        dis = LP.compute_human_span_disagreements(anns)
+        dis = LP.compute_human_span_disagreements_by_text(anns)
         dists = span_distributions(rec.get("samples", []), min_detections)
         for key, d in dists.items():
             info = dis.get(key)

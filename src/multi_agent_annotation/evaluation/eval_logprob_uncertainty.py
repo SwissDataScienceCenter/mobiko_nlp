@@ -19,7 +19,7 @@ Targets, per doubly-annotated sentence:
   human_difficulty     = 1 - pairwise inter-human F1 (text+type)
   human_disagree_rate  = fraction of unique human spans where the humans
                          disagreed (type or presence), via
-                         compute_human_span_disagreements.
+                         compute_human_span_disagreements_by_text.
 Internal / calibration checks (agent's own behaviour):
   agent_error          = 1 - mean agent-vs-human F1 (text+type)
   rounds_used, r1_disagreements, total_disagreements (deliberation friction)
@@ -52,7 +52,8 @@ for _p in (_PKG_ROOT, _PKG_ROOT / "evaluation"):
 from deliberation_history import load_records, norm, record_signals
 from eval_layer2_correlation import (
     load_all_human_annotations,
-    compute_human_span_disagreements,
+    compute_human_span_disagreements_by_text,
+    human_disagreements, HUMAN_MATCHERS, PRIMARY_MATCHER,
     _normalize,
 )
 from eval_layer1_output import sentence_f1
@@ -77,7 +78,9 @@ def _typed(ents: List[dict]) -> List[dict]:
 
 # ─────────────────────────── per-sentence rows ───────────────────────────
 
-def build_rows(records: List[dict], human: Dict[str, Dict[str, dict]]) -> List[dict]:
+def build_rows(records: List[dict], human: Dict[str, Dict[str, dict]],
+               matcher: str = PRIMARY_MATCHER,
+               nested: bool = False) -> List[dict]:
     hnorm = {norm(s): a for s, a in human.items()}
     rows: List[dict] = []
     for rec in records:
@@ -119,7 +122,7 @@ def build_rows(records: List[dict], human: Dict[str, Dict[str, dict]]) -> List[d
                              _typed(anns[ids[1]]["entities"]), mode="text_type") or 0.0
             row["human_difficulty"] = 1.0 - f1
 
-            dis = compute_human_span_disagreements(anns)
+            dis = human_disagreements(anns, matcher, nested)
             if dis:
                 row["human_disagree_rate"] = sum(1 for v in dis.values() if v["disagreed"]) / len(dis)
 
@@ -192,7 +195,9 @@ def _group_compare(pairs: List[Tuple[Optional[float], bool]],
     return res
 
 
-def span_level(records: List[dict], human: Dict[str, Dict[str, dict]]) -> Dict[str, Any]:
+def span_level(records: List[dict], human: Dict[str, Dict[str, dict]],
+               matcher: str = PRIMARY_MATCHER,
+               nested: bool = False) -> Dict[str, Any]:
     """Per agent entity: does its type-uncertainty (logprob / entropy) track
     whether the two humans disagree on that span's type?"""
     hnorm = {norm(s): a for s, a in human.items()}
@@ -203,7 +208,7 @@ def span_level(records: List[dict], human: Dict[str, Dict[str, dict]]) -> Dict[s
         anns = hnorm.get(norm(rec.get("sentence", "")))
         if not anns or len(anns) < 2:
             continue
-        dis = compute_human_span_disagreements(anns)
+        dis = human_disagreements(anns, matcher, nested)
         for e in rec.get("annotator_entity_logprobs", []):
             info = dis.get(_normalize(e.get("text", "")))
             if info is None:
@@ -355,7 +360,15 @@ def main():
         "internal_targets": internal_targets,
         "human_table": _corr_table(rows, signals, human_targets),
         "internal_table": _corr_table(rows, internal_signals, internal_targets),
-        "span_level": span_level(records, human),
+        "span_level": span_level(records, human, PRIMARY_MATCHER),
+        # Every matcher, so the sensitivity analysis is part of the output
+        # rather than a separate script someone has to remember. "position"
+        # groups spans by overlap; "text" is the legacy matcher every published
+        # number used. See evaluation/MEASURING_HUMAN_DISAGREEMENT.md.
+        "human_matcher": PRIMARY_MATCHER,
+        "span_level_by_matcher": {
+            m: span_level(records, human, m) for m in HUMAN_MATCHERS
+        },
     }
     print_report(report)
 

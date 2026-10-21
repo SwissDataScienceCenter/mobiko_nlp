@@ -1,8 +1,12 @@
 """
 Human disagreement over N annotators, grouped by POSITION rather than by text.
 
+DECISION RECORD: evaluation/MEASURING_HUMAN_DISAGREEMENT.md — which matcher is primary where, what is still
+unported, and the measured differences between the three. Read it before
+changing anything here.
+
 WHAT IS WRONG WITH THE EXISTING MEASURE. eval_layer2_correlation.
-compute_human_span_disagreements keys spans by normalised text, so two
+compute_human_span_disagreements_by_text keys spans by normalised text, so two
 annotators marking the same mention at different extents become two unrelated
 entities, each internally unanimous. The CoNLL-MTurk case that makes it obvious:
 
@@ -137,3 +141,68 @@ def match(mentions: Sequence[Dict[str, Any]], span: Span,
         if v > best_iou or best is None:
             best, best_iou = mm, v
     return best
+
+
+def disagreements_by_position(
+    annotators: Dict[str, dict],
+    threshold: float = 0.5,
+    nested: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Drop-in replacement for compute_human_span_disagreements_by_text.
+
+    Same signature, same return shape, so a call site switches matcher by
+    switching function — and an eval can call BOTH and report them side by side
+    rather than silently committing to one.
+
+    WHAT DIFFERS: spans are GROUPED by position (overlap) instead of by text,
+    which is where the bug was. Two annotators marking one mention at different
+    extents are one group here, so the type conflict between them is recorded;
+    keyed by text they were two groups, each internally unanimous, and the
+    conflict vanished.
+
+    The result is still KEYED by normalised text, because the call sites look up
+    by an agent span's text and the archived runs carry no offsets. So the fix is
+    to the grouping, not to the lookup. A merged mention appears once, under the
+    text of its modal extent, carrying the whole conflict.
+
+    KEY COLLISIONS. Two genuinely separate mentions in one sentence can share a
+    modal text ("forest" twice). Their records are merged rather than one
+    silently overwriting the other, and `key_collision` marks it so a consumer
+    can exclude them. Measured: 2.1% of MoBiKo mentions and 2.3% of CoNLL-MTurk
+    ones — small, but overwriting would have been invisible, and a sentence
+    repeating a name is exactly where annotators disagree about how many
+    mentions there are.
+
+    `extent_disagreed` is additional — the text-keyed function cannot express it
+    at all — so consumers written against the old shape ignore it harmlessly.
+    """
+    spans = [a.get("entities", []) for a in annotators.values()]
+    out: Dict[str, Dict[str, Any]] = {}
+    for m in mention_disagreements(spans, threshold=threshold, nested=nested):
+        key = m["norm_text"]
+        rec = {
+            "types": dict(m["types"]),
+            "type_disagreed": m["type_disagreed"],
+            "presence_disagreed": m["presence_disagreed"],
+            "extent_disagreed": m["extent_disagreed"],
+            "disagreed": (m["type_disagreed"] or m["presence_disagreed"]
+                          or m["extent_disagreed"]),
+            "present_in": m["present_in"],
+            "total_annotators": m["total_annotators"],
+            "graded_type": m["graded_type"],
+            "graded_presence": m["graded_presence"],
+            "extent": m["extent"],
+            "key_collision": False,
+        }
+        if key in out:
+            prev = out[key]
+            merged = Counter(prev["types"]); merged.update(m["types"])
+            rec["types"] = dict(merged)
+            rec["present_in"] = max(prev["present_in"], m["present_in"])
+            for f in ("type_disagreed", "presence_disagreed",
+                      "extent_disagreed", "disagreed"):
+                rec[f] = prev[f] or rec[f]
+            rec["type_disagreed"] = rec["type_disagreed"] or len(merged) > 1
+            rec["key_collision"] = True
+        out[key] = rec
+    return out

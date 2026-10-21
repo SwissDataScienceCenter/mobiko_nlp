@@ -87,6 +87,32 @@ We surveyed four contiguous protected areas in the core forest area of the south
 ]
 
 
+def _resolve_nested_spans(args) -> bool:
+    """The corpus preset decides unless explicitly overridden.
+
+    Whether a containing span is the same mention as the span inside it is a
+    fact about the annotation schema, so asking it per run invites getting it
+    wrong silently — and getting it wrong changes what counts as human
+    disagreement, which is the RQ2 target. An explicit override is logged
+    loudly rather than accepted quietly.
+    """
+    from src.multi_agent_annotation.corpora import CORPORA
+    # Read from the preset table, NOT from corpus_kwargs: that dict is splatted
+    # into the constructor, so putting this in it would collide with the
+    # explicit argument.
+    preset = bool(CORPORA[getattr(args, "corpus", "mobiko")].get("nested_spans", False))
+    choice = getattr(args, "nested_spans", "corpus")
+    if choice == "corpus":
+        return preset
+    wanted = choice == "on"
+    if wanted != preset:
+        print(f"[WARN] --nested-spans {choice} OVERRIDES the "
+              f"{getattr(args, 'corpus', '?')} preset ({preset}). This changes "
+              f"what the vote counts as one mention, so results are not "
+              f"comparable to runs using the preset.")
+    return wanted
+
+
 def load_sentences(input_path: Path) -> list[str]:
     """Load one sentence per non-empty line from a .txt file or directory of .txt files."""
     if input_path.is_dir():
@@ -457,17 +483,15 @@ def main() -> None:
              "self-reported confidence.",
     )
     parser.add_argument(
-        "--nested-spans", action="store_true",
-        help="In blind_pair mode, treat a span wholly containing another as the "
-             "SAME mention when the majority vote clusters annotations. IoU alone "
-             "penalises nesting — 'America' inside 'Corporate America' scores "
-             "0.41 and does not merge at the 0.5 threshold — so one mention "
-             "annotated at two granularities is otherwise recorded as two "
-             "mentions each missing from some annotators, turning an extent and "
-             "type dispute into a detection one. Right for CoNLL, where a name "
-             "is a name; not obviously right for a schema where 'species "
-             "richness' inside 'centres of species richness' may be two "
-             "distinct entities. Stamped into run_meta either way.",
+        "--nested-spans", choices=["corpus", "on", "off"], default="corpus",
+        help="Whether the blind-pair vote treats a span containing another as ONE "
+             "mention. Leave at 'corpus' (default): the right answer is a property "
+             "of the schema, not of the run, so each corpus preset carries it — "
+             "conll on, mobiko off. Not one of CoNLL's 3,288 within-annotator span "
+             "pairs nests, so nesting across annotators there can only be an "
+             "extent disagreement; MoBiKo's annotators nest deliberately (74 "
+             "pairs), where merging would erase real annotations. 'on'/'off' "
+             "override it and are logged as a deliberate departure.",
     )
     parser.add_argument(
         "--context-radius", type=int, default=1,
@@ -624,7 +648,7 @@ def main() -> None:
             guideline_search_enabled=(args.guideline_search != "off"),
             deliberation_mode=args.deliberation_mode,
             context_radius=args.context_radius,
-            nested_spans=args.nested_spans,
+            nested_spans=_resolve_nested_spans(args),
             relation_search_mandatory=(args.relation_search == "mandatory"),
             include_relation_schema=args.relation_schema_in_prompt,
             tool_choice=args.tool_choice,

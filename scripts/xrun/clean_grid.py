@@ -162,7 +162,7 @@ def build_rows_deep(path, hnorm):
         anns = hnorm.get(norm(rec.get("sentence", "")))
         if not anns or len(anns) < 2:
             continue
-        dis = L2.compute_human_span_disagreements(anns)
+        dis = L2.compute_human_span_disagreements_by_text(anns)
         for e in (rec.get("annotator_entity_logprobs") or []):
             k = L2._normalize(e.get("text", ""))
             if dis.get(k) is None:

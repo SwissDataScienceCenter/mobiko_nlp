@@ -42,6 +42,18 @@ CORPORA = {
         "relation_guide": _REPO / "src/multi_agent_annotation/Relation schema.csv",
         "seeds": _REPO / "src/resources_updated/manual_seeds_filled.py",
         "prompt_set": "mobiko",
+        # Whether the blind-pair vote treats a span containing another as ONE
+        # mention. Set per corpus, not per run, because it is a property of the
+        # schema and getting it wrong silently changes what "disagreement" means.
+        #
+        # FALSE for MoBiKo. Its annotators DO nest spans deliberately — 74 of
+        # 9,196 within-annotator span pairs on the 154 doubly-annotated
+        # sentences — because the schema annotates properties inside entities
+        # ('species richness' inside 'centres of species richness' are two
+        # annotatable things, and the boundary rule asks for the minimal head
+        # noun phrase). Merging them would erase real annotations rather than
+        # reveal a disagreement.
+        "nested_spans": False,
     },
     "conll": {
         "entity_schema": SCHEMA_CONLL_SHORT,
@@ -56,6 +68,13 @@ CORPORA = {
         # CoNLL-2003 annotates no relations, so there is no vocabulary to serve
         # and the relation tools are not registered.
         "relation_guide": None,
+        # TRUE for CoNLL. Not one of its 3,288 within-annotator span pairs
+        # nests — no annotator ever marked a name inside another of their own
+        # names — so nesting ACROSS annotators cannot be anything but a
+        # disagreement about extent. 'America' inside 'Corporate America'
+        # scores IoU 0.41 and would otherwise be filed as two entities people
+        # kept missing, losing the LOC-vs-ORG conflict entirely.
+        "nested_spans": True,
         "seeds": None,
         # Parallel prompt templates: newswire framing, no relations, CoNLL
         # boundary conventions. See prompts_conll.

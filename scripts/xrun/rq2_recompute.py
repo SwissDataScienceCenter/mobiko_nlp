@@ -24,6 +24,10 @@ for new runs; archived runs predate the field) and matched to mentions by
 overlap, so an agent that marked a real mention at a slightly different extent
 counts as talking about that mention rather than as a miss.
 
+THIS SCRIPT HOLDS THE PRIMARY RQ2 TARGET. The eval pipeline is still on the
+text-keyed matcher because it joins human to agent spans by text; see
+src/multi_agent_annotation/evaluation/MEASURING_HUMAN_DISAGREEMENT.md.
+
     python scripts/xrun/rq2_recompute.py
     python scripts/xrun/rq2_recompute.py --nested
 """
@@ -74,7 +78,7 @@ def collect(path, mark, dav, raws, nested):
         sent = raws.get(k, rec.get("sentence", ""))
         mentions = H.mention_disagreements([mark[k], dav[k]], nested=nested)
         # text-keyed target, for the side-by-side
-        text_dis = L2.compute_human_span_disagreements({
+        text_dis = L2.compute_human_span_disagreements_by_text({
             "m": {"entities": [{"text": s["text"], "entity_type": s["type"]}
                                for s in mark[k]]},
             "d": {"entities": [{"text": s["text"], "entity_type": s["type"]}

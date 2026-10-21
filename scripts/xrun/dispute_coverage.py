@@ -112,7 +112,7 @@ def main():
             if not anns or len(anns) < 2:
                 continue
             lit, ends, ent = collect(rec)
-            for key, info in L2.compute_human_span_disagreements(anns).items():
+            for key, info in L2.compute_human_span_disagreements_by_text(anns).items():
                 y = 1.0 if info["type_disagreed"] else 0.0
                 for name, flagged in (("literal", key in lit),
                                       ("endpoints", key in ends),

@@ -211,7 +211,7 @@ def deliberation_history(multi):
                         sev_ct[lab] += 1
                         for k in DC.implicated_spans(d.get("target")):
                             sev.setdefault(k, set()).add(lab)
-                for key, info in _L2.compute_human_span_disagreements(anns).items():
+                for key, info in _L2.compute_human_span_disagreements_by_text(anns).items():
                     if key not in sev:
                         continue
                     y = 1 if info["type_disagreed"] else 0

@@ -91,7 +91,7 @@ def check_graded_vs_binary():
     for a in human.values():
         if len(a) < 2:
             continue
-        for info in L2.compute_human_span_disagreements(a).values():
+        for info in L2.compute_human_span_disagreements_by_text(a).values():
             tot += 1
             g, _ = L2.graded_disagreement(info)
             same += int((g > 0) == info["type_disagreed"])
@@ -115,7 +115,7 @@ def check_span_dropping():
             a = hnorm.get(norm(r.get("sentence", "")))
             if not a or len(a) < 2:
                 continue
-            dis = L2.compute_human_span_disagreements(a)
+            dis = L2.compute_human_span_disagreements_by_text(a)
             for e in (r.get("annotator_entity_logprobs") or []):
                 lp = e.get("type_mean_logprob")
                 if lp is None:

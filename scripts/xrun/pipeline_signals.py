@@ -80,7 +80,7 @@ def build_rows(path: Path, hnorm: dict) -> list:
         anns = hnorm.get(norm(rec.get("sentence", "")))
         if not anns or len(anns) < 2:
             continue
-        dis = L2.compute_human_span_disagreements(anns)
+        dis = L2.compute_human_span_disagreements_by_text(anns)
         critic = agent_disagreed_spans(rec)
         touched = audit_touched(rec)
         flagged = 1.0 if rec.get("flagged_for_human_review") else 0.0

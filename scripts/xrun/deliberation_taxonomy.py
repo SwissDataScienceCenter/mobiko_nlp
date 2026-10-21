@@ -90,7 +90,7 @@ def main():
                 continue
             spans, kinds = split_disputes(rec)
             tot.update(kinds)
-            dis = L2.compute_human_span_disagreements(anns)
+            dis = L2.compute_human_span_disagreements_by_text(anns)
             for key, info in dis.items():
                 # score every span a human marked, flagged by whether the Critic
                 # raised an ENTITY-type dispute about it
