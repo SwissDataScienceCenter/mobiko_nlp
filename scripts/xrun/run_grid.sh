@@ -21,6 +21,7 @@
 #   scripts/xrun/run_grid.sh mobiko multi solo  # the review baseline
 #   DRY_RUN=1 scripts/xrun/run_grid.sh conll    # print what would run
 #   ONLY=apertus scripts/xrun/run_grid.sh conll # just the Apertus cells
+#   SMOKE=5 scripts/xrun/run_grid.sh conll      # 5 sentences/model, r1 only
 #   WAIT_MAX=7200 scripts/xrun/run_grid.sh conll  # tolerate a 2h outage
 #
 # Launch it detached, or a dropped SSH session SIGHUPs the whole job:
@@ -86,17 +87,31 @@ $PY scripts/xrun/grid_config.py --print --corpus "$CORPUS" --arms "${ARMS[@]}" >
 eval "$(grep '^export ' "$PLAN")"
 
 LOGDIR="logs/grid_${CORPUS}"
-mkdir -p "$LOGDIR" data/auto_annotated
+OUTDIR="data/auto_annotated"
+if [[ -n "${SMOKE:-}" ]]; then
+  LOGDIR="logs/smoke_${CORPUS}"
+  OUTDIR="data/auto_annotated/smoke"
+fi
+mkdir -p "$LOGDIR" "$OUTDIR"
 
 # ONLY=<substring> restricts the cells, so several models can run at once in
 # separate shells without racing for the same output file. Sequential within a
 # shell is deliberate: the cells share one RCP endpoint.
-mapfile -t CELLS < <(grep -v '^export ' "$PLAN" | { [[ -n "${ONLY:-}" ]] && grep -- "$ONLY" || cat; })
+# SMOKE=N: N sentences per model, first replicate only, into a SEPARATE output
+# directory. Separate because a 5-record file sitting at the real grid's output
+# path is indistinguishable from a cell that died at sentence 5, and the next
+# launch would silently resume the 400-sentence run on top of it. Same config,
+# so the records would not actually be wrong -- but "is this smoke residue or a
+# crashed cell" is not a question worth having at hour 60.
+mapfile -t CELLS < <(grep -v '^export ' "$PLAN" \
+  | { [[ -n "${ONLY:-}" ]] && grep -- "$ONLY" || cat; } \
+  | { [[ -n "${SMOKE:-}" ]] && grep -- '_r1\.jsonl' || cat; })
 if [[ ${#CELLS[@]} -eq 0 ]]; then
   echo "FAIL: ONLY='${ONLY:-}' matched no cells" >&2; exit 1
 fi
 echo
 echo "corpus $CORPUS   arms ${ARMS[*]}   ${#CELLS[@]} cells   logs in $LOGDIR"
+[[ -n "${SMOKE:-}" ]] && echo "SMOKE: $SMOKE sentences/cell, r1 only, output -> $OUTDIR"
 echo
 
 n=0; ran=0; skipped=0; failed=0
@@ -104,6 +119,11 @@ BAD_MODELS=()
 for cmd in "${CELLS[@]}"; do
   n=$((n + 1))
   out="$(sed -n 's/.*--output \([^ ]*\).*/\1/p' <<<"$cmd")"
+  if [[ -n "${SMOKE:-}" ]]; then
+    newout="$ROOT/$OUTDIR/$(basename "$out")"
+    cmd="${cmd/$out/$newout} --num-sentences $SMOKE"
+    out="$newout"
+  fi
   name="$(basename "${out%.jsonl}")"
   log="$LOGDIR/$name.log"
 
@@ -121,6 +141,9 @@ for cmd in "${CELLS[@]}"; do
   # --resume should continue, not one this loop should skip.
   want="$(grep -cve '^[[:space:]]*$' \
       "$(sed -n 's/.*--input \([^ ]*\).*/\1/p' <<<"$cmd")" 2>/dev/null || echo 0)"
+  # In smoke mode the cell stops at N, so N is what "done" means -- otherwise
+  # every smoke cell looks partial and gets re-run on the next invocation.
+  [[ -n "${SMOKE:-}" && "$SMOKE" -lt "$want" ]] && want="$SMOKE"
   have=0
   [[ -f "$out" ]] && have="$(grep -c '^{' "$out" 2>/dev/null || echo 0)"
   if [[ "$want" -gt 0 && "$have" -ge "$want" ]]; then
