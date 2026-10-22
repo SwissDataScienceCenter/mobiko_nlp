@@ -21,6 +21,10 @@
 #   scripts/xrun/run_grid.sh mobiko multi solo  # the review baseline
 #   DRY_RUN=1 scripts/xrun/run_grid.sh conll    # print what would run
 #   ONLY=apertus scripts/xrun/run_grid.sh conll # just the Apertus cells
+#   WAIT_MAX=7200 scripts/xrun/run_grid.sh conll  # tolerate a 2h outage
+#
+# Launch it detached, or a dropped SSH session SIGHUPs the whole job:
+#   nohup setsid ./scripts/xrun/run_grid.sh conll blind > logs/grid.log 2>&1 &
 set -uo pipefail
 
 ROOT="/home/katinska/mobiko_nlp"
@@ -36,6 +40,34 @@ if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
 if [[ -z "${RCP_API_KEY:-}" ]]; then
   echo "FAIL: RCP_API_KEY unset and not in .env" >&2; exit 1
 fi
+
+# Wait for the endpoint to answer, up to WAIT_MAX seconds. This is the whole
+# point of the gate: a dropped VPN is the common interruption on this job, and
+# the pipeline's own retry is 2 attempts per sentence, which a multi-minute
+# outage outlasts. Without the gate, an outage does not pause the run -- every
+# sentence fails fast on DNS, the cell "finishes" in a minute having written
+# nothing, and the loop marches through the remaining cells doing the same.
+# Resume would recover it all on the next launch, but the 80-hour job would be
+# over in 20 minutes and you would not find out until morning.
+WAIT_MAX="${WAIT_MAX:-3600}"
+endpoint_up() {
+  curl -s -o /dev/null -m 15 \
+    -H "Authorization: Bearer $RCP_API_KEY" \
+    https://inference.rcp.epfl.ch/v1/models 2>/dev/null
+}
+await_endpoint() {
+  local waited=0
+  endpoint_up && return 0
+  echo "    endpoint unreachable -- waiting (up to ${WAIT_MAX}s)" >&2
+  while (( waited < WAIT_MAX )); do
+    sleep 30; waited=$((waited + 30))
+    if endpoint_up; then
+      echo "    endpoint back after ${waited}s" >&2; return 0
+    fi
+  done
+  echo "FAIL: endpoint still unreachable after ${WAIT_MAX}s" >&2
+  return 1
+}
 
 export PYTHONPATH=".:src/multi_agent_annotation${PYTHONPATH:+:$PYTHONPATH}"
 PY=".mobiko-venv/bin/python"
@@ -90,13 +122,32 @@ for cmd in "${CELLS[@]}"; do
       "$n" "${#CELLS[@]}" "$name" "$have" "$want" "$(date +%H:%M)"
   if [[ -n "${DRY_RUN:-}" ]]; then echo "        $cmd --resume"; continue; fi
 
-  if $cmd --resume >>"$log" 2>&1; then
+  await_endpoint || exit 1
+
+  $cmd --resume >>"$log" 2>&1; rc=$?
+  after=0
+  [[ -f "$out" ]] && after="$(grep -c '^{' "$out" 2>/dev/null || echo 0)"
+
+  if [[ "$after" -le "$have" ]]; then
+    # Zero new records. Either the model cannot hold the output contract or the
+    # network went down between the gate and the first call. Both mean the next
+    # cell would fail identically, so stop here instead of burning the rest and
+    # leaving 18 empty files to interpret. Everything written so far is kept and
+    # re-invoking resumes from it.
+    failed=$((failed + 1))
+    echo "        STOPPED: $name wrote 0 new records (exit $rc) -- see $log" >&2
+    tail -5 "$log" | sed 's/^/        /' >&2
+    echo "        Fix the cause, then re-run; completed cells are skipped." >&2
+    break
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
     ran=$((ran + 1))
   else
+    # Progress was made but the cell exited non-zero: partial, and resumable.
     failed=$((failed + 1))
-    echo "        FAILED (exit $?) -- see $log" >&2
-    tail -3 "$log" | sed 's/^/        /' >&2
-    # Keep going: one unreachable model should not abandon the other five.
+    echo "        PARTIAL $name: $after/$want (exit $rc) -- see $log" >&2
+    # Keep going: one bad model should not abandon the other five.
   fi
 done
 
