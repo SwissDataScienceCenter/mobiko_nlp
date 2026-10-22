@@ -100,11 +100,21 @@ echo "corpus $CORPUS   arms ${ARMS[*]}   ${#CELLS[@]} cells   logs in $LOGDIR"
 echo
 
 n=0; ran=0; skipped=0; failed=0
+BAD_MODELS=()
 for cmd in "${CELLS[@]}"; do
   n=$((n + 1))
   out="$(sed -n 's/.*--output \([^ ]*\).*/\1/p' <<<"$cmd")"
   name="$(basename "${out%.jsonl}")"
   log="$LOGDIR/$name.log"
+
+  # A model that already failed a cell with the endpoint up will fail its other
+  # replicates identically; do not spend hours proving it three times.
+  this_model="$(sed -n 's/.*--annotator-model \([^ ]*\).*/\1/p' <<<"$cmd")"
+  if [[ " ${BAD_MODELS[*]:-} " == *" $this_model "* ]]; then
+    printf '[%2d/%2d] skip  %-52s model already failed\n' \
+        "$n" "${#CELLS[@]}" "$name"
+    skipped=$((skipped + 1)); continue
+  fi
 
   # "Done" = the output has as many records as the input has sentences. Mere
   # existence is not enough: a cell killed partway leaves a short file that
@@ -129,15 +139,26 @@ for cmd in "${CELLS[@]}"; do
   [[ -f "$out" ]] && after="$(grep -c '^{' "$out" 2>/dev/null || echo 0)"
 
   if [[ "$after" -le "$have" ]]; then
-    # Zero new records. Either the model cannot hold the output contract or the
-    # network went down between the gate and the first call. Both mean the next
-    # cell would fail identically, so stop here instead of burning the rest and
-    # leaving 18 empty files to interpret. Everything written so far is kept and
-    # re-invoking resumes from it.
+    # Zero new records: either the network went down, or this model cannot hold
+    # the output contract. The two need opposite responses, and re-probing the
+    # endpoint separates them. Stopping on both -- which this did at first --
+    # means one model that cannot emit the blind-pair JSON halts every cell
+    # after it, including the models already known to work. Three of the six
+    # have never run this mode.
     failed=$((failed + 1))
-    echo "        STOPPED: $name wrote 0 new records (exit $rc) -- see $log" >&2
     tail -5 "$log" | sed 's/^/        /' >&2
-    echo "        Fix the cause, then re-run; completed cells are skipped." >&2
+    if endpoint_up; then
+      # Endpoint fine, so it is this model. Skip its remaining replicates and
+      # carry on with the other models.
+      model="$(sed -n 's/.*--annotator-model \([^ ]*\).*/\1/p' <<<"$cmd")"
+      BAD_MODELS+=("$model")
+      echo "        SKIP MODEL $model: wrote 0 new records, endpoint is up" \
+           "(exit $rc) -- see $log" >&2
+      continue
+    fi
+    echo "        STOPPED at $name: 0 new records and the endpoint is down" \
+         "(exit $rc)" >&2
+    echo "        Nothing is lost; re-run to resume." >&2
     break
   fi
 
@@ -153,4 +174,8 @@ done
 
 echo
 echo "ran $ran   skipped $skipped   failed $failed"
+if [[ ${#BAD_MODELS[@]} -gt 0 ]]; then
+  echo "models that produced nothing: ${BAD_MODELS[*]}"
+  echo "  (endpoint was up, so check that model's log for the parse failure)"
+fi
 [[ "$failed" -eq 0 ]] || exit 1
