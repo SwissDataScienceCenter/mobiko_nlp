@@ -42,21 +42,43 @@ for _p in (ROOT, ROOT / "src" / "multi_agent_annotation"):
 
 # ── the grid ────────────────────────────────────────────────────────────────
 
-# Six models: two within-family SCALE pairs plus two further families.
+# Five models, one per family. THE SCALE PAIRS ARE GONE — read this before
+# citing the grid as a scale contrast, because an earlier revision of this file
+# claimed one and the claim no longer holds.
 #
-# The scale pairs are the point. A spread of unrelated models can only show
-# that uncertainty-readability differs between models; a pair that varies scale
-# inside one family can show what it varies with. The probe of 2026-10-19 made
-# this better than designed — reasoning status splits exactly along the pairs,
-# so scale is contrasted once inside a reasoning family (Qwen) and once inside
-# a non-reasoning one (Apertus).
+# The design was two within-family scale pairs (Qwen 35B/397B reasoning, Apertus
+# 8B/70B non-reasoning) on the argument that a spread of unrelated models can
+# only show THAT uncertainty-readability differs between models, while a pair
+# varying scale inside one family can show what it varies WITH. The 5-sentence
+# CoNLL smoke of 2026-10-22 killed both pairs, for unrelated reasons:
 #
-# Apertus is load-bearing beyond being a family. Reasoning models emit
-# chain-of-thought into the same stream the logprobs are captured from, so
-# annotator_mean_logprob pools reasoning with answer tokens. Apertus is the only
-# non-reasoning pair available and therefore the control that separates "this
+#   rcp-qwen3.5-397B  Correct on every measure — 20/20 role parses, 5/5
+#       adjudications, 0 unresolved offsets — and 407 s/sentence, which is 45 h
+#       for one 400-sentence cell and 136 h for three replicates. Removed on
+#       cost, not capability. If wall clock ever stops mattering it is the one
+#       to bring back first, and it alone restores a scale pair.
+#
+#   rcp-apertus-8B  Emits malformed tool calls: "Invalid tool call",
+#       "Unterminated string", 400 from the gateway, both retries identical.
+#       Lost 2 of 5 sentences and 4 of 12 role parses. Not a cost decision.
+#       Confirmed to be the MODEL and not RCP's serving layer — the same weights
+#       on CSCS-Inference reproduce the signature exactly — and the
+#       -tools-thinking variant only partly mitigates it (3/3 records but still
+#       8/12 role parses and 53k tokens/sentence of retry overhead). See the
+#       swissai-apertus-8B-* entries in model_endpoints for both probes.
+#
+# WHAT THE GRID CAN AND CANNOT SAY NOW. Five families, so differences between
+# models remain measurable. Scale does not vary inside any family, so a
+# difference CANNOT be attributed to scale. Do not write "larger models are
+# better at X" from these cells.
+#
+# Apertus-70B is load-bearing and now carries its job alone. Reasoning models
+# emit chain-of-thought into the same stream the logprobs are captured from, so
+# annotator_mean_logprob pools reasoning with answer tokens. Apertus-70B is the
+# only non-reasoning model left and therefore the sole control separating "this
 # model's uncertainty is unreadable" from "this model's logprobs are mostly
-# reasoning".
+# reasoning" — a contrast of one against four, where it used to be a pair. If it
+# fails or is withdrawn, that control is gone, not degraded.
 #
 # PRECISION IS PINNED TO THE UNSUFFIXED ID. The RCP allow-list carries -fp8 and
 # -bfloat16 variants of nearly all of these. Quantisation changes the logit
@@ -70,17 +92,31 @@ for _p in (ROOT, ROOT / "src" / "multi_agent_annotation"):
 # error-type discrimination (0.78, 0.94). Its three archived runs stay in the
 # paper as that contrast; it is not carried into the rebuilt grid.
 #
+# KIMI IS BACK, and it is reached by a different endpoint from the other four.
+# "Withdrawn" was only ever true of the RCP route: inference.rcp.epfl.ch has
+# returned 403 for it since 2026-10, but api.swissai.svc.cscs.ch still serves it
+# as CSCS-Inference/moonshotai/Kimi-K2.7-Code, and it held the blind-pair
+# pipeline at 8/8 role parses on a 3-sentence probe. It earns its cell on more
+# than family breadth: all 17 archived runs used Kimi or DeepSeek, so having it
+# live again is what makes those runs comparable to new ones instead of a
+# dangling contrast.
+#
+# Consequence for anything that launches this grid: the models no longer share
+# one endpoint or one API key. A launcher that checks only RCP_API_KEY, or
+# probes only inference.rcp.epfl.ch for reachability, will pass preflight and
+# then fail the Kimi cells. run_grid.sh checks and probes both.
+#
 # No mixed-model arms. The DeepSeek-annotator/Kimi-critic run was how the
-# annotator-seat vs critic-seat question got asked, but Kimi is withdrawn and
-# the Critic adds +0.004 AUC over the Annotator's own confidence in either
-# seat, so the question no longer discriminates anything worth a cell.
+# annotator-seat vs critic-seat question got asked, and Kimi being live again
+# makes it possible — but the Critic adds +0.004 AUC over the Annotator's own
+# confidence in either seat, so the question still does not discriminate
+# anything worth a cell.
 MODELS = [
-    "rcp-qwen3.6-35B",      # Qwen, small, reasoning
-    "rcp-qwen3.5-397B",     # Qwen, large, reasoning
-    "rcp-apertus-8B",       # Swiss-AI, small, NOT reasoning
-    "rcp-apertus-70B",      # Swiss-AI, large, NOT reasoning
+    "rcp-qwen3.6-35B",      # Qwen, reasoning
+    "rcp-apertus-70B",      # Swiss-AI, NOT reasoning — the only one
     "rcp-deepseek-4.1",     # DeepSeek, reasoning
     "rcp-glm-5.3",          # Zhipu, reasoning
+    "swissai-kimi-2.7",     # Moonshot, reasoning — api.swissai, not rcp
 ]
 
 # Both arms, every cell. The previous grid had solo arms for only some models,

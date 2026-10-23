@@ -35,12 +35,39 @@ CORPUS="${1:-conll}"
 shift || true
 ARMS=("${@:-blind}")
 
-# RCP_API_KEY. Without it every cell dies on auth after the model list prints,
-# which looks like a model problem rather than a credentials one.
 if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
-if [[ -z "${RCP_API_KEY:-}" ]]; then
-  echo "FAIL: RCP_API_KEY unset and not in .env" >&2; exit 1
+
+export PYTHONPATH=".:src/multi_agent_annotation${PYTHONPATH:+:$PYTHONPATH}"
+PY=".mobiko-venv/bin/python"
+
+# The grid is no longer single-endpoint: Kimi is served by
+# api.swissai.svc.cscs.ch while the other four are on inference.rcp.epfl.ch, and
+# the two use different API keys. So the credentials and the reachability gate
+# are DERIVED from the models in the grid rather than hardcoded -- hardcoding
+# RCP_API_KEY is exactly how a preflight passes and the Kimi cells then die on
+# auth four hours in.
+mapfile -t ENDPOINTS < <($PY - <<'ENDPOINTS_PY'
+import sys
+sys.path.insert(0, "scripts/xrun")
+from grid_config import MODELS
+from src.resources_updated.model_endpoints import MODEL_ENDPOINTS as E
+pairs = {}
+for m in MODELS:
+    ep = E[m]
+    pairs[(ep["api_key_env"], ep["base_url"])] = True
+for env, url in pairs:
+    print(env + "\t" + url)
+ENDPOINTS_PY
+)
+if [[ ${#ENDPOINTS[@]} -eq 0 ]]; then
+  echo "FAIL: could not resolve the grid's endpoints" >&2; exit 1
 fi
+for row in "${ENDPOINTS[@]}"; do
+  env="${row%%$'\t'*}"
+  if [[ -z "${!env:-}" ]]; then
+    echo "FAIL: $env unset and not in .env (needed by this grid)" >&2; exit 1
+  fi
+done
 
 # Wait for the endpoint to answer, up to WAIT_MAX seconds. This is the whole
 # point of the gate: a dropped VPN is the common interruption on this job, and
@@ -51,10 +78,15 @@ fi
 # Resume would recover it all on the next launch, but the 80-hour job would be
 # over in 20 minutes and you would not find out until morning.
 WAIT_MAX="${WAIT_MAX:-3600}"
+# Every endpoint the grid uses must answer, not just the first one.
 endpoint_up() {
-  curl -s -o /dev/null -m 15 \
-    -H "Authorization: Bearer $RCP_API_KEY" \
-    https://inference.rcp.epfl.ch/v1/models 2>/dev/null
+  local row env url
+  for row in "${ENDPOINTS[@]}"; do
+    env="${row%%$'\t'*}"; url="${row#*$'\t'}"
+    curl -s -o /dev/null -m 15 -H "Authorization: Bearer ${!env}" \
+      "$url/models" 2>/dev/null || return 1
+  done
+  return 0
 }
 await_endpoint() {
   local waited=0
@@ -70,8 +102,6 @@ await_endpoint() {
   return 1
 }
 
-export PYTHONPATH=".:src/multi_agent_annotation${PYTHONPATH:+:$PYTHONPATH}"
-PY=".mobiko-venv/bin/python"
 PLAN="$(mktemp)"
 trap 'rm -f "$PLAN"' EXIT
 
