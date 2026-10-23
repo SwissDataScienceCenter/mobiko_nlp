@@ -195,4 +195,91 @@ MODEL_ENDPOINTS = {
         "reasoning": False,
         "withdrawn": "403 since 2026-10; archived runs only",
     },
+
+    # ── api.swissai.svc.cscs.ch: the SUPERSET gateway ────────────────────────
+    #
+    # Probed 2026-10-22. This endpoint fronts three serving stacks and the model
+    # ids carry the stack as a prefix: RCP-AIaaS/* are the same deployments the
+    # inference.rcp.epfl.ch entries above reach directly, plus CSCS-Inference/*
+    # and SwissAI-Research/*, which are NOT reachable through the RCP base_url.
+    # That is why the two legacy swissai-* entries above 404: their ids predate
+    # the prefixes, not the endpoint.
+    #
+    # All ten probed candidates answered, served logprobs at depth 20 and
+    # reported usage. Tool calling is what separates them, and a raw tool probe
+    # is NOT sufficient -- rcp-apertus-8B passes one and still fails the
+    # blind-pair pipeline with malformed tool calls -- so each entry below
+    # records its PIPELINE result.
+    #
+    # NO TIMINGS are recorded here on purpose. The five pipeline probes ran
+    # CONCURRENTLY and contended with each other, so their seconds-per-sentence
+    # are not comparable to the sequential grid smoke. Separately, rcp-apertus-
+    # 70B measured 38 s/sentence on 2026-10-21 and 106 s on 2026-10-22 at
+    # identical settings, so endpoint load moves these figures by a factor of
+    # three and any number written here would be read as more stable than it is.
+    # Time a candidate sequentially, close to when it would run.
+    "swissai-apertus-8B-tools": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "SwissAI-Research/swiss-ai/Apertus-v1.5-8B-tools-thinking",
+        "reasoning": False,
+        # The candidate for the seat rcp-apertus-8B cannot hold. The sibling
+        # -fixed variant refuses tools outright and -thinking 400s on them, so
+        # this was the only 8B variant worth the pipeline test.
+        # PIPELINE 2026-10-22, 3 CoNLL sentences: 3/3 records (against 3/5 for
+        # rcp-apertus-8B) and no tool-call 400s, but only 8/12 role parses and
+        # 53k tokens/sentence -- the highest of any model measured, which is
+        # retry overhead. Better than the RCP 8B, still not clean.
+    },
+    "swissai-apertus-8B-cscs": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "CSCS-Inference/swiss-ai/Apertus-v1.5-8B",
+        "reasoning": False,
+        # Same weights as rcp-apertus-8B on a different stack, probed to find
+        # out whether the RCP failure was the serving layer's tool-call parsing
+        # or the model.
+        # PIPELINE 2026-10-22: 1/3 records, with the IDENTICAL failure signature
+        # -- "Invalid tool call", "Unterminated string", 400. Two stacks, one
+        # bug: it is the model. Kept as the record of that result; do not put it
+        # in a grid.
+    },
+    "swissai-kimi-2.7": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "CSCS-Inference/moonshotai/Kimi-K2.7-Code",
+        "reasoning": True,
+        # rcp-kimi-2.7 is 403 and marked withdrawn; this stack still serves it,
+        # so "withdrawn" was only ever true of the RCP route.
+        # PIPELINE 2026-10-22: 2/3 records, 8/8 role parses, 2/2 adjudications,
+        # 0 unresolved offsets. One sentence lost. Holds the contract well
+        # enough to be worth a longer probe, which matters because it would make
+        # the 17 archived runs comparable to new ones again.
+    },
+    "swissai-qwen3.8-27B": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "SwissAI-Research/Qwen/Qwen3.8-27B",
+        "reasoning": True,
+        # Listed three times by /v1/models, i.e. three replicas. A newer
+        # generation than rcp-qwen3.6-35B, so NOT a scale pair with it.
+        # PIPELINE 2026-10-22: the cleanest candidate -- 3/3 records, 12/12 role
+        # parses, 3/3 adjudications, 0 unresolved offsets. But 109k
+        # tokens/sentence, four to five times every other model, so it is the
+        # most expensive thing here by a wide margin.
+    },
+    "swissai-nemotron-120B": {
+        "base_url": "https://api.swissai.svc.cscs.ch/v1",
+        "api_key_env": "SWISSAI_API_KEY",
+        "model": "CSCS-Inference/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+        "reasoning": True,
+        # CAUTION: the only id offered carries a -BF16 precision suffix, which
+        # grid_config.check() rejects by design -- quantisation moves the logit
+        # distribution, hence the logprobs and entropy that RQ2 measures. Usable
+        # as a comparison point, not as a drop-in grid cell, unless that guard
+        # is consciously relaxed for it.
+        # PIPELINE 2026-10-22: 2/3 records, 8/8 role parses, 2/2 adjudications,
+        # 0 unresolved offsets. The contract is fine; the precision suffix is
+        # the blocker, not the capability.
+    },
 }
