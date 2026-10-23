@@ -72,7 +72,9 @@ cd /home/katinska/mobiko_nlp && PYTHONPATH=.:src/multi_agent_annotation .mobiko-
 
 ## Notes
 
-- Needs **both** `RCP_API_KEY` and `SWISSAI_API_KEY` in `.env` — Kimi is on a
-  different endpoint. Preflight fails loudly if either is missing.
+- Keys: both `RCP_API_KEY` and `SWISSAI_API_KEY` are already in `.env`, and the
+  runner sources it itself — nothing to export. (Two keys because Kimi is on
+  `api.swissai.svc.cscs.ch` and the other four are on `inference.rcp.epfl.ch`.)
+  Preflight names the missing one if that ever changes.
 - Commit before launching, or every record is stamped `<sha>-dirty`.
 - `DRY_RUN=1` prints the cell list without running anything.
