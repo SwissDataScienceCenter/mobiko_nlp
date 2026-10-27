@@ -1,5 +1,124 @@
 from typing import Annotated, Dict, List, Optional, Tuple, Any
 
+from label_norm import NO_PROPERTY, RELATION_PROPERTIES
+
+
+# ─────────────────────────── relation properties ───────────────────────────
+#
+# A relation's "property" qualifies the relation itself: that it does NOT hold,
+# that it holds in the negative direction. Same field, same four values and same
+# spelling as the relation annotation page (deploy_annotate/
+# relation_annotation_page.py), so agent output and Mark's and Davnah's
+# annotations mean one thing by it. Without it a negated finding — "elevation did
+# not affect richness" — reaches the graph as the positive triplet.
+#
+# OPT-IN, default off in these functions. The review-path prompts are pinned by
+# tests/test_review_pipeline_frozen.py so that archived runs stay reproducible;
+# with relation_properties=False every prompt renders byte-identical to that, the
+# vague one-line mention included. The pipeline turns it on for new runs
+# (MultiAgentAnnotator(relation_properties=True), demo_ag2 --no-relation-properties
+# to turn it off).
+#
+# The examples are Mark's and Davnah's own, from their relation annotations of
+# the human-gold abstracts, relabelled only where they used a relation that is not
+# in the current guide.
+
+_LEGACY_PROPERTY_LINE = (
+    "For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE "
+    "POLARITY or a custom one. ")
+
+_RELATION_PROPERTY_SECTION = f"""## Relation properties
+Every relation has a "property": "" when none applies, otherwise exactly ONE of \
+{", ".join(f'"{p}"' for p in RELATION_PROPERTIES)} (spelled exactly so).
+
+- "Negation" — the sentence says the relation does NOT hold, including a result \
+reported as not significant. Annotate the relation the sentence talks about and \
+mark it: never leave a relation out because it is negated, and never swap in a \
+different relation instead.
+    "Elevation did not affect beetle species richness" -> Elevation AFFECTS species richness, "Negation"
+    "Odonata ... are generally absent from the Sierra above 3000m" -> Odonata LOCATED_IN Sierra, "Negation"
+    "There were no interactive effects of temperature and predator presence" -> temperature INTERACTS_WITH predator presence, "Negation"
+    "The CV ... did not significantly change with elevation (p = .135)" -> CV VARIES_WITH elevation, "Negation"
+- "Negative_polarity" — the relation holds, in the negative or inverse direction: \
+a decrease, a hindrance, a negative association or response.
+    "limited information ... hinders effective conservation efforts" -> limited information AFFECTS conservation efforts, "Negative_polarity"
+    "Predator presence ... negatively associated with daily numerical abundance" -> Predator presence ASSOCIATED_WITH numerical abundance, "Negative_polarity"
+    "richness ... declines linearly with increasing elevation" -> richness INCREASES_WITH elevation, "Negative_polarity"
+- "Exclusive" — the relation holds only for this argument: "only", "exclusively", \
+"restricted to".
+    "the crested porcupine ... was only detected in the Montane Forest" -> crested porcupine LOCATED_IN Montane Forest, "Exclusive"
+- "Dominance" — the relation holds for the predominant case: "mainly", \
+"predominantly", "mostly". When dominance IS the relation, use the DOMINATES \
+relation instead; this property qualifies some other relation.
+
+Deciding:
+- "did not change", "no effect", "absent", "without", "not significant" -> \
+"Negation". "decreased", "lower", "declines", "negatively", "hinders" -> \
+"Negative_polarity". A negated decrease ("did not decline") is "Negation".
+- The negation must apply to THIS relation. In "NPP was negatively related to \
+soil C:N ratio, which was not the case in the other NPP components", NPP \
+CORRELATES_WITH soil C:N ratio is "Negative_polarity"; the "not" is about the \
+other components.
+- One property per relation. Use a short custom label only when the sentence \
+qualifies the relation in a way none of these covers, e.g. a hedged "may" -> \
+"certainty_medium"."""
+
+_CRITIC_PROPERTY_CHECK = f"""
+
+Check every relation's "property" against the sentence. A missing "Negation" makes \
+a triplet state the opposite of what the sentence says: treat it as a major error. \
+To dispute a property, file a disagreement whose "target" is the triplet \
+("e1 --RELATION--> e2"), with "annotator_label" = the property it has now and \
+"proposed_label" = the property it should have; write "{NO_PROPERTY}" for "no \
+property" in either field."""
+
+_ADJUDICATOR_PROPERTY_RULE = """
+
+Every relation in "final_relations" carries its "property". Keep the property the \
+annotation gave a relation unless it was disputed; when you resolve a dispute about \
+one, write the property you decided ("" for none)."""
+
+
+def _property_section(enabled: bool, role: str = "annotator") -> str:
+    """The relation-property guidance for a prompt, or the legacy one-liner.
+
+    `role` adds what only that agent needs: the Critic how to dispute a property,
+    the Adjudicator that properties are carried and decided like labels.
+    """
+    if not enabled:
+        return _LEGACY_PROPERTY_LINE
+    extra = {"critic": _CRITIC_PROPERTY_CHECK,
+             "adjudicator": _ADJUDICATOR_PROPERTY_RULE}.get(role, "")
+    return _RELATION_PROPERTY_SECTION + extra
+
+
+def _property_block(enabled: bool, role: str) -> str:
+    """For prompts that never carried the legacy line: nothing when off."""
+    return "\n\n" + _property_section(True, role) if enabled else ""
+
+
+def _property_example(enabled: bool) -> str:
+    """The "property" key in a relation output example, when properties are on."""
+    return ' "property": "",' if enabled else ""
+
+
+def _critic_property_example(enabled: bool) -> str:
+    """A worked property dispute appended to the Critic's disagreement examples."""
+    if not enabled:
+        return ""
+    return ('},\n    {"target": "Elevation --AFFECTS--> species richness", '
+            f'"annotator_label": "{NO_PROPERTY}", "proposed_label": "Negation", '
+            '"guideline_reference": "", "severity": "major", '
+            '"explanation": "the sentence says elevation did NOT affect richness"')
+
+
+def _critic_property_rule(enabled: bool) -> str:
+    if not enabled:
+        return ""
+    return (f'\n- To change a relation\'s "property", put the property (or '
+            f'"{NO_PROPERTY}") in "proposed_label" — never "none" or "invalid", '
+            f'which remove the relation itself.')
+
 
 # ─────────────────────────────────────────────────────────────
 # Agent system prompts
@@ -91,7 +210,8 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
                           relation_search_mandatory: bool = False,
                           relation_types: Optional[List[str]] = None,
                           guideline_search_enabled: bool = True,
-                          standalone: bool = False) -> str:
+                          standalone: bool = False,
+                          relation_properties: bool = False) -> str:
     """standalone=True renders the prompt for an annotator whose output is final.
 
     Used by the single-pass arm and by the blind-pair pipeline, where Annotator A,
@@ -146,7 +266,7 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
 
 {relation_vocab_section}
 
-For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
+{_property_section(relation_properties, 'annotator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -192,7 +312,7 @@ Return a JSON object with exactly these fields (field values here are just examp
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
   ],
   "relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -213,7 +333,8 @@ def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict
                        guideline_search_mandatory: bool = True,
                        relation_search_mandatory: bool = False,
                        relation_types: Optional[List[str]] = None,
-                       precedent_memory: bool = True) -> str:
+                       precedent_memory: bool = True,
+                       relation_properties: bool = False) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -268,7 +389,7 @@ Disagreement is expected and productive — correctness matters more than consen
 
 {relation_vocab_section}
 
-For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
+{_property_section(relation_properties, 'critic')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -313,7 +434,7 @@ Return a JSON object with exactly these fields:
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
     {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE",  "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}},
-    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "", "severity": "major", "explanation": "why this triplet should not exist"}}
+    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "", "severity": "major", "explanation": "why this triplet should not exist"{_critic_property_example(relation_properties)}}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY", "reasoning": "reason it should be annotated"}}
@@ -330,7 +451,7 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 "proposed_label" and file it as a disagreement. Confirmations are NOT disagreements.
 - To DELETE an annotation rather than relabel it, set "proposed_label" to exactly \
 "invalid". That is the only value read as a removal request: "REMOVE", "none", \
-"IGNORE" and anything else you might invent leave the annotation in place.
+"IGNORE" and anything else you might invent leave the annotation in place.{_critic_property_rule(relation_properties)}
 - "proposed_label" carries an ENTITY TYPE when you dispute a span's type and a \
 RELATION NAME when you dispute a triplet's label. Use the vocabulary that matches \
 what you are disputing; never put a whole triplet in this field.
@@ -342,7 +463,8 @@ def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schem
                               guideline_search_mandatory: bool = True,
                               relation_search_mandatory: bool = False,
                               relation_types: Optional[List[str]] = None,
-                              precedent_memory: bool = True) -> str:
+                              precedent_memory: bool = True,
+                              relation_properties: bool = False) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -380,7 +502,7 @@ raise it as a disagreement. Do not give the Annotator the benefit of the doubt.
 
 {relation_vocab_section}
 
-For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
+{_property_section(relation_properties, 'critic')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -450,7 +572,7 @@ Return a JSON object with exactly these fields:
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
     {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "Step X", "severity": "major", "explanation": "reason"}},
-    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "Step X", "severity": "major", "explanation": "why this triplet should not exist"}}
+    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "Step X", "severity": "major", "explanation": "why this triplet should not exist"{_critic_property_example(relation_properties)}}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY",  "reasoning": "reason it should be annotated"}}
@@ -467,7 +589,7 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 "proposed_label" and file it as a disagreement. Confirmations are NOT disagreements.
 - To DELETE an annotation rather than relabel it, set "proposed_label" to exactly \
 "invalid". That is the only value read as a removal request: "REMOVE", "none", \
-"IGNORE" and anything else you might invent leave the annotation in place.
+"IGNORE" and anything else you might invent leave the annotation in place.{_critic_property_rule(relation_properties)}
 - "proposed_label" carries an ENTITY TYPE when you dispute a span's type and a \
 RELATION NAME when you dispute a triplet's label. Use the vocabulary that matches \
 what you are disputing; never put a whole triplet in this field.
@@ -514,7 +636,8 @@ name the cue in the text that decided it."""
 def _annotator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
                                      guideline_search_mandatory: bool = False,
                                      relation_search_mandatory: bool = False,
-                                     relation_types: Optional[List[str]] = None) -> str:
+                                     relation_types: Optional[List[str]] = None,
+                                    relation_properties: bool = False) -> str:
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Annotator, a biodiversity NLP expert working in a COLD-START setting: the \
@@ -527,7 +650,7 @@ the Critic filters errors later.
 
 {relation_vocab_section}
 
-For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
+{_property_section(relation_properties, 'annotator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -574,7 +697,7 @@ Return a JSON object with exactly these fields (values here are just examples):
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "", "confidence": 0.9, "reasoning": "attribute measured on a biotic entity (birds); 'richness' is a count of taxa, so BIOTIC PROPERTY not ABIOTIC PROPERTY"}}
   ],
   "relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.81, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -595,7 +718,8 @@ def _critic_system_msg_coldstart(guideline: str, entity_schema: str, relation_sc
                                   guideline_search_mandatory: bool = False,
                                   relation_search_mandatory: bool = False,
                                   relation_types: Optional[List[str]] = None,
-                                  precedent_memory: bool = True) -> str:
+                                  precedent_memory: bool = True,
+                                 relation_properties: bool = False) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -626,7 +750,7 @@ leave it "" whenever the guideline is silent (which is nearly always).
 
 {relation_vocab_section}
 
-For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
+{_property_section(relation_properties, 'critic')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -685,7 +809,7 @@ Return a JSON object with exactly these fields:
   "agreements": [{{"target": "span text", "label": "ENTITY_TYPE or RELATION"}}],
   "disagreements": [
     {{"target": "span text", "annotator_label": "WRONG_TYPE", "proposed_label": "CORRECT_TYPE", "guideline_reference": "", "severity": "major", "explanation": "distinguishing principle: X is CORRECT_TYPE not WRONG_TYPE because <cue in the sentence>"}},
-    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "", "severity": "major", "explanation": "why this triplet should not exist"}}
+    {{"target": "a --RELATION--> b", "annotator_label": "RELATION_NAME", "proposed_label": "invalid", "guideline_reference": "", "severity": "major", "explanation": "why this triplet should not exist"{_critic_property_example(relation_properties)}}}
   ],
   "missing_annotations": [
     {{"text": "missed span", "entity_type": "BIOTIC ENTITY", "reasoning": "reason it should be annotated"}}
@@ -702,7 +826,7 @@ AGREE with a label, list it under "agreements" — never copy the annotator's la
 "proposed_label" and file it as a disagreement. Confirmations are NOT disagreements.
 - To DELETE an annotation rather than relabel it, set "proposed_label" to exactly \
 "invalid". That is the only value read as a removal request: "REMOVE", "none", \
-"IGNORE" and anything else you might invent leave the annotation in place.
+"IGNORE" and anything else you might invent leave the annotation in place.{_critic_property_rule(relation_properties)}
 - "proposed_label" carries an ENTITY TYPE when you dispute a span's type and a \
 RELATION NAME when you dispute a triplet's label. Use the vocabulary that matches \
 what you are disputing; never put a whole triplet in this field.
@@ -714,7 +838,8 @@ what you are disputing; never put a whole triplet in this field.
 
 def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
                                        relation_search_mandatory: bool = False,
-                                       relation_types: Optional[List[str]] = None) -> str:
+                                       relation_types: Optional[List[str]] = None,
+                                      relation_properties: bool = False) -> str:
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations, working in a \
@@ -730,7 +855,7 @@ forcing a confident label.
 
 {relation_vocab_section}
 
-For each relation, the annotators could add PROPERTIES: NEGATION, NEGATIVE POLARITY or a custom one. 
+{_property_section(relation_properties, 'adjudicator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -761,7 +886,7 @@ Return a JSON object with exactly these fields, then end your message with TERMI
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "primary referent is …, so Y not X"}}
@@ -779,13 +904,14 @@ Output rules:
 
 def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                             relation_search_mandatory: bool = False,
-                            relation_types: Optional[List[str]] = None) -> str:
+                            relation_types: Optional[List[str]] = None,
+                            relation_properties: bool = False) -> str:
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations. 
 You see the Annotator's labels and the Critic's review.
 
-{relation_vocab_section}
+{relation_vocab_section}{_property_block(relation_properties, 'adjudicator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -817,7 +943,7 @@ Return a JSON object with exactly these fields, then end your message with TERMI
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "guideline step Z says..."}}
@@ -839,7 +965,8 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
                                guideline_search_mandatory: bool = True,
                                relation_search_mandatory: bool = False,
                                relation_types: Optional[List[str]] = None,
-                               guideline_search_enabled: bool = True) -> str:
+                               guideline_search_enabled: bool = True,
+                               relation_properties: bool = False) -> str:
     """Single-pass annotator: no Critic, no Adjudicator, output is final.
 
     WHY THIS EXISTS. _annotator_system_msg tells the model its "primary objective
@@ -877,6 +1004,7 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
         relation_search_mandatory=relation_search_mandatory,
         relation_types=relation_types,
         guideline_search_enabled=guideline_search_enabled,
+        relation_properties=relation_properties,
         standalone=True)
 
 
@@ -884,7 +1012,8 @@ def _adjudicator_system_msg_blind(guideline: str, entity_schema: str,
                                   relation_schema: dict,
                                   relation_search_mandatory: bool = False,
                                   relation_types: Optional[List[str]] = None,
-                                  guideline_search_enabled: bool = False) -> str:
+                                  guideline_search_enabled: bool = False,
+                                  relation_properties: bool = False) -> str:
     """Adjudicator for the blind-pair pipeline.
 
     A SIBLING of _adjudicator_system_msg, not a modification of it. The review
@@ -925,7 +1054,7 @@ same guideline, without seeing each other's work. You are shown their \
 annotations without being told which annotator produced which, and a list of \
 the specific spans they did not agree on. Your job is to decide those spans.
 
-{relation_vocab_section}
+{relation_vocab_section}{_property_block(relation_properties, 'adjudicator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -969,7 +1098,7 @@ Return a JSON object with exactly these fields, then end your message with TERMI
     {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "annotators split on the type of X", "decision": "X is Y", "rationale": "guideline step Z says..."}}

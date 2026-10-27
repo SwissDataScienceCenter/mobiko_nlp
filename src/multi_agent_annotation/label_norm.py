@@ -260,3 +260,62 @@ def off_schema_relation_report() -> Dict[str, int]:
 
 def reset_off_schema_relations() -> None:
     _OFF_SCHEMA_RELATIONS.clear()
+
+
+# ─────────────────────── relation properties ───────────────────────
+
+# An optional qualifier on a relation itself, not on its arguments: that the
+# relation does NOT hold, that it holds in the negative direction, and so on.
+# The same list, spelling and casing as RELATION_PROPERTIES in
+# deploy_annotate/relation_annotation_page.py, so agent output and Mark's and
+# Davnah's annotations share one convention and compare directly. That page
+# ships in its own image and cannot import this module;
+# tests/test_relation_properties.py fails if the two lists drift apart.
+RELATION_PROPERTIES = ["Negation", "Negative_polarity", "Exclusive", "Dominance"]
+
+# How the Critic says "this relation should carry NO property". It cannot write
+# "none": that is one of the removal verdicts, and would delete the relation.
+NO_PROPERTY = "No_property"
+
+_RELATION_PROPERTY_BY_KEY = {p.upper(): p for p in RELATION_PROPERTIES}
+# Listed explicitly, like the entity aliases — never fuzzy-matched.
+_RELATION_PROPERTY_ALIASES = {"NEGATED": "Negation"}
+_NO_PROPERTY_KEYS = {"", "NONE", "NULL", "N_A", "NA", "NO_PROPERTY"}
+_OFF_SCHEMA_PROPERTIES: Dict[str, int] = {}
+
+
+def canonicalize_relation_property(raw: Optional[str], record_off_schema: bool = True) -> str:
+    """Normalise a relation PROPERTY. "" means the relation has none.
+
+    "negation", "NEGATION", "negative polarity", "Negative-Polarity" -> the
+    spelling in RELATION_PROPERTIES. Anything else is a custom property, which
+    the annotators also use ("certainty_medium", "strong", "only"): it is
+    normalised the way the annotation page normalises a typed one — runs of
+    non-alphanumerics become "_", the annotator's casing is kept — and counted,
+    not dropped, exactly as an off-schema relation label is.
+    """
+    if raw is None or not isinstance(raw, str):
+        return ""
+    text = re.sub(r"[^A-Za-z0-9]+", "_", raw.strip()).strip("_")
+    key = text.upper()
+    if key in _NO_PROPERTY_KEYS:
+        return ""
+    if key in _RELATION_PROPERTY_BY_KEY:
+        return _RELATION_PROPERTY_BY_KEY[key]
+    if key in _RELATION_PROPERTY_ALIASES:
+        return _RELATION_PROPERTY_ALIASES[key]
+    if record_off_schema:
+        _OFF_SCHEMA_PROPERTIES[text] = _OFF_SCHEMA_PROPERTIES.get(text, 0) + 1
+        if _OFF_SCHEMA_PROPERTIES[text] == 1:
+            logger.warning("Custom relation property %r (from %r) — kept. The fixed "
+                           "set is %s.", text, raw, RELATION_PROPERTIES)
+    return text
+
+
+def off_schema_property_report() -> Dict[str, int]:
+    """Custom relation properties seen so far this process, most frequent first."""
+    return dict(sorted(_OFF_SCHEMA_PROPERTIES.items(), key=lambda kv: -kv[1]))
+
+
+def reset_off_schema_properties() -> None:
+    _OFF_SCHEMA_PROPERTIES.clear()

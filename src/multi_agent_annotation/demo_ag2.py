@@ -61,6 +61,7 @@ from src.multi_agent_annotation.multi_agent_annotation_ag2 import (
     list_relation_types,
     load_relation_guide,
     off_schema_relation_report,
+    off_schema_property_report,
     _DEFAULT_RELATION_GUIDE,
     consistency_check,
     list_entity_types,
@@ -307,6 +308,7 @@ def run_live(
     guideline_search_mandatory: bool = True,
     relation_search_mandatory: bool = True,
     include_relation_schema: bool = False,
+    relation_properties: bool = True,
     tool_choice: str | None = None,
     annotator_max_tokens: int | None = None,
     critic_max_tokens: int | None = None,
@@ -354,6 +356,7 @@ def run_live(
         nested_spans=nested_spans,
         relation_search_mandatory=relation_search_mandatory,
         include_relation_schema=include_relation_schema,
+        relation_properties=relation_properties,
         tool_choice=tool_choice,
         annotator_max_tokens=annotator_max_tokens,
         critic_max_tokens=critic_max_tokens,
@@ -534,6 +537,13 @@ def main() -> None:
              "this matters only together with an explicit --schema.",
     )
     parser.add_argument(
+        "--no-relation-properties", action="store_true",
+        help="MoBiKo: do not ask the agents for relation properties (Negation, "
+             "Negative_polarity, Exclusive, Dominance — the annotation page's set). "
+             "Renders the prompts exactly as the frozen review pipeline did, for "
+             "re-running the archived design.",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="Skip sentences already present in the output file and append new results.",
     )
@@ -651,6 +661,7 @@ def main() -> None:
             nested_spans=_resolve_nested_spans(args),
             relation_search_mandatory=(args.relation_search == "mandatory"),
             include_relation_schema=args.relation_schema_in_prompt,
+            relation_properties=not args.no_relation_properties,
             tool_choice=args.tool_choice,
             annotator_max_tokens=annotator_max_tokens,
             critic_max_tokens=critic_max_tokens,
@@ -695,6 +706,13 @@ def main() -> None:
             print("       They were kept, not dropped. Each is a relation the agent "
                   "did not obtain from relation_search — check that the tool is "
                   "registered and that --relation-search is 'mandatory'.")
+
+        off_props = off_schema_property_report()
+        if off_props:
+            print(f"\n[NOTE] {sum(off_props.values())} relation(s) carry a custom "
+                  f"property outside the annotation page's fixed set:")
+            for label, count in off_props.items():
+                print(f"         {label!r} x{count}")
         else:
             print("[OK] All emitted relation labels are in the relation guide.")
 
