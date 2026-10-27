@@ -46,8 +46,12 @@ import prompts_conll as _prompts_conll
 from label_norm import (  # noqa: F401
     canonicalize_entity_type,
     canonicalize_relation_type,
+    canonicalize_relation_property,
+    NO_PROPERTY,
+    RELATION_PROPERTIES,
     off_schema_label_report,
     off_schema_relation_report,
+    off_schema_property_report,
     reset_off_schema_labels,
     reset_off_schema_relations,
     normalize_text,
@@ -451,10 +455,16 @@ def _canonicalize_disagreement_label_field(value):
     off-schema entity types. On one 5-sentence run that produced 78 warnings, 74 of
     which described correct Critic behaviour.
 
-    Resolution order: entity type, then relation name, then a removal verdict
-    (mapped onto REMOVAL_SENTINEL so the deletion path actually fires). Only a value
-    that is none of those is counted as off-schema, and it is counted against the
-    entity vocabulary because that is what the field usually holds.
+    Resolution order: entity type, then relation name, then relation PROPERTY,
+    then a removal verdict (mapped onto REMOVAL_SENTINEL so the deletion path
+    actually fires). Only a value that is none of those is counted as
+    off-schema, and it is counted against the entity vocabulary because that is
+    what the field usually holds.
+
+    The property check comes before the removal verdicts on purpose. A Critic
+    disputing a relation's property writes "Negation", or NO_PROPERTY to say the
+    relation should carry none — and must never be read as a request to delete
+    the relation, which is what "none" means in this field.
     """
     if not isinstance(value, str):
         return value
@@ -467,6 +477,12 @@ def _canonicalize_disagreement_label_field(value):
     if as_relation in _ALL_RELATION_TYPES:
         return as_relation
 
+    if re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_").upper() == NO_PROPERTY.upper():
+        return NO_PROPERTY
+    as_property = canonicalize_relation_property(value, record_off_schema=False)
+    if as_property in RELATION_PROPERTIES:
+        return as_property
+
     # Strip punctuation so "IGNORE / not annotated" reaches the verdict set.
     flat = re.sub(r"[^A-Z0-9 ]+", " ", as_entity)
     flat = re.sub(r"\s+", " ", flat).strip()
@@ -474,6 +490,12 @@ def _canonicalize_disagreement_label_field(value):
         return REMOVAL_SENTINEL
 
     return canonicalize_entity_type(value)
+
+
+def _canonicalize_property_field(value):
+    """Pydantic validator body for a relation's ``property``: "" or one value,
+    spelled as the annotation page spells it (label_norm.RELATION_PROPERTIES)."""
+    return canonicalize_relation_property(value) if isinstance(value, str) else ""
 
 
 def _canonicalize_relation_field(value):
@@ -678,10 +700,15 @@ class RelationAnnotation(BaseModel):
     relation: str
     e1: EntityAnnotation
     e2: EntityAnnotation
+    # A qualifier on the relation itself — "Negation" when the sentence says it
+    # does NOT hold — in the annotation page's own field and vocabulary, so a
+    # converted run and a human file mean the same thing by it. "" when unset.
+    property: str = ""
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
 
     _canon_relation = field_validator("relation")(_canonicalize_relation_field)
+    _canon_property = field_validator("property", mode="before")(_canonicalize_property_field)
 
 
 class DeliberationRecord(BaseModel):
@@ -769,18 +796,30 @@ class RelationFlat(BaseModel):
     e1_type: str
     e2_text: str
     e2_type: str
+    # See RelationAnnotation.property. Defaults to "" so output from a run
+    # without relation properties, or from a model that omits the key, parses.
+    property: str = ""
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
 
     _canon_endpoint_types = field_validator("e1_type", "e2_type")(
         _canonicalize_label_field)
     _canon_relation = field_validator("relation")(_canonicalize_relation_field)
+    _canon_property = field_validator("property", mode="before")(_canonicalize_property_field)
+
+    def describe(self) -> str:
+        """`e1 RELATION e2`, plus the property when there is one — the form every
+        audit line and agent-facing summary uses, so a negated relation is never
+        printed as if it held."""
+        prop = f" [{self.property}]" if self.property else ""
+        return f"{self.e1_text} {self.relation} {self.e2_text}{prop}"
 
     def to_relation_annotation(self) -> RelationAnnotation:
         return RelationAnnotation(
             relation=self.relation,
             e1=EntityAnnotation(text=self.e1_text, entity_type=self.e1_type),
             e2=EntityAnnotation(text=self.e2_text, entity_type=self.e2_type),
+            property=self.property,
             confidence=self.confidence,
             reasoning=self.reasoning,
         )
@@ -2081,8 +2120,14 @@ def _diff_annotator_rounds(
         changes.append(f"Removed entities: {', '.join(removed_details)}")
 
     # ── Relation diffs ────────────────────────────────────────
+    # The property is part of the key: adding or dropping a Negation turns a
+    # relation into its opposite, and has to show up as a change.
     def _rel_key(r: RelationFlat) -> tuple:
-        return (r.e1_text.lower(), r.relation, r.e2_text.lower())
+        return (r.e1_text.lower(), r.relation, r.e2_text.lower(), r.property)
+
+    def _fmt(k: tuple) -> str:
+        e1, rel, e2, prop = k
+        return f"({e1}, {rel}, {e2}{', ' + prop if prop else ''})"
 
     prev_rels = {_rel_key(r) for r in prev.relations}
     curr_rels = {_rel_key(r) for r in curr.relations}
@@ -2093,12 +2138,12 @@ def _diff_annotator_rounds(
     if added_rels:
         changes.append(
             f"Added {len(added_rels)} relation(s): "
-            + "; ".join(f"({e1}, {rel}, {e2})" for e1, rel, e2 in sorted(added_rels))
+            + "; ".join(_fmt(k) for k in sorted(added_rels))
         )
     if removed_rels:
         changes.append(
             f"Removed {len(removed_rels)} relation(s): "
-            + "; ".join(f"({e1}, {rel}, {e2})" for e1, rel, e2 in sorted(removed_rels))
+            + "; ".join(_fmt(k) for k in sorted(removed_rels))
         )
 
     return " | ".join(changes)
@@ -2663,6 +2708,12 @@ class MultiAgentAnnotator:
         # default, but can be handed one explicitly via --schema, and its prompts
         # still render it, so the flag stays meaningful there.
         include_relation_schema: bool = False,
+        # MoBiKo only. Agents annotate relation properties ("Negation",
+        # "Negative_polarity", ...) the way Mark and Davnah do on the annotation
+        # page. False renders the prompts byte-identical to the frozen review
+        # pipeline (tests/test_review_pipeline_frozen.py), which is how archived
+        # runs stay reproducible; the output schema accepts `property` either way.
+        relation_properties: bool = True,
         tool_choice: Optional[str] = None,
         annotator_temperature: Optional[float] = None,
         critic_temperature: Optional[float] = None,
@@ -2997,6 +3048,7 @@ class MultiAgentAnnotator:
                 "relation_search_mandatory": (relation_search_mandatory
                                               and bool(relation_guide)),
                 "relation_types": [sec["title"] for sec in relation_guide],
+                "relation_properties": relation_properties,
             }
 
         # guideline_search_enabled=False drops the tool from the prompt. Only the
@@ -3135,6 +3187,7 @@ class MultiAgentAnnotator:
             relation_guide_path=str(self.relation_guide_path) if self.relation_guide_path else None,
             relation_guide_size=len(relation_guide),
             relation_search_mandatory=relation_search_mandatory and bool(relation_guide),
+            relation_properties=relation_properties and prompt_set != "conll",
             relation_search_registered=any(
                 t[0] is relation_search for t in annotator_tools),
             entity_types=list(entity_types_list) if entity_types_list else None,
@@ -3190,6 +3243,10 @@ class MultiAgentAnnotator:
             "relation_guide_path": cfg.get("relation_guide_path"),
             "relation_guide_size": cfg.get("relation_guide_size"),
             "relation_search_mandatory": cfg.get("relation_search_mandatory"),
+            # Whether the agents were asked for relation properties. A run without
+            # them has `property` = "" everywhere, which must not be read as "no
+            # relation in this run was negated".
+            "relation_properties": bool(cfg.get("relation_properties")),
             "relation_search_registered": cfg.get("relation_search_registered"),
             "entity_types": cfg.get("entity_types"),
             # Which prompt templates the agents actually ran with. Two corpora with
@@ -4670,7 +4727,7 @@ class MultiAgentAnnotator:
             for r in parsed.relations:
                 if r.confidence is not None and r.confidence < LOW_CONFIDENCE_THRESHOLD:
                     low_conf.append(
-                        f'  - relation "{r.e1_text} {r.relation} {r.e2_text}"'
+                        f'  - relation "{r.describe()}"'
                         f" (conf={r.confidence:.2f})"
                     )
             if low_conf:
@@ -5068,7 +5125,7 @@ Previous output to repair:
             e2k = MultiAgentAnnotator._normalize_annotation_text(r.e2_text)
             if e1k in dropped or e2k in dropped:
                 audit["warnings"].append(
-                    f'relation "{r.e1_text} {r.relation} {r.e2_text}" removed '
+                    f'relation "{r.describe()}" removed '
                     "(endpoint was a nested entity)"
                 )
         return clean_entities, clean_relations
@@ -5150,7 +5207,7 @@ Previous output to repair:
         for rel in annotator.relations:
             if rel.confidence is not None and rel.confidence < LOW_CONFIDENCE_THRESHOLD:
                 add_flag(
-                    f'"{rel.e1_text} {rel.relation} {rel.e2_text}"'
+                    f'"{rel.describe()}"'
                     f" (confidence={rel.confidence:.2f})",
                     "low_confidence",
                 )
@@ -5188,13 +5245,17 @@ Previous output to repair:
         )
 
     @staticmethod
-    def _relation_key(rel: RelationFlat) -> Tuple[str, str, str, str, str]:
+    def _relation_key(rel: RelationFlat) -> Tuple[str, str, str, str, str, str]:
+        # The property is part of what a relation says, so the Adjudicator
+        # changing it is a change like any other: accepted when the Critic
+        # disputed that relation, rejected when it did not.
         return (
             MultiAgentAnnotator._normalize_annotation_text(rel.relation),
             MultiAgentAnnotator._normalize_annotation_text(rel.e1_text),
             MultiAgentAnnotator._normalize_annotation_text(rel.e1_type),
             MultiAgentAnnotator._normalize_annotation_text(rel.e2_text),
             MultiAgentAnnotator._normalize_annotation_text(rel.e2_type),
+            rel.property,
         )
 
     @staticmethod
@@ -5427,7 +5488,7 @@ Previous output to repair:
 
         for slot, relation in final_relations_by_slot.items():
             audit["preserved_consensus"].append(
-                f'relation "{relation.e1_text} {relation.relation} {relation.e2_text}"'
+                f'relation "{relation.describe()}"'
             )
 
         for adj_relation in adjudicator.final_relations:
@@ -5443,15 +5504,16 @@ Previous output to repair:
                     final_relations_by_slot[slot] = synced_adj_relation
                     if slot not in relation_order:
                         relation_order.append(slot)
+                    # Compared with the Annotator's version: a disputed slot was
+                    # set aside above, so `current` is always None here and a
+                    # change of label or property went unrecorded.
+                    before = current if current is not None else original
                     if (
-                        current is not None
-                        and MultiAgentAnnotator._relation_key(current)
+                        MultiAgentAnnotator._relation_key(before)
                         != MultiAgentAnnotator._relation_key(synced_adj_relation)
                     ):
                         audit["allowed_changes"].append(
-                            f'relation "{synced_adj_relation.e1_text} '
-                            f"{synced_adj_relation.relation} "
-                            f'{synced_adj_relation.e2_text}" changed '
+                            f'relation "{synced_adj_relation.describe()}" changed '
                             "(final Critic disagreement)"
                         )
                     continue
@@ -5462,9 +5524,7 @@ Previous output to repair:
                     != MultiAgentAnnotator._relation_key(synced_adj_relation)
                 ):
                     audit["rejected_changes"].append(
-                        f'relation "{synced_adj_relation.e1_text} '
-                        f"{synced_adj_relation.relation} "
-                        f'{synced_adj_relation.e2_text}" changed '
+                        f'relation "{synced_adj_relation.describe()}" changed '
                         "(not in final Critic disagreements)"
                     )
                 continue
@@ -5485,25 +5545,19 @@ Previous output to repair:
                 final_relations_by_slot[slot] = synced_adj_relation
                 relation_order.append(slot)
                 audit["allowed_changes"].append(
-                    f'relation "{synced_adj_relation.e1_text} '
-                    f"{synced_adj_relation.relation} "
-                    f'{synced_adj_relation.e2_text}" added '
+                    f'relation "{synced_adj_relation.describe()}" added '
                     "(final Critic disagreement)"
                 )
             elif split_span_relation:
                 final_relations_by_slot[slot] = synced_adj_relation
                 relation_order.append(slot)
                 audit["allowed_changes"].append(
-                    f'relation "{synced_adj_relation.e1_text} '
-                    f"{synced_adj_relation.relation} "
-                    f'{synced_adj_relation.e2_text}" added '
+                    f'relation "{synced_adj_relation.describe()}" added '
                     "(split-span relation from Critic missing annotations)"
                 )
             else:
                 audit["rejected_changes"].append(
-                    f'relation "{synced_adj_relation.e1_text} '
-                    f"{synced_adj_relation.relation} "
-                    f'{synced_adj_relation.e2_text}" added '
+                    f'relation "{synced_adj_relation.describe()}" added '
                     "(not in final Critic disagreements)"
                 )
 
@@ -5511,8 +5565,7 @@ Previous output to repair:
             if slot not in final_relations_by_slot:
                 removed = annotator_relations_by_slot[slot]
                 audit["allowed_changes"].append(
-                    f'relation "{removed.e1_text} {removed.relation} '
-                    f'{removed.e2_text}" removed '
+                    f'relation "{removed.describe()}" removed '
                     "(final Critic disagreement)"
                 )
 
