@@ -500,3 +500,24 @@ def test_a_span_with_no_concept_text_is_left_alone(monkeypatch):
     _, out, seen = _fallback(monkeypatch, sp, links=set())
     assert seen == []
     assert out["canonical_text"] == "bird species"
+
+
+# ── place-name abbreviations ─────────────────────────────────────
+
+@pytest.mark.parametrize("text,want", [
+    ("Mt. Kilimanjaro", "Mount Kilimanjaro"), ("Mt Kenya", "Mount Kenya"),
+    ("west Mt Kilimanjaro", "west Mount Kilimanjaro"),
+    ("Udzungwa Mts.", "Udzungwa Mountains"), ("Uluguru Mts", "Uluguru Mountains"),
+    ("Mount Meru", None), ("mt DNA", None), ("mtDNA", None), ("Mts.", None), ("the mts", None),
+])
+def test_abbreviation_expansion(text, want):
+    from src.linking.mention_norm import expand_abbreviations
+    assert expand_abbreviations(text) == want
+
+
+@pytest.mark.parametrize("a,b", [
+    ("Mt. Kilimanjaro", "Mount Kilimanjaro"),
+    ("Udzungwa Mts.", "Udzungwa Mountains"),
+])
+def test_an_abbreviated_place_is_the_same_entity_even_ungrounded(a, b):
+    assert content_key(a, "SPATIAL ENTITY") == content_key(b, "SPATIAL ENTITY")

@@ -1743,3 +1743,20 @@ sentence splitter is losing text, not merely splitting badly:
 input entirely. The splitter is partly *manufacturing* the need for
 `concept_text`, and the old gate then penalised the annotator for repairing it.
 Worth chasing in the postprocessing path, separately from linking.
+
+## Correction: the sentence splitter does not lose text (27 Oct 2026)
+
+The 11 Sep entry says "the sentence splitter is losing text" because "nov.
+from the Myotis" and the sentence introducing *Tadarida* were absent around
+`[115]–[117]`. They are absent only from `data/manually_labeled_last/
+overlap_sentences.txt`, which by construction (`data/aug_runs/
+overlap_sentences_list.py`) keeps just the sentences BOTH Mark and Davnah
+annotated. All three missing pieces are present in Mark's, Davnah's and
+Yousra's full files.
+
+What is real is splitting at abbreviations: 12 of 378 human-gold sentences are
+cut mid-sentence (`et al.` 4, `spp.` 2, genus initials `My.`/`Ta.`/`Pi.`/`Mu.`,
+`sp.`), and 4 of 640 in second_iteration (`Mts.`, `sp. nov.`, `var.`). That
+still produces bare epithets like "sicarius", so the conclusion that the
+splitter partly manufactures the need for `concept_text` stands; "loses text"
+does not.

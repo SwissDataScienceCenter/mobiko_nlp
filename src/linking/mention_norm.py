@@ -96,3 +96,44 @@ def normalize_display(text: str | None) -> str:
         return ""
     s = unicodedata.normalize("NFKC", str(text)).translate(_TRANSLATE)
     return _WS.sub(" ", s).strip()
+
+
+# ─────────────────────── place-name abbreviations ───────────────────────
+#
+# "Mt. Kilimanjaro" and "Mount Kilimanjaro" are one mountain, but only the second
+# is a GeoNames name, so the abbreviated form grounded to nothing and became a
+# separate project-local node: 15 "Mt. Kilimanjaro" mentions in second_iteration
+# alone, beside the grounded "Mount Kilimanjaro". Expanded, 6 of the 7
+# abbreviated place forms in that corpus link (Mount Kilimanjaro, Mount Meru,
+# Mount Kenya, the Uluguru, Usambara and Nguru Mountains).
+#
+# Mention side only, deliberately NOT part of normalize_key: that function also
+# builds the dictionaries, so changing it would mean NORMALIZER_VERSION 3 and a
+# rebuild of all three artifacts, for a rewrite that only ever applies to
+# mentions.
+#
+# An explicit table, case-sensitive, and anchored on a capitalised neighbour:
+# "Mt" before a name, "Mts" after one. A lowercase "mt" (a unit, "mtDNA") is
+# never touched. Listed rather than inferred, like label_norm's aliases — a
+# guessed expansion is worse than none.
+_PLACE_ABBREVIATIONS = [
+    (re.compile(r"\bMt\.?(?=\s+[A-Z])"), "Mount"),
+    (re.compile(r"\bMtn\.?(?=\s+[A-Z])"), "Mount"),
+    (re.compile(r"\b([A-Z][\w'’-]*\s+)Mts\b\.?"), r"\1Mountains"),
+    (re.compile(r"\b([A-Z][\w'’-]*\s+)Mtns\b\.?"), r"\1Mountains"),
+]
+
+
+def expand_abbreviations(text: str | None) -> str | None:
+    """The mention with place-name abbreviations written out, or None if it has none.
+
+    "Mt. Kilimanjaro" -> "Mount Kilimanjaro", "Udzungwa Mts." -> "Udzungwa
+    Mountains". Capitalisation is kept: the matcher's proper-name rule reads it.
+    """
+    if not text:
+        return None
+    out = text
+    for rx, full in _PLACE_ABBREVIATIONS:
+        out = rx.sub(full, out)
+    out = _WS.sub(" ", out).strip()
+    return out if out != text.strip() else None

@@ -107,7 +107,7 @@ from src.linking.dictionary import Dictionary
 from src.linking.split_spans import SpanSplitter
 from src.linking.match import Outcome, resolve
 from src.linking import wordnet_guard
-from src.linking.mention_norm import NORMALIZER_VERSION, normalize_key
+from src.linking.mention_norm import NORMALIZER_VERSION, expand_abbreviations, normalize_key
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "multi_agent_annotation"))
 from label_norm import canonicalize_entity_type  # noqa: E402
@@ -302,6 +302,26 @@ def iter_spans(path: Path) -> Iterator[dict]:
                 }
 
 
+def _try_abbreviation(dictionary, sp: dict, nil_result):
+    """The mention with place-name abbreviations written out, tried on NIL.
+
+    "Mt. Kilimanjaro" matched nothing while "Mount Kilimanjaro" grounded to
+    geonames:157452, so one mountain was two nodes. Second in the precedence,
+    straight after the span itself: an expansion changes no word's meaning, so
+    it is a closer reading of what the annotator marked than either the
+    annotator's concept_text or a singularised form.
+
+    **Only a LINK is accepted**, as in every fallback here.
+    """
+    alt = expand_abbreviations(sp["canonical_text"])
+    if not alt:
+        return nil_result, sp
+    res = resolve(dictionary, alt, sp["entity_type"])
+    if res.outcome is not Outcome.LINKED:
+        return nil_result, sp
+    return res, {**sp, "canonical_text": alt, "concept_source": "abbreviation"}
+
+
 def _try_concept_text(dictionary, sp: dict, nil_result):
     """The annotator's value, tried when the span as written matched nothing.
 
@@ -399,6 +419,9 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=Path("output/resolution.jsonl"))
     ap.add_argument("--no-split", action="store_true",
                     help="skip coordination splitting even when the parser is present")
+    ap.add_argument("--no-abbreviations", action="store_true",
+                    help="do not retry an unmatched mention with place-name "
+                         "abbreviations written out (`Mt. Kenya` -> `Mount Kenya`)")
     ap.add_argument("--no-singular", action="store_true",
                     help="do not retry an unmatched mention with its head noun "
                          "singularised (`glaciations` -> `glaciation`)")
@@ -474,17 +497,21 @@ def main(argv: List[str] | None = None) -> int:
     stats: Counter = Counter()
     reused_uids = 0
     n_singular = 0
+    n_abbrev = 0
     n_concept = 0
     concept_stats: Counter = Counter()
     if True:
         for sp in raw:
             if sp.get("part_index") is None and sp["uid_occurrence"] > 1:
                 reused_uids += 1
-            # The span as written first; then the annotator's concept_text;
-            # then the singular. Each later step is reached only when the one
+            # The span as written first; then with place-name abbreviations
+            # written out; then the annotator's concept_text; then the singular. Each later step is reached only when the one
             # before it matched nothing, and each accepts only a LINK, so a
             # fallback can add grounding but never take an answer away.
             r = resolve(d, sp["canonical_text"], sp["entity_type"])
+            if r.outcome is Outcome.NIL and not args.no_abbreviations:
+                r, sp = _try_abbreviation(d, sp, r)
+                n_abbrev += int(sp["concept_source"] == "abbreviation")
             if r.outcome is Outcome.NIL:
                 r, sp = _try_concept_text(d, sp, r)
                 n_concept += int(sp["concept_source"].startswith("concept_text:"))
@@ -637,6 +664,7 @@ def main(argv: List[str] | None = None) -> int:
         "reused_uids_in_input": reused_uids,
         "spans_split": n_split,
         "grounded_via_singular": n_singular,
+        "grounded_via_abbreviation": n_abbrev,
         "splitter_model": (splitter.model if splitter and splitter.available else None),
         "concept_text": dict(concept_stats),
         "n_entities": len(grounded_entities) + len(local_entities),
@@ -656,6 +684,9 @@ def main(argv: List[str] | None = None) -> int:
     if n_split:
         print(f"  coordination: {n_split} spans split into parts "
               f"({splitter.model})")
+    if n_abbrev:
+        print(f"  abbreviation: {n_abbrev:,} mention(s) grounded after writing out "
+              f"place-name abbreviations (Mt. -> Mount, Mts. -> Mountains)")
     if n_singular:
         print(f"  singular:     {n_singular:,} mention(s) grounded via their "
               f"singular after matching nothing")

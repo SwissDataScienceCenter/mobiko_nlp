@@ -81,7 +81,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from src.linking.mention_norm import normalize_key
+from src.linking.mention_norm import expand_abbreviations, normalize_key
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,14 @@ def split_entity_type(entity_type: str) -> Tuple[str, Optional[str]]:
 
 
 def content_key(text: str, entity_type: str) -> Tuple[str, Tuple[str, ...]]:
-    """The identity key: (full entity label, sorted lemmatised content words)."""
+    """The identity key: (full entity label, sorted lemmatised content words).
+
+    Place-name abbreviations are written out first, so "Udzungwa Mts." and
+    "Udzungwa Mountains" share a key even where no authority grounds them —
+    GeoNames does not carry the Udzungwa Mountains under that name, so the
+    lookup fallback alone would leave them two project-local entities.
+    """
+    text = expand_abbreviations(text) or text
     tokens = [t for t in normalize_key(text).replace("-", " ").split() if t]
     while tokens and tokens[0] in _DETERMINERS:
         tokens = tokens[1:]
