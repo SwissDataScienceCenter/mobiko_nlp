@@ -1,0 +1,5 @@
+# Make the password hash once (it prompts; keep the single quotes below, the hash contains $):
+#   openssl passwd -apr1
+# No --command override: the image's own entrypoint writes the auth file and
+# starts nginx, so basic auth cannot be bypassed from the submit command.
+runai inference submit graph-viewer -p mobiko-anisia -i docker.io/askinkaty/graph-viewer:1.0 --serving-port=8000 -e GRAPH_VIEWER_USER=mobiko -e 'GRAPH_VIEWER_PASSWORD_HASH=<paste hash here>'
