@@ -94,7 +94,7 @@ import json
 import logging
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -599,18 +599,23 @@ def main(argv: List[str] | None = None) -> int:
     comp = link_signatures(sigs)
 
     # Name each component: its authority URI where it has one, else its key.
+    # Both are the smallest of the component's, never the first one seen, so
+    # the name does not depend on the order of the input files or rows.
     comp_uri: Dict[object, str] = {}
     comp_key: Dict[object, tuple] = {}
+    comp_uris: Dict[object, set] = defaultdict(set)
+    comp_keys: Dict[object, set] = defaultdict(set)
     for r in rows:
         if r["_sig"] is None:
             continue
         c = comp[r["_sig"]]
-        comp_key.setdefault(c, r["_sig"][1])
+        comp_keys[c].add(r["_sig"][1])
         if r["_res"].outcome is Outcome.LINKED:
-            uri = r["_res"].match.uri
-            # Deterministic when a component somehow spans two authorities.
-            if c not in comp_uri or uri < comp_uri[c]:
-                comp_uri[c] = uri
+            comp_uris[c].add(r["_res"].match.uri)
+    for c, keys in comp_keys.items():
+        comp_key[c] = min(keys)
+        if comp_uris.get(c):
+            comp_uri[c] = min(comp_uris[c])
 
     def _entity_of(row) -> Optional[str]:
         if row["_sig"] is None:
@@ -619,6 +624,23 @@ def main(argv: List[str] | None = None) -> int:
         if c in comp_uri:
             return f"{row['entity_type']}@{comp_uri[c]}"
         return entity_id(comp_key[c])
+
+    def _aliases_of(row) -> Optional[List[str]]:
+        """Every other id this entity has, or would have in another corpus.
+
+        A component is named by its smallest URI, else its smallest key. When
+        new papers chain two components together, or a mention first links to
+        an authority, the name changes. Each id the entity could carry on its
+        own (one per content key, one per URI) is kept here, so an id stored
+        anywhere earlier can still be found.
+        """
+        if row["_sig"] is None:
+            return None
+        c = comp[row["_sig"]]
+        ids = {entity_id(k) for k in comp_keys[c]}
+        ids |= {f"{row['entity_type']}@{u}" for u in comp_uris.get(c, ())}
+        ids.discard(_entity_of(row))
+        return sorted(ids) or None
 
     to_cluster = [(r["mention_id"], r["canonical_text"], r["entity_type"], r["doc_id"])
                   for r in rows if r["_res"].outcome in CLUSTERED_OUTCOMES]
@@ -698,6 +720,7 @@ def main(argv: List[str] | None = None) -> int:
                 "surface_key": "+".join(surface_key(r["canonical_text"])) or None,
                 "entity_types": sorted(entity_labels.get(eid, ())) or None,
                 "entity_id": eid,
+                "entity_aliases": _aliases_of(r) if eid else None,
                 "authority_uri": authority_uri,
                 "entity_label": res.match.label if res.match else (
                     clusters[eid].label if eid and eid in clusters else None),
@@ -734,6 +757,10 @@ def main(argv: List[str] | None = None) -> int:
         "n_entities": len(grounded_entities) + len(local_entities),
         "n_entities_from_authorities": len(grounded_entities),
         "n_entities_project_local": len(local_entities),
+        # Components that joined several content keys or URIs: the entities
+        # whose id can change as the corpus grows (see entity_aliases).
+        "n_entities_merged": sum(1 for c, k in comp_keys.items()
+                                 if len(k) > 1 or len(comp_uris.get(c, ())) > 1),
         # Content keys minted for unresolved mentions. Larger than
         # n_entities_project_local by however many chained into a grounded
         # component; the gap report lists only the ones that stayed unresolved.

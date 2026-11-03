@@ -521,3 +521,47 @@ def test_abbreviation_expansion(text, want):
 ])
 def test_an_abbreviated_place_is_the_same_entity_even_ungrounded(a, b):
     assert content_key(a, "SPATIAL ENTITY") == content_key(b, "SPATIAL ENTITY")
+
+
+# ── stable ids as the corpus grows ───────────────────────────────
+
+def _one_doc(path: Path, doc_id: str, sentence: str, spans):
+    rec = {"doc_id": doc_id, "sentences": [{"text": sentence, "spans": [
+        {"start_char": sentence.index(t), "end_char": sentence.index(t) + len(t),
+         "type": ty, "uid": f"{doc_id}-{i}", "text": t}
+        for i, (t, ty) in enumerate(spans)]}]}
+    path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+
+def _resolve(tmp_path, name, inputs):
+    out = tmp_path / f"{name}.jsonl"
+    cmd = [sys.executable, "-m", "src.linking.resolve_corpus", "--out", str(out), "--no-split"]
+    for p in inputs:
+        cmd += ["--input", str(p)]
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-800:]
+    return {(row["doc_id"], row["uid"]): row
+            for row in map(json.loads, out.open(encoding="utf-8"))}
+
+
+@pytest.mark.skipif(not artifact_path("ontologies").exists(),
+                    reason="compiled dictionary absent")
+def test_entity_ids_do_not_depend_on_input_order_and_keep_their_aliases(tmp_path):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    _one_doc(a, "P1", "Insects were sampled at high elevation.",
+             [("Insects", "BIOTIC ENTITY"), ("elevation", "SPATIAL PROPERTY")])
+    _one_doc(b, "P2", "We counted insect species along the elevation gradient.",
+             [("insect", "BIOTIC ENTITY"), ("elevation gradient", "SPATIAL PROPERTY")])
+    ab = _resolve(tmp_path, "ab", [a, b])
+    ba = _resolve(tmp_path, "ba", [b, a])
+    assert ab.keys() == ba.keys()
+    for k in ab:
+        assert ab[k]["entity_id"] == ba[k]["entity_id"], k
+        assert ab[k]["entity_aliases"] == ba[k]["entity_aliases"], k
+    # A grounded entity keeps the project-local id its words alone would get,
+    # so an id stored while it was unlinked can still be found.
+    for row in ab.values():
+        if row["authority_uri"]:
+            own = entity_id(content_key(row["canonical_text"], row["entity_type"]))
+            assert own in (row["entity_aliases"] or []), row["text"]
+        assert row["entity_id"] not in (row["entity_aliases"] or [])
