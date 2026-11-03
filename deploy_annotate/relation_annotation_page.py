@@ -628,17 +628,25 @@ def _load_re_saved(path: str) -> Dict[Tuple, Dict]:
 #  sessions carries two different uids and must still collapse into one.
 # ------------------------------------------------------------------ #
 
-def _span_sig(sp: Dict) -> Tuple:
+def _span_sig(sp: Dict, with_uid: bool = True) -> Tuple:
     """Identity of an entity: offsets, type, text and whether it is virtual.
     Virtualness is derived, not read, so a signature taken from an 'original'
-    snapshot (which has no 'virtual' key) still matches."""
+    snapshot (which has no 'virtual' key) still matches.
+
+    A virtual entity also carries its uid. It has no offsets, so two virtual
+    entities with the same text — one implied "elevation" per site, as agreed
+    with the annotators on 3 Nov 2026 — were otherwise one signature and were
+    merged into one entity. ``with_uid=False`` gives the uid-less form, which an
+    'original' snapshot (stored without a uid) is matched against."""
     start, end = sp.get("start_char"), sp.get("end_char")
     start = None if start is None else int(start)
     end = None if end is None else int(end)
     virtual = (bool(sp.get("virtual")) or start is None or end is None
                or start < 0 or end < 0)
-    return (start, end, sp.get("type", "") or "", sp.get("text", "") or "",
-            virtual)
+    sig = (start, end, sp.get("type", "") or "", sp.get("text", "") or "", virtual)
+    if virtual and with_uid and sp.get("uid"):
+        sig += (sp["uid"],)
+    return sig
 
 
 def _topo_order(relations: List[Dict]) -> List[Dict]:
@@ -725,6 +733,10 @@ class _SentenceMerge:
                 used.add(merged_uid)
                 self.spans.append(merged)
                 self.span_uid_by_sig[sig] = merged_uid
+                # An edit's 'original' has no uid; let it still find this
+                # entity (the first one, when several share the uid-less form).
+                self.span_uid_by_sig.setdefault(_span_sig(sp, with_uid=False),
+                                                merged_uid)
             if own_uid:
                 uid_map[own_uid] = merged_uid
         return uid_map
@@ -736,7 +748,8 @@ class _SentenceMerge:
         original = sp.get("original")
         if not isinstance(original, dict):
             return None
-        return self.span_uid_by_sig.get(_span_sig(original))
+        return (self.span_uid_by_sig.get(_span_sig(original))
+                or self.span_uid_by_sig.get(_span_sig(original, with_uid=False)))
 
     # -- relations --------------------------------------------------
     def add_relations(self, relations: List[Dict], span_uid_map: Dict[str, str],

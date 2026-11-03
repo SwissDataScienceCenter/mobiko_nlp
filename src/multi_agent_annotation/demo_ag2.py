@@ -309,6 +309,9 @@ def run_live(
     relation_search_mandatory: bool = True,
     include_relation_schema: bool = False,
     relation_properties: bool = True,
+    split_counts: bool = True,
+    entity_ids: bool = True,
+    relation_guide_path: Path | None = None,
     tool_choice: str | None = None,
     annotator_max_tokens: int | None = None,
     critic_max_tokens: int | None = None,
@@ -357,6 +360,9 @@ def run_live(
         relation_search_mandatory=relation_search_mandatory,
         include_relation_schema=include_relation_schema,
         relation_properties=relation_properties,
+        split_counts=split_counts,
+        entity_ids=entity_ids,
+        relation_guide_path=relation_guide_path,
         tool_choice=tool_choice,
         annotator_max_tokens=annotator_max_tokens,
         critic_max_tokens=critic_max_tokens,
@@ -544,6 +550,24 @@ def main() -> None:
              "re-running the archived design.",
     )
     parser.add_argument(
+        "--no-split-counts", action="store_true",
+        help="MoBiKo: do not tell the agents to split a number from the noun it "
+             "counts (\"28\" + \"species\"). With --no-relation-properties, "
+             "renders the prompts exactly as the frozen review pipeline did.",
+    )
+    parser.add_argument(
+        "--relation-guide", type=Path, default=None,
+        help="Relation guide CSV (default: 'Relation schema.csv', the current "
+             "vocabulary, matching the annotation page). To re-run a design on "
+             "the vocabulary it was run with, pass the version its run_meta "
+             "names, e.g. 'Relation schema v1.csv' for runs before 3 Nov 2026.",
+    )
+    parser.add_argument(
+        "--no-entity-ids", action="store_true",
+        help="MoBiKo: do not ask the agents for mention ids. Without them two "
+             "mentions of the same words in one sentence cannot be told apart.",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="Skip sentences already present in the output file and append new results.",
     )
@@ -662,6 +686,9 @@ def main() -> None:
             relation_search_mandatory=(args.relation_search == "mandatory"),
             include_relation_schema=args.relation_schema_in_prompt,
             relation_properties=not args.no_relation_properties,
+            split_counts=not args.no_split_counts,
+            entity_ids=not args.no_entity_ids,
+            relation_guide_path=args.relation_guide,
             tool_choice=args.tool_choice,
             annotator_max_tokens=annotator_max_tokens,
             critic_max_tokens=critic_max_tokens,

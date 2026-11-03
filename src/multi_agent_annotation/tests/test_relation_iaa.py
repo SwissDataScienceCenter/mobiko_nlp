@@ -328,7 +328,13 @@ def test_custom_marking_is_read_from_the_relation_guide():
     import — it used to be an inlined copy of the page's ORIGINAL nine options,
     which silently marked standard labels as annotator inventions."""
     vocab = ri.FIXED_RELATION_TYPES
-    assert len(vocab) > 30, "the guide did not load; custom marking would be wrong"
+    # The guide's size moves as the vocabulary is revised (37 in v1, 30 since
+    # 3 Nov 2026), so "it loaded" is checked against the file, not a count.
+    import csv
+    guide = Path(ri.__file__).resolve().parents[1] / "Relation schema.csv"
+    with guide.open(newline="", encoding="utf-8") as fh:
+        in_file = {r["Relation"].strip() for r in csv.DictReader(fh) if r["Relation"].strip()}
+    assert vocab == in_file, "the guide did not load; custom marking would be wrong"
     for standard in ("PART_OF", "SUBSET_OF", "LOCATED_IN", "HAS_VALUE", "OCCURS_DURING"):
         assert standard in vocab, f"{standard} is in the guide but marked custom"
     for retired in ("IS_PART_OF", "COMPARES_TO", "DURING", "OCCURS_IN", "HAS_STATE"):

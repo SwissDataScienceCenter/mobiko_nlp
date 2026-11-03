@@ -38,23 +38,27 @@ different relation instead.
     "Elevation did not affect beetle species richness" -> Elevation AFFECTS species richness, "Negation"
     "Odonata ... are generally absent from the Sierra above 3000m" -> Odonata LOCATED_IN Sierra, "Negation"
     "There were no interactive effects of temperature and predator presence" -> temperature INTERACTS_WITH predator presence, "Negation"
-    "The CV ... did not significantly change with elevation (p = .135)" -> CV VARIES_WITH elevation, "Negation"
+    "The CV ... did not significantly change with elevation (p = .135)" -> CV CORRELATES_WITH elevation, "Negation"
 - "Negative_polarity" — the relation holds, in the negative or inverse direction: \
 a decrease, a hindrance, a negative association or response.
     "limited information ... hinders effective conservation efforts" -> limited information AFFECTS conservation efforts, "Negative_polarity"
     "Predator presence ... negatively associated with daily numerical abundance" -> Predator presence ASSOCIATED_WITH numerical abundance, "Negative_polarity"
-    "richness ... declines linearly with increasing elevation" -> richness INCREASES_WITH elevation, "Negative_polarity"
 - "Exclusive" — the relation holds only for this argument: "only", "exclusively", \
 "restricted to".
     "the crested porcupine ... was only detected in the Montane Forest" -> crested porcupine LOCATED_IN Montane Forest, "Exclusive"
 - "Dominance" — the relation holds for the predominant case: "mainly", \
-"predominantly", "mostly". When dominance IS the relation, use the DOMINATES \
-relation instead; this property qualifies some other relation.
+"predominantly", "mostly", "dominated by".
 
 Deciding:
 - "did not change", "no effect", "absent", "without", "not significant" -> \
-"Negation". "decreased", "lower", "declines", "negatively", "hinders" -> \
-"Negative_polarity". A negated decrease ("did not decline") is "Negation".
+"Negation". "negatively", "hinders", "reduces" on a relation without a \
+direction of its own (AFFECTS, ASSOCIATED_WITH, CORRELATES_WITH) -> \
+"Negative_polarity".
+- A quantity that falls as another rises is DECREASES_WITH, with no property \
+("richness declines with increasing elevation" -> richness DECREASES_WITH \
+elevation); never INCREASES_WITH with "Negative_polarity". A negated decrease ("did not decline") is "Negation", \
+and so is a negative trend reported as not significant ("generally negative, \
+but not significant"): the relation is not established, whatever its direction.
 - The negation must apply to THIS relation. In "NPP was negatively related to \
 soil C:N ratio, which was not the case in the other NPP components", NPP \
 CORRELATES_WITH soil C:N ratio is "Negative_polarity"; the "not" is about the \
@@ -125,6 +129,85 @@ def _critic_property_rule(enabled: bool) -> str:
 # ─────────────────────────────────────────────────────────────
 
 LOW_CONFIDENCE_THRESHOLD = 0.7
+
+
+# ─────────────────────────────── counts ───────────────────────────────
+#
+# Decided 3 Nov 2026 (Mark & Davnah question list): a number is split from the
+# noun it counts or measures, as Davnah annotates — "28" + "species", not
+# "28 species". The agents merged them ("2447 domestic species observations" as
+# one QUANTITATIVE PROPERTY), which leaves the counted thing without a node and
+# the number without a bearer. Opt-in like relation properties, for the same
+# reason: off, every prompt is byte-identical to the frozen review pipeline.
+# Also decided 3 Nov: the link is HAS_VALUE (not HAS_PROPERTY, which Davnah had
+# used), and test statistics (p, r, t, R²) are not annotated — the graph reads
+# them from the sentence.
+
+_COUNT_RULE = (
+    "a number is never part of the span of the thing it counts or measures. Annotate "
+    "the thing as its own span and the number, with its unit, as a separate "
+    "QUANTITATIVE PROPERTY, linked by HAS_VALUE (thing HAS_VALUE number): "
+    "\"2447 domestic species observations\" -> [domestic species observations] "
+    "HAS_VALUE [2447]; \"28 species of wildlife\" -> [species] HAS_VALUE [28]; "
+    "\"a mean elevation of 2456 m\" -> [mean elevation] HAS_VALUE [2456 m]. "
+    "The unit stays with the number (\"2456 m\", \"25%\"). Test statistics "
+    "(p = .03, r = -.57, t = 2.3, R2 = 0.42, F, AIC) are not annotated.")
+
+
+def _count_bullet(enabled: bool) -> str:
+    """The span-boundary bullet for annotators, when the rule is on."""
+    return f"\n- Numbers: {_COUNT_RULE}" if enabled else ""
+
+
+def _count_block(enabled: bool, role: str) -> str:
+    """The rule for reviewers and adjudicators, as a short block."""
+    if not enabled:
+        return ""
+    tail = {"critic": " If a span merges a number with the thing it counts, dispute its "
+                      "extent and propose the two spans.",
+            "adjudicator": " When resolving a span's extent, apply this rule."}.get(role, "")
+    return f"\n\n## Numbers\n{_COUNT_RULE[0].upper()}{_COUNT_RULE[1:]}{tail}"
+
+
+# ───────────────────────────── mention ids ─────────────────────────────
+#
+# Decided 3 Nov 2026: when a sentence gives a property for several things, each
+# gets its own property mention — one implied "elevation" per site. Two mentions
+# of the same words can only be told apart by an id, so entities carry one and
+# relations name their arguments by it. Opt-in like the rules above: off, every
+# prompt is byte-identical to the frozen review pipeline.
+
+_ID_RULE = (
+    'Give every entity an "id" unique in this sentence ("e1", "e2", ...) and name '
+    'each relation\'s arguments by id ("e1_id", "e2_id") as well as by text. Two '
+    "mentions of the same words are two entities with two ids. When a sentence gives a "
+    "property for several things, annotate one property mention per thing, even when "
+    "the word appears once or is only implied: \"Monduli forest reserve, ... 2456 m; "
+    "Marangu route, ... 2743 m\" -> e1 [Monduli forest reserve] HAS_PROPERTY "
+    "e2 [elevation] HAS_VALUE e3 [2456 m]; e4 [Marangu route] HAS_PROPERTY "
+    "e5 [elevation] HAS_VALUE e6 [2743 m].")
+
+
+def _id_block(enabled: bool, role: str) -> str:
+    if not enabled:
+        return ""
+    if role == "critic":
+        return ("\n\n## One property mention per thing\nWhen a sentence gives a property "
+                "for several things (the elevation of two sites), each needs its own "
+                "property mention and value. If one mention carries several bearers or "
+                "values, list the missing mentions under \"missing_annotations\".")
+    tail = (" Keep the Annotator's ids for the entities you keep, give any entity you "
+            "add a new id, and name every relation's arguments by id."
+            if role == "adjudicator" else "")
+    return f"\n\n## Mention ids\n{_ID_RULE}{tail}"
+
+
+def _entity_id_example(enabled: bool) -> str:
+    return '"id": "e1", ' if enabled else ""
+
+
+def _relation_id_example(enabled: bool) -> str:
+    return ' "e1_id": "e2", "e2_id": "e1",' if enabled else ""
 
 
 def _build_guideline_summary(sections: List[Dict[str, str]]) -> str:
@@ -211,7 +294,9 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
                           relation_types: Optional[List[str]] = None,
                           guideline_search_enabled: bool = True,
                           standalone: bool = False,
-                          relation_properties: bool = False) -> str:
+                          relation_properties: bool = False,
+                          split_counts: bool = False,
+                          entity_ids: bool = False) -> str:
     """standalone=True renders the prompt for an annotator whose output is final.
 
     Used by the single-pass arm and by the blind-pair pipeline, where Annotator A,
@@ -266,7 +351,7 @@ def _annotator_system_msg(guideline: str, entity_schema: str, relation_schema: d
 
 {relation_vocab_section}
 
-{_property_section(relation_properties, 'annotator')}
+{_property_section(relation_properties, 'annotator')}{_id_block(entity_ids, 'annotator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -298,7 +383,7 @@ Incomplete: an empty result means "not catalogued", NEVER "invalid".{gs_tool_lin
 - Exclude ordinal/positional modifiers that aren't part of a fixed term: "first occurrence" → [occurrence].
 - Keep a multi-word span ONLY if it is a fixed domain term whose meaning is lost when split — [species richness], [mountain biodiversity], [habitat quality]. Test: would a biodiversity glossary list this exact phrase as one term?
 - Otherwise take the minimal head noun phrase, and split coordinations: "antibacterial and antifungal properties" → two spans: [antibacterial properties], [antifungal properties].
-- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
+- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").{_count_bullet(split_counts)}
 
 ## Other rules
 - List ambiguous spans in "uncertain_cases" rather than dropping them.
@@ -309,10 +394,10 @@ Incomplete: an empty result means "not catalogued", NEVER "invalid".{gs_tool_lin
 Return a JSON object with exactly these fields (field values here are just examples):
 {{
   "entities": [
-    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
+    {{{_entity_id_example(entity_ids)}"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "<verbatim definition/question/example from the guideline that this type satisfies>", "confidence": 0.9, "reasoning": "attribute of biotic entity"}}
   ],
   "relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.81, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_relation_id_example(entity_ids)}{_property_example(relation_properties)} "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -334,7 +419,9 @@ def _critic_system_msg(guideline: str, entity_schema: str, relation_schema: dict
                        relation_search_mandatory: bool = False,
                        relation_types: Optional[List[str]] = None,
                        precedent_memory: bool = True,
-                       relation_properties: bool = False) -> str:
+                       relation_properties: bool = False,
+                       split_counts: bool = False,
+                       entity_ids: bool = False) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -389,7 +476,7 @@ Disagreement is expected and productive — correctness matters more than consen
 
 {relation_vocab_section}
 
-{_property_section(relation_properties, 'critic')}
+{_property_section(relation_properties, 'critic')}{_count_block(split_counts, 'critic')}{_id_block(entity_ids, 'critic')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -464,7 +551,9 @@ def _critic_system_msg_strict(guideline: str, entity_schema: str, relation_schem
                               relation_search_mandatory: bool = False,
                               relation_types: Optional[List[str]] = None,
                               precedent_memory: bool = True,
-                              relation_properties: bool = False) -> str:
+                              relation_properties: bool = False,
+                              split_counts: bool = False,
+                              entity_ids: bool = False) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -502,7 +591,7 @@ raise it as a disagreement. Do not give the Annotator the benefit of the doubt.
 
 {relation_vocab_section}
 
-{_property_section(relation_properties, 'critic')}
+{_property_section(relation_properties, 'critic')}{_count_block(split_counts, 'critic')}{_id_block(entity_ids, 'critic')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -637,7 +726,9 @@ def _annotator_system_msg_coldstart(guideline: str, entity_schema: str, relation
                                      guideline_search_mandatory: bool = False,
                                      relation_search_mandatory: bool = False,
                                      relation_types: Optional[List[str]] = None,
-                                    relation_properties: bool = False) -> str:
+                                    relation_properties: bool = False,
+                                    split_counts: bool = False,
+                                    entity_ids: bool = False) -> str:
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Annotator, a biodiversity NLP expert working in a COLD-START setting: the \
@@ -650,7 +741,7 @@ the Critic filters errors later.
 
 {relation_vocab_section}
 
-{_property_section(relation_properties, 'annotator')}
+{_property_section(relation_properties, 'annotator')}{_id_block(entity_ids, 'annotator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -683,7 +774,7 @@ and advisory; an empty result means "not catalogued", never "invalid".
 - Exclude leading determiners and demonstratives: "this species" → [species], "the frater complex" → [frater complex]. Never include "this/the/a/its/their".
 - Keep a multi-word span ONLY if it is a fixed domain term whose meaning is lost when split — [species richness], [mountain biodiversity], [habitat quality]. Test: would a biodiversity glossary list this exact phrase as one term?
 - Otherwise take the minimal head noun phrase, and split coordinations: "antibacterial and antifungal properties" → two spans: [antibacterial properties], [antifungal properties].
-- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").
+- Do NOT annotate an adjective or sub-word as a separate entity when the full noun phrase containing it is already annotated (e.g. if "limited information" is an entity, do not also annotate "limited").{_count_bullet(split_counts)}
 
 ## Other rules
 - List genuinely ambiguous spans in "uncertain_cases" rather than dropping them — at cold start, ambiguity is expected and informative, so flag liberally.
@@ -694,10 +785,10 @@ and advisory; an empty result means "not catalogued", never "invalid".
 Return a JSON object with exactly these fields (values here are just examples):
 {{
   "entities": [
-    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "", "confidence": 0.9, "reasoning": "attribute measured on a biotic entity (birds); 'richness' is a count of taxa, so BIOTIC PROPERTY not ABIOTIC PROPERTY"}}
+    {{{_entity_id_example(entity_ids)}"text": "species richness", "entity_type": "BIOTIC PROPERTY", "guideline_rule": "", "confidence": 0.9, "reasoning": "attribute measured on a biotic entity (birds); 'richness' is a count of taxa, so BIOTIC PROPERTY not ABIOTIC PROPERTY"}}
   ],
   "relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.81, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_relation_id_example(entity_ids)}{_property_example(relation_properties)} "confidence": 0.81, "reasoning": "..."}}
   ],
   "uncertain_cases": ["optional span text and short explanation if ambiguous"],
   "reasoning": "brief overall reasoning"
@@ -719,7 +810,9 @@ def _critic_system_msg_coldstart(guideline: str, entity_schema: str, relation_sc
                                   relation_search_mandatory: bool = False,
                                   relation_types: Optional[List[str]] = None,
                                   precedent_memory: bool = True,
-                                 relation_properties: bool = False) -> str:
+                                 relation_properties: bool = False,
+                                 split_counts: bool = False,
+                                 entity_ids: bool = False) -> str:
     precedent_tool_line = (
         "\n- lookup_precedent   : check how a span was adjudicated in earlier sentences this batch"
         if precedent_memory else ""
@@ -750,7 +843,7 @@ leave it "" whenever the guideline is silent (which is nearly always).
 
 {relation_vocab_section}
 
-{_property_section(relation_properties, 'critic')}
+{_property_section(relation_properties, 'critic')}{_count_block(split_counts, 'critic')}{_id_block(entity_ids, 'critic')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -839,7 +932,9 @@ what you are disputing; never put a whole triplet in this field.
 def _adjudicator_system_msg_coldstart(guideline: str, entity_schema: str, relation_schema: dict,
                                        relation_search_mandatory: bool = False,
                                        relation_types: Optional[List[str]] = None,
-                                      relation_properties: bool = False) -> str:
+                                      relation_properties: bool = False,
+                                      split_counts: bool = False,
+                                      entity_ids: bool = False) -> str:
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations, working in a \
@@ -855,7 +950,7 @@ forcing a confident label.
 
 {relation_vocab_section}
 
-{_property_section(relation_properties, 'adjudicator')}
+{_property_section(relation_properties, 'adjudicator')}{_count_block(split_counts, 'adjudicator')}{_id_block(entity_ids, 'adjudicator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -883,10 +978,10 @@ forcing a confident label.
 Return a JSON object with exactly these fields, then end your message with TERMINATE on its own line:
 {{
   "final_entities": [
-    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{{_entity_id_example(entity_ids)}"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_relation_id_example(entity_ids)}{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "primary referent is …, so Y not X"}}
@@ -905,13 +1000,15 @@ Output rules:
 def _adjudicator_system_msg(guideline: str, entity_schema: str, relation_schema: dict,
                             relation_search_mandatory: bool = False,
                             relation_types: Optional[List[str]] = None,
-                            relation_properties: bool = False) -> str:
+                            relation_properties: bool = False,
+                            split_counts: bool = False,
+                            entity_ids: bool = False) -> str:
     relation_vocab_section = _relation_vocab_section(relation_search_mandatory, relation_types)
     return f"""\
 You are Adjudicator, the final decision-maker for biodiversity annotations. 
 You see the Annotator's labels and the Critic's review.
 
-{relation_vocab_section}{_property_block(relation_properties, 'adjudicator')}
+{relation_vocab_section}{_property_block(relation_properties, 'adjudicator')}{_count_block(split_counts, 'adjudicator')}{_id_block(entity_ids, 'adjudicator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -940,10 +1037,10 @@ You see the Annotator's labels and the Critic's review.
 Return a JSON object with exactly these fields, then end your message with TERMINATE on its own line:
 {{
   "final_entities": [
-    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{{_entity_id_example(entity_ids)}"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_relation_id_example(entity_ids)}{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "span was labelled X", "decision": "correct label is Y", "rationale": "guideline step Z says..."}}
@@ -966,7 +1063,9 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
                                relation_search_mandatory: bool = False,
                                relation_types: Optional[List[str]] = None,
                                guideline_search_enabled: bool = True,
-                               relation_properties: bool = False) -> str:
+                               relation_properties: bool = False,
+                               split_counts: bool = False,
+                               entity_ids: bool = False) -> str:
     """Single-pass annotator: no Critic, no Adjudicator, output is final.
 
     WHY THIS EXISTS. _annotator_system_msg tells the model its "primary objective
@@ -1005,6 +1104,8 @@ def _annotator_system_msg_solo(guideline: str, entity_schema: str, relation_sche
         relation_types=relation_types,
         guideline_search_enabled=guideline_search_enabled,
         relation_properties=relation_properties,
+        split_counts=split_counts,
+        entity_ids=entity_ids,
         standalone=True)
 
 
@@ -1013,7 +1114,9 @@ def _adjudicator_system_msg_blind(guideline: str, entity_schema: str,
                                   relation_search_mandatory: bool = False,
                                   relation_types: Optional[List[str]] = None,
                                   guideline_search_enabled: bool = False,
-                                  relation_properties: bool = False) -> str:
+                                  relation_properties: bool = False,
+                                  split_counts: bool = False,
+                                  entity_ids: bool = False) -> str:
     """Adjudicator for the blind-pair pipeline.
 
     A SIBLING of _adjudicator_system_msg, not a modification of it. The review
@@ -1054,7 +1157,7 @@ same guideline, without seeing each other's work. You are shown their \
 annotations without being told which annotator produced which, and a list of \
 the specific spans they did not agree on. Your job is to decide those spans.
 
-{relation_vocab_section}{_property_block(relation_properties, 'adjudicator')}
+{relation_vocab_section}{_property_block(relation_properties, 'adjudicator')}{_count_block(split_counts, 'adjudicator')}{_id_block(entity_ids, 'adjudicator')}
 
 ## Entity Type Schema
 {entity_schema}
@@ -1095,10 +1198,10 @@ failure; it is the correct output when the guideline is silent.
 Return a JSON object with exactly these fields, then end your message with TERMINATE on its own line:
 {{
   "final_entities": [
-    {{"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
+    {{{_entity_id_example(entity_ids)}"text": "species richness", "entity_type": "BIOTIC PROPERTY", "confidence": 0.9, "reasoning": "..."}}
   ],
   "final_relations": [
-    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
+    {{"relation": "<name returned by relation_search>", "e1_text": "birds", "e1_type": "BIOTIC ENTITY", "e2_text": "species richness", "e2_type": "BIOTIC PROPERTY",{_relation_id_example(entity_ids)}{_property_example(relation_properties)} "confidence": 0.9, "reasoning": "..."}}
   ],
   "disagreement_resolutions": [
     {{"issue": "annotators split on the type of X", "decision": "X is Y", "rationale": "guideline step Z says..."}}

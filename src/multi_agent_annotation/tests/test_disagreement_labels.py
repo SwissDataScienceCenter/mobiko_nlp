@@ -66,7 +66,7 @@ def test_entity_types_are_canonicalised(raw, expected):
     assert not M.off_schema_label_report()
 
 
-@pytest.mark.parametrize("raw", ["HAS_PROPERTY", "ADDING_TO", "SUBSET_OF", "USES"])
+@pytest.mark.parametrize("raw", ["HAS_PROPERTY", "DECREASES_WITH", "SUBSET_OF", "USES"])
 def test_relation_names_are_accepted_not_flagged(raw):
     """Disputing a triplet's label is correct Critic behaviour, not an error."""
     assert _proposed(raw) == raw

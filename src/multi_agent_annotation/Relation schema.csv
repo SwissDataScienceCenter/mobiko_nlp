@@ -1,7 +1,8 @@
 Relation,Definition,Example,Comment
 HAS_PROPERTY,Links an entity/process to an attribute or characteristic it possesses. Qualitative property only.,lake HAS_PROPERTY temperature; plants HAS_PROPERTY medicinal,
+HAS_PROCESS,Links an entity or property to a process or change it undergoes or carries out.,species richness HAS_PROCESS decrease; plants HAS_PROCESS growth,"Use it to attach a change (increase, decline, shift) to the quantity that changes. Definition drafted by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah."
 HAS_ROLE,"Links an entity to a functional, ecological, or social role it fulfils.",mountain system HAS_ROLE refuge; species HAS_ROLE pollinator,
-HAS_VALUE,Links a property/measurement to its explicitly stated value. Quantitative property only.,abundance HAS_VALUE 200,
+HAS_VALUE,"Links an entity, property or measurement to its explicitly stated numeric value: a count, measure, percentage or range. The number is its own QUANTITATIVE PROPERTY span.",abundance HAS_VALUE 200; species HAS_VALUE 28; elevation HAS_VALUE 2456 m,"Agreed on 2026-11-03: numbers are split from the noun they count and linked with HAS_VALUE, not HAS_PROPERTY."
 SUBSET_OF,"Indicates set, taxonomic, population, or categorical inclusion.",Diptera SUBSET_OF insects; endemic species SUBSET_OF regional species,"If we have a species and a group of species, use SUBSET_OF"
 PART_OF,"Indicates a physical, structural, or compositional part–whole relationship.",leaf PART_OF plant; tributary PART_OF river system,PART_OF only for a concrete part of the entire object.
 LOCATED_IN,"Indicates the spatial location of an entity within a geographic entity or spatial unit.
@@ -10,36 +11,28 @@ Indicates that an organism, population, process, or phenomenon occurs under or w
 species LOCATED_IN grassland; plants LOCATED_IN high altitudes
 fish LOCATED_IN lake; endemic species LOCATED_IN forest
 ",
+OCCURS_DURING,"Links an event, process, state, or phenomenon to a temporal period.",flowering OCCURS_DURING spring; migration OCCURS_DURING April,
+HAS_ORIGIN,"Identifies the geographical or conceptual starting point of a movement, lineage, or process.",migration HAS_ORIGIN Sahel,
+HAS_DESTINATION,Identifies the endpoint or destination of a movement or directed process.,migration HAS_DESTINATION Denmark,
+HAS_START,"Identifies where an event, process, period or range starts: its start time, start point, or lower bound.",migration HAS_START April; elevational bands HAS_START 250 m,"Replaces STARTS (guide v1). For where a movement comes from, use HAS_ORIGIN. Definition drafted by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah."
+HAS_END,"Identifies where an event, process, period or range ends: its end time, end point, or upper bound.",migration HAS_END May; elevational range HAS_END 5104 m a.s.l.,"Replaces ENDS (guide v1). For where a movement goes, use HAS_DESTINATION. Definition drafted by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah."
+USES,"Indicates that an organism, person, or system uses another entity as a resource, substrate, habitat, food, or for another purpose.",Aymara doctors USES medicinal plants; herbivores USES vegetation,
+REPLACES,"Indicates that one entity, state, or land-cover type takes the place of another.",grassland REPLACES forest,
+INDICATES,"Links an observation, finding, pattern, or proposition to a conclusion, implication, or interpretation that it points toward, supports, or provides evidence for.",vegetation belts INDICATES precipitation; species richness pattern INDICATES energy richness hypothesis,Example added by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah.
 ASSOCIATED_WITH,"Indicates a general, non-specific association between entities or phenomena.","grassland ASSOCIATED_WITH mountain system;
 vicariance ASSOCIATED_WITH biogeographic barriers
 ",
-USES,"Indicates that an organism, person, or system uses another entity as a resource, substrate, habitat, food, or for another purpose.",Aymara doctors USES medicinal plants; herbivores USES vegetation,
-CAUSES,Indicates a causal relationship in which the subject produces or brings about the object.,habitat loss CAUSES decline; predation CAUSES mortality,
-AFFECTS,Indicates that one entity/process influences or has an effect on another without necessarily asserting causality.,temperature AFFECTS abundance; predators AFFECT insect emergence,
-ENABLES,Indicates that the subject facilitates or makes the object/process possible.,habitat complexity ENABLES coexistence,
-INTERACTS_WITH,"Indicates an interaction between two entities, variables, processes, or drivers.",temperature INTERACTS_WITH predator presence,
-DEPENDS_ON,"Indicates that the occurrence, magnitude, or state of the subject depends on the object.",abundance DEPENDS_ON temperature,
-PARTICIPATES_IN,"Indicates participation of subject in a process, either actively or passively",common cranes PARTICIPATES_IN migration,
-REPLACES,"Indicates that one entity, state, or land-cover type takes the place of another.",grassland REPLACES forest,
-SEPARATES,"Indicates that an entity or feature creates spatial, ecological, or population separation between entities.",ridge SEPARATES valleys; barrier SEPARATES populations,
 CORRELATES_WITH,Indicates an explicitly stated statistical correlation or correlational relationship.,diversity CORRELATES_WITH elevation,
+INCREASES_WITH,"Indicates that the subject increases as the object increases: a positive directional relation between two quantities, or between a quantity and a gradient.",growth INCREASES_WITH temperature; species richness INCREASES_WITH habitat area,"For a quantity that falls as the other rises, use DECREASES_WITH. Definition drafted by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah."
+DECREASES_WITH,"Indicates that the subject decreases as the object increases: a negative directional relation between two quantities, or between a quantity and a gradient.",species richness DECREASES_WITH elevation; body size DECREASES_WITH temperature,Use instead of INCREASES_WITH with the property Negative_polarity. Definition drafted by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah.
 GREATER_THAN,"Compares two quantities, magnitudes, rates, effects, or other ordered values and asserts that the first is greater.",[Culicidae abundance LOCATED_IN warmer lakes] GREATER_THAN [Culicidae abundance LOCATED_IN cooler lakes],
 LESS_THAN,"Compares two quantities, magnitudes, rates, effects, or other ordered values and asserts that the first is smaller.",[fish abundance LOCATED_IN acidic lakes] LESS_THAN [fish abundance LOCATED_IN neutral lakes],
 SIMILAR_TO,"Indicates similarity between entities, properties, communities, patterns, or processes.",community SIMILAR_TO community,
 SAME_AS,"Indicates that entities, properties, communities, patterns, or processes are identical",colour SAME_AS colour,
 DIFFERS_FROM,"Indicates that two entities, properties, communities, or processes differ.",community DIFFERS_FROM community,
-OCCURS_DURING,"Links an event, process, state, or phenomenon to a temporal period.",flowering OCCURS_DURING spring; migration OCCURS_DURING April,
-HAS_ORIGIN,"Identifies the geographical or conceptual starting point of a movement, lineage, or process.",migration HAS_ORIGIN Sahel,
-HAS_DESTINATION,Identifies the endpoint or destination of a movement or directed process.,migration HAS_DESTINATION Denmark,
-STARTS,Identifies the temporal or sequential starting point of an event/process.,migration STARTS April,
-ENDS,Identifies the temporal or sequential endpoint of an event/process.,migration ENDS May,
-INDICATES,"Links an observation, finding, pattern, or proposition to a conclusion, implication, or interpretation that it points toward, supports, or provides evidence for.",,
-VARIES_WITH,,,
-ADDING_TO,,,
-RESPONDS_TO,,,
-INCREASES_WITH,,Growth INCREASES_WITH temperature,
-LOCATED_BY,,,
-HAS_PROCESS,,Plants HAS_PROCESS_grow in meadows,
-OBSERVED,,Species OBSERVED in mountain,
-DOMINATES,,,
-REQUIRES,,,
+PARTICIPATES_IN,"Indicates participation of subject in a process, either actively or passively",common cranes PARTICIPATES_IN migration,
+INTERACTS_WITH,"Indicates an interaction between two entities, variables, processes, or drivers.",temperature INTERACTS_WITH predator presence,
+CAUSES,Indicates a causal relationship in which the subject produces or brings about the object.,habitat loss CAUSES decline; predation CAUSES mortality,
+AFFECTS,Indicates that one entity/process influences or has an effect on another without necessarily asserting causality.,temperature AFFECTS abundance; predators AFFECT insect emergence,
+ENABLES,Indicates that the subject facilitates or makes the object/process possible.,habitat complexity ENABLES coexistence,
+OBJECT_OF,"Links an entity to an action or process that acts on it: the entity is what is affected, moved, detected or changed (the object of the verb).",seeds OBJECT_OF carry; crested porcupine OBJECT_OF detected,The entity that performs the action is linked with PARTICIPATES_IN. Definition drafted by Claude on 2026-11-03 from the annotations; to be reviewed by Mark and Davnah.

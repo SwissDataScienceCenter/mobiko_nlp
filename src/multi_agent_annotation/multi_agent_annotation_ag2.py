@@ -30,6 +30,7 @@ import re
 import sys
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, Callable, Dict, List, NamedTuple, Optional, Tuple, Any
 
@@ -512,6 +513,13 @@ def _canonicalize_relation_field(value):
 class EntityAnnotation(BaseModel):
     text: str
     entity_type: str
+    # A mention id unique within the sentence ("e1", "e2", ...). Two mentions
+    # of the same words are two entities, told apart only by this: one implied
+    # "elevation" per site when a sentence gives the elevation of two sites
+    # (decided with the annotators, 3 Nov 2026). Relations name their arguments
+    # by it. None on output from before ids existed, which then falls back to
+    # the text.
+    id: Optional[str] = None
     start: Optional[int] = None
     end: Optional[int] = None
     guideline_step: Optional[str] = None
@@ -796,6 +804,10 @@ class RelationFlat(BaseModel):
     e1_type: str
     e2_text: str
     e2_type: str
+    # Which mention each argument is, by EntityAnnotation.id; the text alone
+    # cannot say which of two "elevation" mentions is meant.
+    e1_id: Optional[str] = None
+    e2_id: Optional[str] = None
     # See RelationAnnotation.property. Defaults to "" so output from a run
     # without relation properties, or from a model that omits the key, parses.
     property: str = ""
@@ -817,8 +829,8 @@ class RelationFlat(BaseModel):
     def to_relation_annotation(self) -> RelationAnnotation:
         return RelationAnnotation(
             relation=self.relation,
-            e1=EntityAnnotation(text=self.e1_text, entity_type=self.e1_type),
-            e2=EntityAnnotation(text=self.e2_text, entity_type=self.e2_type),
+            e1=EntityAnnotation(text=self.e1_text, entity_type=self.e1_type, id=self.e1_id),
+            e2=EntityAnnotation(text=self.e2_text, entity_type=self.e2_type, id=self.e2_id),
             property=self.property,
             confidence=self.confidence,
             reasoning=self.reasoning,
@@ -2507,6 +2519,73 @@ def _span_occurrences(sentence: str, text: str) -> List[Tuple[int, int]]:
             for m in re.finditer(pattern, sentence, flags=re.IGNORECASE)]
 
 
+
+# ─────────────────────── mentions with the same text ───────────────────────
+#
+# Inside the pipeline an entity is identified by (normalised text, k): the k-th
+# mention of that text in an agent's list. A text that occurs once keeps key
+# (text, 0), exactly as when entities were keyed by text alone, so output
+# without ids behaves as before. Ids only say which of two same-text mentions a
+# relation means; after merging, final ids are renumbered e1..en, because the
+# Annotator's and the Adjudicator's id spaces are independent and can collide.
+
+def _mention_norm(text: str) -> str:
+    text = (text or "").strip().strip("\"'`")
+    return re.sub(r"\s+", " ", text).lower()
+
+
+def _entity_keys(entities: List["EntityAnnotation"]) -> List[Tuple[str, int]]:
+    """(normalised text, k) per entity, k counting earlier mentions of that text."""
+    seen: Counter = Counter()
+    keys = []
+    for e in entities:
+        t = _mention_norm(e.text)
+        keys.append((t, seen[t]))
+        seen[t] += 1
+    return keys
+
+
+def _endpoint_key(text: str, eid: Optional[str], entities: List["EntityAnnotation"],
+                  keys: List[Tuple[str, int]]) -> Tuple[str, int]:
+    """The key of the mention a relation argument names: by id when it has one
+    that the list knows, else the first mention of its text."""
+    if eid:
+        for e, k in zip(entities, keys):
+            if e.id == eid:
+                return k
+    return (_mention_norm(text), 0)
+
+
+def _renumber_ids(entities: List["EntityAnnotation"], keys: List[Tuple[str, int]],
+                  relations: List["RelationFlat"],
+                  rel_keys: List[Tuple[Tuple[str, int], Tuple[str, int]]]
+                  ) -> Tuple[List["EntityAnnotation"], List["RelationFlat"]]:
+    """Final ids e1..en in entity order; each relation pointed at its mentions.
+
+    ``rel_keys`` gives each relation's (e1 key, e2 key), already resolved in
+    the list the relation came from. An argument whose mention is not in the
+    final list keeps no id and is matched by text downstream, as before.
+    """
+    id_of = {}
+    out_entities = []
+    for i, (e, k) in enumerate(zip(entities, keys), 1):
+        id_of[k] = f"e{i}"
+        out_entities.append(e.model_copy(update={"id": f"e{i}"}))
+    out_relations = [
+        r.model_copy(update={"e1_id": id_of.get(k1), "e2_id": id_of.get(k2)})
+        for r, (k1, k2) in zip(relations, rel_keys)]
+    return out_entities, out_relations
+
+
+def _assign_ids(entities: List["EntityAnnotation"], relations: List["RelationFlat"]
+                ) -> Tuple[List["EntityAnnotation"], List["RelationFlat"]]:
+    """Clean ids for one agent's own output (single-pass, blind adjudication)."""
+    keys = _entity_keys(entities)
+    rel_keys = [(_endpoint_key(r.e1_text, r.e1_id, entities, keys),
+                 _endpoint_key(r.e2_text, r.e2_id, entities, keys)) for r in relations]
+    return _renumber_ids(entities, keys, relations, rel_keys)
+
+
 def _fill_char_offsets(
     sentence: str,
     entities: List[EntityAnnotation],
@@ -2613,13 +2692,20 @@ def _fill_char_offsets(
         if not progress:
             break
 
-    # Step 4: fallback — first occurrence for anything still unresolved
+    # Step 4: fallback for anything still unresolved — the first occurrence no
+    # other mention of the same text holds, so two "elevation" mentions in a
+    # sentence that says "elevation" twice get the two positions, not one. When
+    # there are more mentions than occurrences (an implied mention beside an
+    # explicit one), the rest stay without offsets.
     for ent in entities:
         if ent.start is not None:
             continue
         occ = occurrence_map.get(_norm(ent.text), [])
-        if occ:
-            _assign(ent, occ[0][0], occ[0][1])
+        taken = {(o.start, o.end) for o in entities
+                 if o is not ent and o.start is not None and _norm(o.text) == _norm(ent.text)}
+        free = [se for se in occ if se not in taken]
+        if free:
+            _assign(ent, free[0][0], free[0][1])
 
     # Step 5: sync offsets into relation e1/e2
     # Build a lookup: (norm_text, norm_type) → lowest-start EntityAnnotation
@@ -2631,11 +2717,21 @@ def _fill_char_offsets(
         if k not in resolved or ent.start < resolved[k].start:
             resolved[k] = ent
 
+    by_id = {ent.id: ent for ent in entities if ent.id}
     for rel in relations:
         for slot in (rel.e1, rel.e2):
             if slot.start is not None:
                 continue
-            anchor = resolved.get(_key(slot))
+            # By id when the argument names a known mention: with two same-text
+            # mentions the text alone would give every relation the earlier
+            # one's position, and an implied mention must stay without one
+            # rather than borrow it.
+            if slot.id and slot.id in by_id:
+                anchor = by_id[slot.id]
+                if anchor.start is None:
+                    continue
+            else:
+                anchor = resolved.get(_key(slot))
             if anchor is not None:
                 slot.start = anchor.start
                 slot.end = anchor.end
@@ -2714,6 +2810,14 @@ class MultiAgentAnnotator:
         # pipeline (tests/test_review_pipeline_frozen.py), which is how archived
         # runs stay reproducible; the output schema accepts `property` either way.
         relation_properties: bool = True,
+        # MoBiKo only. Numbers are split from the noun they count ("28" +
+        # "species"), as decided with the annotators on 3 Nov 2026. Off renders
+        # the frozen review prompts, like relation_properties.
+        split_counts: bool = True,
+        # MoBiKo only. Entities carry a mention id and relations name their
+        # arguments by it, so two same-text mentions (one implied "elevation"
+        # per site, decided 3 Nov 2026) stay two. Off renders the frozen prompts.
+        entity_ids: bool = True,
         tool_choice: Optional[str] = None,
         annotator_temperature: Optional[float] = None,
         critic_temperature: Optional[float] = None,
@@ -3049,6 +3153,8 @@ class MultiAgentAnnotator:
                                               and bool(relation_guide)),
                 "relation_types": [sec["title"] for sec in relation_guide],
                 "relation_properties": relation_properties,
+                "split_counts": split_counts,
+                "entity_ids": entity_ids,
             }
 
         # guideline_search_enabled=False drops the tool from the prompt. Only the
@@ -3188,6 +3294,8 @@ class MultiAgentAnnotator:
             relation_guide_size=len(relation_guide),
             relation_search_mandatory=relation_search_mandatory and bool(relation_guide),
             relation_properties=relation_properties and prompt_set != "conll",
+            split_counts=split_counts and prompt_set != "conll",
+            entity_ids=entity_ids and prompt_set != "conll",
             relation_search_registered=any(
                 t[0] is relation_search for t in annotator_tools),
             entity_types=list(entity_types_list) if entity_types_list else None,
@@ -3247,6 +3355,8 @@ class MultiAgentAnnotator:
             # them has `property` = "" everywhere, which must not be read as "no
             # relation in this run was negated".
             "relation_properties": bool(cfg.get("relation_properties")),
+            "split_counts": bool(cfg.get("split_counts")),
+            "entity_ids": bool(cfg.get("entity_ids")),
             "relation_search_registered": cfg.get("relation_search_registered"),
             "entity_types": cfg.get("entity_types"),
             # Which prompt templates the agents actually ran with. Two corpora with
@@ -3521,10 +3631,12 @@ class MultiAgentAnnotator:
         # is privileged — the paper reports both, which is the point of running
         # both.
         if adj_out is not None:
-            record.final_entities = list(adj_out.final_entities)
+            ents, rels = _assign_ids(list(adj_out.final_entities),
+                                     list(adj_out.final_relations or []))
+            record.final_entities = ents
             record.final_relations = [
                 r.to_relation_annotation() if hasattr(r, "to_relation_annotation")
-                else r for r in (adj_out.final_relations or [])]
+                else r for r in rels]
             record.flagged_for_human_review = list(
                 adj_out.flagged_for_human_review or [])
             record.adjudication_status = "blind_pair"
@@ -3795,6 +3907,7 @@ class MultiAgentAnnotator:
             audit = self._base_adjudication_audit("single-pass: no Critic or Adjudicator")
             ents = list(last_annotator_out.entities)
             rels = [r for r in getattr(last_annotator_out, "relations", [])]
+            ents, rels = _assign_ids(ents, rels)
             ents, rels = MultiAgentAnnotator._remove_nested_entities(ents, rels, audit)
             record.final_entities = ents
             record.final_relations = [
@@ -5342,27 +5455,19 @@ Previous output to repair:
         )
         audit["human_review_flags"] = human_review_provenance
 
-        if critic is None:
+        if critic is None or adjudicator is None:
+            missing_agent = "Critic" if critic is None else "Adjudicator"
             audit["warnings"].append(
-                "Critic output missing or unparseable; kept final Annotator output unchanged."
-            )
+                f"{missing_agent} output missing or unparseable; kept final "
+                "Annotator output unchanged.")
+            entities, relations = _assign_ids(list(annotator.entities),
+                                              list(annotator.relations))
             return ConstrainedAdjudication(
-                final_entities=annotator.entities,
-                final_relations=annotator.relations,
+                final_entities=entities,
+                final_relations=relations,
                 flagged_for_human_review=human_review_flags,
-                status="critic_missing_fallback",
-                audit=audit,
-            )
-
-        if adjudicator is None:
-            audit["warnings"].append(
-                "Adjudicator output missing or unparseable; kept final Annotator output unchanged."
-            )
-            return ConstrainedAdjudication(
-                final_entities=annotator.entities,
-                final_relations=annotator.relations,
-                flagged_for_human_review=human_review_flags,
-                status="adjudicator_parse_failed",
+                status=("critic_missing_fallback" if critic is None
+                        else "adjudicator_parse_failed"),
                 audit=audit,
             )
 
@@ -5377,29 +5482,29 @@ Previous output to repair:
             if m.text
         }
 
-        annotator_entities_by_text = {
-            MultiAgentAnnotator._normalize_annotation_text(e.text): e
-            for e in annotator.entities
-        }
-        entity_order = [
-            MultiAgentAnnotator._normalize_annotation_text(e.text)
-            for e in annotator.entities
-        ]
-        final_entities_by_text = dict(annotator_entities_by_text)
+        # Entities are keyed (text, k), the k-th mention of that text, so two
+        # "elevation" mentions — one per site — stay two (see _entity_keys).
+        # The Adjudicator's k-th "elevation" is taken to be the Annotator's k-th.
+        ann_entities = list(annotator.entities)
+        ann_keys = _entity_keys(ann_entities)
+        annotator_entities_by_key = dict(zip(ann_keys, ann_entities))
+        entity_order = list(ann_keys)
+        final_entities_by_key = dict(annotator_entities_by_key)
 
-        for key, entity in annotator_entities_by_text.items():
-            if key not in disagreement_targets:
+        for key, entity in annotator_entities_by_key.items():
+            if key[0] not in disagreement_targets:
                 audit["preserved_consensus"].append(
                     f'entity "{entity.text}": {entity.entity_type}'
                 )
 
-        for adj_entity in adjudicator.final_entities:
-            key = MultiAgentAnnotator._normalize_annotation_text(adj_entity.text)
-            original = annotator_entities_by_text.get(key)
+        adj_entities = list(adjudicator.final_entities)
+        adj_keys = _entity_keys(adj_entities)
+        for adj_entity, key in zip(adj_entities, adj_keys):
+            original = annotator_entities_by_key.get(key)
 
             if original is not None:
-                if key in disagreement_targets:
-                    final_entities_by_text[key] = adj_entity
+                if key[0] in disagreement_targets:
+                    final_entities_by_key[key] = adj_entity
                     if original.entity_type != adj_entity.entity_type:
                         audit["allowed_changes"].append(
                             f'entity "{adj_entity.text}": '
@@ -5415,9 +5520,9 @@ Previous output to repair:
                     )
                 continue
 
-            missing = missing_by_text.get(key)
+            missing = missing_by_text.get(key[0])
             if missing is not None and adj_entity.entity_type == missing.entity_type:
-                final_entities_by_text[key] = adj_entity
+                final_entities_by_key[key] = adj_entity
                 entity_order.append(key)
                 audit["allowed_changes"].append(
                     f'entity "{adj_entity.text}" added as {adj_entity.entity_type} '
@@ -5438,31 +5543,40 @@ Previous output to repair:
         # This handles span-split corrections (e.g. "warmer lakes" → "lakes")
         # where the Adjudicator replaces the compound span with a different-text
         # entity instead of relabelling the same span.
-        adj_entity_keys = {
-            MultiAgentAnnotator._normalize_annotation_text(e.text)
-            for e in adjudicator.final_entities
-        }
-        for disputed_key in list(disagreement_targets):
-            if disputed_key in final_entities_by_text and disputed_key not in adj_entity_keys:
-                entity = final_entities_by_text.pop(disputed_key)
-                entity_order = [k for k in entity_order if k != disputed_key]
+        adj_key_set = set(adj_keys)
+        for key in list(entity_order):
+            if (key[0] in disagreement_targets and key in final_entities_by_key
+                    and key not in adj_key_set):
+                entity = final_entities_by_key.pop(key)
+                entity_order.remove(key)
                 audit["allowed_changes"].append(
                     f'entity "{entity.text}" removed '
                     "(disputed, Adjudicator replaced with different span)"
                 )
 
-        final_entities = [final_entities_by_text[key] for key in entity_order]
-        final_entity_type_by_text = {
-            MultiAgentAnnotator._normalize_annotation_text(e.text): e.entity_type
-            for e in final_entities
-        }
+        final_type_by_key = {k: final_entities_by_key[k].entity_type for k in entity_order}
 
-        annotator_relations_by_slot = {
-            MultiAgentAnnotator._relation_slot(r): r
-            for r in annotator.relations
-        }
+        # A relation's slot is the pair of mentions it connects, resolved in the
+        # list it came from: by id where it names one, else by text.
+        def ann_slot(r: RelationFlat):
+            return (_endpoint_key(r.e1_text, r.e1_id, ann_entities, ann_keys),
+                    _endpoint_key(r.e2_text, r.e2_id, ann_entities, ann_keys))
+
+        def adj_slot(r: RelationFlat):
+            return (_endpoint_key(r.e1_text, r.e1_id, adj_entities, adj_keys),
+                    _endpoint_key(r.e2_text, r.e2_id, adj_entities, adj_keys))
+
+        def synced(r: RelationFlat, slot) -> RelationFlat:
+            updates: Dict[str, str] = {}
+            if slot[0] in final_type_by_key:
+                updates["e1_type"] = final_type_by_key[slot[0]]
+            if slot[1] in final_type_by_key:
+                updates["e2_type"] = final_type_by_key[slot[1]]
+            return r.model_copy(update=updates) if updates else r
+
+        annotator_relations_by_slot = {ann_slot(r): r for r in annotator.relations}
         disputed_relation_slots = {
-            MultiAgentAnnotator._relation_slot(r)
+            ann_slot(r)
             for r in annotator.relations
             if any(
                 MultiAgentAnnotator._disagreement_matches_relation(d, r)
@@ -5473,29 +5587,20 @@ Previous output to repair:
             )
         }
 
-        relation_order = [
-            MultiAgentAnnotator._relation_slot(r)
-            for r in annotator.relations
-            if MultiAgentAnnotator._relation_slot(r) not in disputed_relation_slots
-        ]
+        relation_order = [ann_slot(r) for r in annotator.relations
+                          if ann_slot(r) not in disputed_relation_slots]
         final_relations_by_slot = {
-            MultiAgentAnnotator._relation_slot(r): MultiAgentAnnotator._sync_relation_endpoint_types(
-                r, final_entity_type_by_text
-            )
+            ann_slot(r): synced(r, ann_slot(r))
             for r in annotator.relations
-            if MultiAgentAnnotator._relation_slot(r) not in disputed_relation_slots
+            if ann_slot(r) not in disputed_relation_slots
         }
 
         for slot, relation in final_relations_by_slot.items():
-            audit["preserved_consensus"].append(
-                f'relation "{relation.describe()}"'
-            )
+            audit["preserved_consensus"].append(f'relation "{relation.describe()}"')
 
         for adj_relation in adjudicator.final_relations:
-            synced_adj_relation = MultiAgentAnnotator._sync_relation_endpoint_types(
-                adj_relation, final_entity_type_by_text
-            )
-            slot = MultiAgentAnnotator._relation_slot(synced_adj_relation)
+            slot = adj_slot(adj_relation)
+            synced_adj_relation = synced(adj_relation, slot)
             original = annotator_relations_by_slot.get(slot)
             current = final_relations_by_slot.get(slot)
 
@@ -5529,14 +5634,12 @@ Previous output to repair:
                     )
                 continue
 
-            e1_key = MultiAgentAnnotator._normalize_annotation_text(synced_adj_relation.e1_text)
-            e2_key = MultiAgentAnnotator._normalize_annotation_text(synced_adj_relation.e2_text)
             # Allow relations produced from span-splitting: both endpoints must be
             # valid final entities and at least one must come from critic missing_annotations.
             split_span_relation = (
-                e1_key in final_entity_type_by_text
-                and e2_key in final_entity_type_by_text
-                and (e1_key in missing_by_text or e2_key in missing_by_text)
+                slot[0] in final_type_by_key
+                and slot[1] in final_type_by_key
+                and (slot[0][0] in missing_by_text or slot[1][0] in missing_by_text)
             )
             if any(
                 MultiAgentAnnotator._disagreement_matches_relation(d, synced_adj_relation)
@@ -5569,8 +5672,11 @@ Previous output to repair:
                     "(final Critic disagreement)"
                 )
 
-        out_entities = [final_entities_by_text[key] for key in entity_order]
+        out_entities = [final_entities_by_key[key] for key in entity_order]
         out_relations = [final_relations_by_slot[key] for key in relation_order]
+        # Final ids e1..en; each relation pointed at the mentions its slot names.
+        out_entities, out_relations = _renumber_ids(
+            out_entities, entity_order, out_relations, relation_order)
 
         # Drop entities whose span is strictly nested inside a longer co-annotated
         # entity, and remove any relation that references a dropped entity.
