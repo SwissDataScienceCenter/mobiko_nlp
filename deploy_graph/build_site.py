@@ -30,6 +30,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from src.graph.build_graph import STRUCTURAL  # noqa: E402
 from src.graph.render_html import VIS_NETWORK, render  # noqa: E402
+from src.graph.text_store import TextStore  # noqa: E402
 
 VIS_SHA256 = "f53f833ddb9bf97efe856bb0637d4fe88f39e39999c7e94a4b8afc8de8a1a2e5"
 
@@ -153,8 +154,11 @@ def main(argv=None) -> int:
         nodes, edges = _read(g / "nodes.jsonl"), _read(g / "edges.jsonl")
         page = args.out / g.name / "index.html"
         page.parent.mkdir(parents=True)
+        db = g / "sentences.sqlite"
+        store = TextStore(db) if db.exists() else None
         page.write_text(render(nodes, edges, f"MoBiKo graph · {g.name}",
-                               vis_src="../vendor/vis-network.min.js"), encoding="utf-8")
+                               vis_src="../vendor/vis-network.min.js", store=store),
+                        encoding="utf-8")
         s = summary(g, nodes, edges)
         cards.append(card(s))
         print(f"  {g.name}: {s['docs']} docs, {s['edges']:,} relations, "

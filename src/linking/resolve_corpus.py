@@ -93,6 +93,7 @@ import hashlib
 import json
 import logging
 import subprocess
+from functools import lru_cache
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -104,8 +105,9 @@ from src.linking.cluster import (build_clusters, content_key, entity_id,
                                  link_signatures, rank_by_document_frequency,
                                  singular_form, split_entity_type, surface_key)
 from src.linking.dictionary import Dictionary
-from src.linking.split_spans import SpanSplitter
-from src.linking.match import Outcome, resolve
+from src.linking.split_spans import SpanSplitter, may_split
+from src.linking.match import Outcome
+from src.linking.match import resolve as _resolve_uncached
 from src.linking import wordnet_guard
 from src.linking.mention_norm import NORMALIZER_VERSION, expand_abbreviations, normalize_key
 
@@ -132,6 +134,18 @@ DEFAULT_INPUTS = [
 # Outcomes that get a project-local entity. AMBIGUOUS is excluded on purpose —
 # see the module docstring.
 CLUSTERED_OUTCOMES = (Outcome.NIL, Outcome.UNROUTED)
+
+
+@lru_cache(maxsize=500_000)
+def resolve(dictionary, text: str, entity_type: str):
+    """``match.resolve``, once per (text, type) in a run.
+
+    The answer depends only on these and the dictionary, and most mentions
+    repeat ("elevation", "species"): 2,251 distinct of 3,484 on
+    second_iteration, fewer as the corpus grows. Results are never modified
+    after they are returned, so rows can share one.
+    """
+    return _resolve_uncached(dictionary, text, entity_type)
 
 
 def _synthetic_uid(doc_id: str, sent_i: int, start, end, text: str) -> str:
@@ -516,17 +530,19 @@ def main(argv: List[str] | None = None) -> int:
 
     n_split = 0
     if splitter and splitter.available:
+        # Only sentences with a span that could be split are parsed (see
+        # may_split); the parser is otherwise nearly all of the running time.
         by_sentence: Dict[str, list] = {}
         for i, sp in enumerate(raw):
-            by_sentence.setdefault(sp["sentence"], []).append((i, sp["start_char"],
-                                                              sp["end_char"]))
+            if may_split(sp["text"]):
+                by_sentence.setdefault(sp["sentence"], []).append(
+                    (i, sp["start_char"], sp["end_char"]))
         expanded: List[dict] = []
         for sp in raw:
             sp["split_from"] = None
             sp["part_index"] = None
-        for sentence, group in by_sentence.items():
-            for i, sres in splitter.split_all(sentence, group).items():
-                raw[i]["_split"] = sres
+        for i, sres in splitter.split_many(list(by_sentence.items())).items():
+            raw[i]["_split"] = sres
         for sp in raw:
             sres = sp.pop("_split", None)
             expanded.append(sp)

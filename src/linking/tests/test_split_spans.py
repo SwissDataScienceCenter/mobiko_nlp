@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.linking.split_spans import SpanSplitter, split_span
+from src.linking.split_spans import SpanSplitter, may_split, split_span
 
 splitter = SpanSplitter()
 needs_trf = pytest.mark.skipif(
@@ -143,3 +143,33 @@ def test_split_parts_become_separate_entities(tmp_path):
     if slopes:
         assert len({p["entity_id"] for p in slopes}) == 2, \
             "the two slopes must not collapse back into one entity"
+
+
+# ── only sentences that could split are parsed ───────────────────
+
+@pytest.mark.parametrize("text,could", [
+    ("eastern and western slopes", True),
+    ("ecosystem goods and services", True),
+    ("coniferous forest", False),                          # no conjunction
+    ("between 1100 and 1700m", False),                     # a range
+    ("Monitoring and Assessment Programme", False),        # a proper name
+])
+def test_may_split_is_the_text_test_split_span_makes_first(text, could):
+    assert may_split(text) is could
+
+
+@needs_trf
+def test_batched_splitting_gives_the_per_sentence_result():
+    items = [
+        ("Defaunation differed between the eastern and western slopes of the massif.",
+         "eastern and western slopes"),
+        ("The area shows high and transient relief today.", "high and transient relief"),
+        ("Sampling ran between 1100 and 1700m elevation.", "between 1100 and 1700m"),
+    ]
+    batch = [(s, [(k, s.index(p), s.index(p) + len(p))]) for k, (s, p) in enumerate(items)]
+    many = splitter.split_many(batch)
+    one = {}
+    for s, spans in batch:
+        one.update(splitter.split_all(s, spans))
+    assert {k: v.parts for k, v in many.items()} == {k: v.parts for k, v in one.items()}
+    assert set(many) == {0, 1}

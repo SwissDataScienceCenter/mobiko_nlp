@@ -88,16 +88,25 @@ def _ok(part: str) -> bool:
             and any(c.isalpha() for c in part))
 
 
+def may_split(text: str) -> bool:
+    """Whether ``split_span`` could split a span with this text at all.
+
+    It is the text-only test ``split_span`` makes before reading the parse, so
+    a sentence none of whose spans passes it need not be parsed: the result is
+    the same. On second_iteration that is 12 sentences of 571, and the parser
+    is nearly all of resolve_corpus's running time.
+    """
+    return (any(w.lower() in _CONJ_WORDS for w in text.split())
+            and not _RANGE.search(text) and not _looks_like_proper_name(text))
+
+
 def split_span(span, model: str = PREFERRED_MODEL) -> Optional[Split]:
     """Split a parsed spaCy span, or return None to leave it alone.
 
     ``span`` must be a spaCy Span parsed IN ITS SENTENCE — a span parsed on its
     own loses the attachments this reads.
     """
-    text = span.text
-    if not any(w.lower() in _CONJ_WORDS for w in text.split()):
-        return None
-    if _RANGE.search(text) or _looks_like_proper_name(text):
+    if not may_split(span.text):
         return None
 
     root = span.root
@@ -197,7 +206,23 @@ class SpanSplitter:
         """``spans`` is [(key, start_char, end_char)]; returns key -> Split."""
         if not self.available or not sentence:
             return {}
-        doc = self._nlp(sentence)
+        return self._split_doc(self._nlp(sentence), spans)
+
+    def split_many(self, items: Sequence[tuple], batch_size: int = 32) -> dict:
+        """``items`` is [(sentence, spans)]; returns key -> Split over all of them.
+
+        Same result as ``split_all`` per sentence, parsed in batches.
+        """
+        items = [(s, sp) for s, sp in items if s]
+        if not self.available or not items:
+            return {}
+        out = {}
+        docs = self._nlp.pipe((s for s, _ in items), batch_size=batch_size)
+        for doc, (_, spans) in zip(docs, items):
+            out.update(self._split_doc(doc, spans))
+        return out
+
+    def _split_doc(self, doc, spans: Sequence[tuple]) -> dict:
         out = {}
         for key, start, end in spans:
             if start is None or end is None:
