@@ -236,6 +236,18 @@ class Dictionary:
         return [Match(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], r[8])
                 for r in rows]
 
+    def concept(self, uri: str) -> Optional[dict]:
+        """One concept by URI, whatever its aliases: how a GMBA range's parent
+        ("Eastern Arc Mountains") or a GeoNames feature code is looked up."""
+        sql = self._union(
+            """SELECT uri, curie, source, label, definition, namespace, obsolete
+               FROM {s}.concept WHERE uri = ?""")
+        row = self._conn.execute(f"{sql} LIMIT 1", [uri] * len(self._schemas)).fetchone()
+        if not row:
+            return None
+        return dict(zip(("uri", "curie", "source", "label", "definition",
+                         "namespace", "obsolete"), row))
+
     # ── provenance ───────────────────────────────────────────────
 
     def provenance(self) -> Dict[str, dict]:

@@ -51,13 +51,17 @@ Usage
     python -m src.linking.authorities.compile_db                  # ontologies
     python -m src.linking.authorities.compile_db --group gbif
     python -m src.linking.authorities.compile_db --group geonames
+    python -m src.linking.authorities.compile_db --group wdpa
+    python -m src.linking.authorities.compile_db --group gmba
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import io
 import json
 import logging
+import re
 import sqlite3
 import sys
 import zipfile
@@ -401,8 +405,148 @@ def parse_geonames(auth: Authority, stats: Counter) -> Iterator[Rec]:
                     yield ("alias", (uri, alt, key, "exact", "geonames"))
 
 
+WDPA_URI = "https://www.protectedplanet.net/{}"
+# Statuses of an area that exists; "Proposed" ones may never be designated.
+WDPA_STATUSES = {"Designated", "Established", "Inscribed", "Adopted"}
+
+
+def wdpa_full_name(name: str, designation: str) -> Optional[str]:
+    """The name a paper would use: "Monduli" + "Forest Reserve" ->
+    "Monduli Forest Reserve"; a name already carrying its designation
+    ("Kilimanjaro National Park") is kept. A name that IS only a designation
+    ("National Park") names nothing in particular, so it gives None."""
+    name, designation = normalize_display(name), normalize_display(designation)
+    if not name:
+        return None
+    n, d = normalize_key(name), normalize_key(designation)
+    if n == d:
+        return None
+    return name if not d or d in n else f"{name} {designation}"
+
+
+def parse_wdpa(auth: Authority, stats: Counter) -> Iterator[Rec]:
+    """WDPA public CSV: one row per protected area (SITE_ID).
+
+    Indexed under full names only, from NAME (the official, often local-language
+    name) and NAME_ENG ("Vuon quoc gia Phuoc Binh" / "Phuoc Binh"); each also
+    without hyphens, since papers write "Bidoup Nui Ba" for "Bidoup-Nui Ba".
+    ``namespace`` holds "<designation type>|<designation>|<ISO3>", which the
+    matcher reads to prefer a national designation over the World Heritage or
+    biosphere record of the same area.
+    """
+    z = zipfile.ZipFile(auth.path)
+    member = next(n for n in z.namelist()
+                  if n.startswith("WDPA_") and n.endswith("_Public_csv.csv"))
+    with z.open(member) as fh:
+        for row in csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig")):
+            stats["rows"] += 1
+            if row.get("STATUS") not in WDPA_STATUSES:
+                stats["skipped_status"] += 1
+                continue
+            desig = row.get("DESIG_ENG") or ""
+            names = [wdpa_full_name(row.get(c) or "", desig) for c in ("NAME", "NAME_ENG")]
+            names = [n for n in names if n]
+            if not names:
+                stats["skipped_no_name"] += 1
+                continue
+            uri = WDPA_URI.format(row["SITE_ID"])
+            label = names[-1] if row.get("NAME_ENG") else names[0]
+            stats["concepts"] += 1
+            yield ("concept", (uri, f"wdpa:{row['SITE_ID']}", "wdpa", label, None,
+                               f"{row.get('DESIG_TYPE') or ''}|{desig}|{row.get('ISO3') or ''}",
+                               0, 1))
+            seen = set()
+            for i, nm in enumerate(names):
+                for variant in (nm, nm.replace("-", " ")):
+                    key = normalize_key(variant)
+                    if key and key not in seen:
+                        seen.add(key)
+                        yield ("alias", (uri, variant, key,
+                                         "label" if variant == label else "exact", "wdpa"))
+
+
+GMBA_URI = "urn:gmba:v2:{}"
+# Features a mention can be linked to. The others stay concepts, so a range's
+# parents can be named, but get no alias: "Africa" in GMBA is the mountains of
+# Africa, "Madagascar" the island's mountain system.
+GMBA_LINKABLE = {"Mountain range with well-recognized name",
+                 "Geographically-defined sub-range", "Highland or plateau",
+                 "Area dominated by a single large peak", "Point Defined Range",
+                 "Escarpment / Canyon"}
+_GMBA_QUALIFIER = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def read_dbf(data: bytes) -> Iterator[dict]:
+    """Rows of a dBase III table, as {field: stripped text}. Stdlib only."""
+    import struct
+    n, hlen, rlen = struct.unpack("<IHH", data[4:12])
+    fields, off = [], 32
+    while data[off] != 0x0D:
+        b = data[off:off + 32]
+        length = b[16] + (b[17] << 8 if chr(b[11]) == "C" else 0)
+        fields.append((b[:11].split(b"\0")[0].decode("ascii"), length))
+        off += 32
+    for i in range(n):
+        rec = data[hlen + i * rlen: hlen + (i + 1) * rlen]
+        if rec[:1] == b"*":                 # deleted record
+            continue
+        pos, row = 1, {}
+        for name, length in fields:
+            row[name] = rec[pos:pos + length].decode("utf-8", "replace").strip()
+            pos += length
+        yield row
+
+
+def gmba_parent(path_id: str) -> Optional[str]:
+    """"12154 > 14066 > 12149 > 12025" -> "12149"."""
+    ids = [p.strip() for p in (path_id or "").split(">") if p.strip()]
+    return ids[-2] if len(ids) > 1 else None
+
+
+def parse_gmba(auth: Authority, stats: Counter) -> Iterator[Rec]:
+    """GMBA Inventory v2 attribute table (the .dbf inside the shapefile zip).
+
+    ``namespace`` holds "<feature>|<parent GMBA id>", which is how the graph
+    walks up the hierarchy; ``definition`` holds the Wikidata URL when there is
+    one. Names: DBaseName, MapName, Name_EN and AsciiName, each also without a
+    trailing qualifier ("Sierra Nevada (USA)" -> "Sierra Nevada", so the three
+    Sierra Nevadas tie instead of none matching).
+    """
+    z = zipfile.ZipFile(auth.path)
+    member = next(n for n in z.namelist()
+                  if n.endswith(".dbf") and not n.startswith("__MACOSX"))
+    for row in read_dbf(z.read(member)):
+        stats["rows"] += 1
+        gid = row["GMBA_V2_ID"]
+        label = normalize_display(row.get("Name_EN") or row.get("DBaseName") or "")
+        if not gid or not label:
+            continue
+        uri = GMBA_URI.format(gid)
+        stats["concepts"] += 1
+        yield ("concept", (uri, f"gmba:{gid}", "gmba", label,
+                           row.get("WikiDataUR") or None,
+                           f"{row.get('Feature', '')}|{gmba_parent(row.get('Path_ID')) or ''}",
+                           0, 1))
+        if row.get("Feature") not in GMBA_LINKABLE:
+            stats["not_linkable"] += 1
+            continue
+        seen = set()
+        for col in ("Name_EN", "DBaseName", "MapName", "AsciiName"):
+            raw = normalize_display(row.get(col) or "")
+            if not raw or raw.endswith("(nn)"):
+                continue
+            for name in (raw, _GMBA_QUALIFIER.sub("", raw)):
+                key = normalize_key(name)
+                if key and key not in seen:
+                    seen.add(key)
+                    stats["aliases"] += 1
+                    yield ("alias", (uri, name, key,
+                                     "label" if name == label else "exact", "gmba"))
+
+
 PARSERS = {"obograph": parse_obograph, "gbif_dwca": parse_gbif,
-           "geonames_dump": parse_geonames}
+           "geonames_dump": parse_geonames, "wdpa_csv": parse_wdpa,
+           "gmba_dbf": parse_gmba}
 
 
 # ── build ────────────────────────────────────────────────────────

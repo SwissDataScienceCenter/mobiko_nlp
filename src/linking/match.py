@@ -103,7 +103,18 @@ _SCOPE_UNKNOWN = 99
 # spelling. `add_coref_annotations.py` already resolves anaphora over these
 # documents; feeding those antecedents in is the principled fix, and is exactly
 # what this outcome is flagging as needed.
-INDIVIDUAL_SOURCES = frozenset({"geonames"})
+INDIVIDUAL_SOURCES = frozenset({"geonames", "wdpa", "gmba"})
+
+# A fallback authority is consulted only when its primary has no candidate. A
+# protected area named in both GeoNames and WDPA is one place, not two rival
+# claims, so the cross-authority rule must not make it ambiguous: GeoNames
+# answers, and WDPA fills its gaps (Kilimanjaro National Park).
+FALLBACK_SOURCES: Dict[str, tuple] = {"wdpa": ("geonames", "gmba"),
+                                       "gmba": ("geonames",)}
+
+# WDPA lists one area under several designations (the national park and the
+# World Heritage site of the same name); the national record is preferred.
+_WDPA_DESIGNATION_ORDER = {"national": 0, "regional": 1, "international": 2}
 
 # Far above any observed fan-out (the widest in the human gold is `beetle` at
 # 65). Saturating it means the candidate set could not be enumerated, which is
@@ -148,6 +159,9 @@ def _best_by(matches: Sequence[Match], key) -> List[Match]:
 
 
 def _rank_key(m: Match) -> int:
+    if m.source == "wdpa":
+        kind = (m.rank or "").split("|", 1)[0].strip().lower()
+        return _WDPA_DESIGNATION_ORDER.get(kind, _RANK_UNKNOWN)
     return RANK_ORDER.get((m.rank or "").strip().lower(), _RANK_UNKNOWN)
 
 
@@ -222,6 +236,11 @@ def resolve(dictionary: Dictionary, text: str, entity_types,
         if cur is None or _scope_key(m) < _scope_key(cur):
             by_uri[m.uri] = m
     distinct = list(by_uri.values())
+    answering = {m.source for m in distinct}
+    dropped = {s for s, primaries in FALLBACK_SOURCES.items()
+               if s in answering and answering & set(primaries)}
+    if dropped:
+        distinct = [m for m in distinct if m.source not in dropped]
 
     if len(candidates) >= limit:
         return Resolution(text, norm, label, Outcome.AMBIGUOUS, candidates=distinct,
@@ -244,6 +263,13 @@ def resolve(dictionary: Dictionary, text: str, entity_types,
     names_individuals = only_source in INDIVIDUAL_SOURCES
 
     survivors = distinct
+    if len(survivors) > 1 and only_source == "gmba":
+        # A GMBA sub-range can carry its parent's name ("Northwestern Great
+        # Escarpment" is "Great Escarpment" in English); the parent is meant.
+        ids = {m.curie.split(":", 1)[1] for m in survivors if m.curie}
+        parent_named = [m for m in survivors
+                        if (m.rank or "").rsplit("|", 1)[-1] not in ids]
+        survivors = parent_named or survivors
     if len(survivors) > 1:
         survivors = _best_by(survivors, _rank_key)
     # The label-over-synonym tiebreak says a concept's own name is a stronger

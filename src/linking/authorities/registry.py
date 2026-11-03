@@ -134,6 +134,7 @@ ENVO_VERSION = "v2026-06-26"
 PATO_VERSION = "v2025-05-14"
 GO_VERSION = "2026-08-05"
 ECOCORE_VERSION = "v2026-08-31"
+WDPA_VERSION = "Nov2026"
 
 AUTHORITIES: Dict[str, Authority] = {
     a.key: a for a in [
@@ -243,6 +244,47 @@ AUTHORITIES: Dict[str, Authority] = {
                   "everything else in the artifact for no gain on this corpus. "
                   "Like GBIF, versioned only by snapshot hash.",
         ),
+        Authority(
+            key="wdpa",
+            name="World Database on Protected Areas (Protected Planet)",
+            url=f"https://d1gam3xoknrgr2.cloudfront.net/current/WDPA_{WDPA_VERSION}_Public_csv.zip",
+            version=WDPA_VERSION,
+            fmt="wdpa_csv",
+            group="wdpa",
+            filename=f"WDPA_{WDPA_VERSION}_Public_csv.zip",
+            serves=("SPATIAL ENTITY",),
+            licence="WDPA terms of use: non-commercial use, no redistribution of "
+                    "the data, cite UNEP-WCMC and IUCN (Protected Planet)",
+            size_hint="~29 MB zipped",
+            notes="Protected areas, which GeoNames mostly lacks (Kilimanjaro "
+                  "National Park, Bidoup-Nui Ba). Indexed only under FULL "
+                  "names (\"Monduli\" + designation \"Forest Reserve\"): WDPA "
+                  "has reserves called Africa, Peru and Colorado, so bare names "
+                  "would hijack country and region mentions. Consulted only "
+                  "when GeoNames has no candidate (match.FALLBACK_SOURCES). "
+                  "Published monthly; the public URL serves the current month "
+                  "only, so the snapshot file is the version record.",
+        ),
+        Authority(
+            key="gmba",
+            name="GMBA Mountain Inventory v2.0 (standard)",
+            url="https://data.earthenv.org/mountains/standard/GMBA_Inventory_v2.0_standard.zip",
+            version="v2.0",
+            fmt="gmba_dbf",
+            group="gmba",
+            filename="GMBA_Inventory_v2.0_standard.zip",
+            serves=("SPATIAL ENTITY",),
+            licence="CC BY 4.0 (cite Snethlage et al. 2022, Sci Data 9:139)",
+            size_hint="~186 MB zipped",
+            notes="Mountain ranges with a hierarchy (Udzungwa > Eastern Arc "
+                  "Mountains > East African Highlands > Africa). Only ranges, "
+                  "sub-ranges, plateaus, single-peak areas and escarpments are "
+                  "linkable: its continent, island and archipelago entries mean "
+                  "'the mountains of Africa', not Africa. Every entry is kept as a "
+                  "concept so parents can be named. Consulted only when GeoNames "
+                  "has no candidate; a GeoNames mountain also gets its GMBA entry "
+                  "as a crosswalk (resolve_corpus).",
+        ),
     ]
 }
 
@@ -254,8 +296,11 @@ GROUPS: Dict[str, tuple] = {
     "ontologies": ("envo", "pato", "go_bp", "ecocore"),
     "gbif": ("gbif",),
     "geonames": ("geonames",),
+    "wdpa": ("wdpa",),
+    "gmba": ("gmba",),
 }
-LARGE_KEYS = ("gbif", "geonames")
+# wdpa is small but opt-in for its licence: it may not be redistributed.
+LARGE_KEYS = ("gbif", "geonames", "wdpa", "gmba")
 
 
 # ── hashing and versions ─────────────────────────────────────────

@@ -396,6 +396,50 @@ def _try_singular(dictionary, sp: dict, nil_result):
 
 CANDIDATES_KEPT = 20
 
+# GeoNames feature codes of mountains, which get their GMBA range as a crosswalk.
+MOUNTAIN_CODES = frozenset({"T.MT", "T.MTS", "T.PK", "T.PKS", "T.RANGE", "T.HLLS",
+                            "T.MASS", "T.UPLD", "T.PLAT", "T.PLATS", "T.RDGE"})
+
+
+def gmba_link(dictionary, authority_uri: Optional[str], cache: dict) -> Optional[dict]:
+    """The GMBA range of a linked place and its parents, or None.
+
+    A mention linked to GMBA is its own range. A GeoNames mountain (Mount
+    Kilimanjaro, Taita Hills) is crosswalked when its name finds exactly one
+    linkable GMBA range; a name GMBA lists twice is left alone rather than
+    guessed. ``path`` runs from the range's parent up to the continent level,
+    so "everything in the Eastern Arc Mountains" is a graph walk.
+    """
+    if not authority_uri:
+        return None
+    if authority_uri in cache:
+        return cache[authority_uri]
+    out = None
+    c = dictionary.concept(authority_uri)
+    start = None
+    if c and c["source"] == "gmba":
+        start, crosswalk = c, False
+    elif c and c["source"] == "geonames" and c["namespace"] in MOUNTAIN_CODES \
+            and "gmba" in dictionary.sources_for("SPATIAL ENTITY"):
+        hits = {m.uri for m in dictionary.lookup(normalize_key(c["label"]), ["gmba"])}
+        if len(hits) == 1:
+            start, crosswalk = dictionary.concept(hits.pop()), True
+    if start:
+        path, seen = [], {start["uri"]}
+        parent = start["namespace"].rsplit("|", 1)[-1]
+        while parent:
+            p = dictionary.concept(f"urn:gmba:v2:{parent}")
+            if not p or p["uri"] in seen:
+                break
+            seen.add(p["uri"])
+            path.append({"uri": p["uri"], "curie": p["curie"], "label": p["label"],
+                         "feature": p["namespace"].rsplit("|", 1)[0]})
+            parent = p["namespace"].rsplit("|", 1)[-1]
+        out = {"uri": start["uri"], "curie": start["curie"], "label": start["label"],
+               "wikidata": start["definition"], "crosswalk": crosswalk, "path": path}
+    cache[authority_uri] = out
+    return out
+
 
 def _candidates(res) -> Optional[List[dict]]:
     """The ambiguous mention's candidates, at most CANDIDATES_KEPT of them."""
@@ -598,6 +642,7 @@ def main(argv: List[str] | None = None) -> int:
     # --gap-report what they missed (the coverage gap), --entity-report both.
     entities: Dict[str, dict] = {}
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    gmba_cache: dict = {}
     with args.out.open("w", encoding="utf-8") as fh:
         for r in rows:
             res = r["_res"]
@@ -667,6 +712,8 @@ def main(argv: List[str] | None = None) -> int:
                 # each of these ("Kilimanjaro" -> the mountain, the region).
                 "candidates": _candidates(res) if eid is None
                 and res.outcome is Outcome.AMBIGUOUS else None,
+                # The mountain range in GMBA, with its parent ranges.
+                "gmba": gmba_link(d, authority_uri, gmba_cache),
             }, ensure_ascii=False) + "\n")
 
     meta = {
@@ -691,6 +738,8 @@ def main(argv: List[str] | None = None) -> int:
         # n_entities_project_local by however many chained into a grounded
         # component; the gap report lists only the ones that stayed unresolved.
         "n_unresolved_clusters": len(clusters),
+        "gmba_ranges": sum(1 for v in gmba_cache.values() if v),
+        "gmba_crosswalks": sum(1 for v in gmba_cache.values() if v and v["crosswalk"]),
     }
     meta_path = args.out.with_suffix(".meta.json")
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True, default=str) + "\n",
