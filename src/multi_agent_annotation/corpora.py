@@ -132,7 +132,10 @@ def add_corpus_args(parser) -> None:
     parser.add_argument("--relation-guide", type=Path, default=None,
                         help="relation guide .csv (Relation, Definition, Example); "
                              "defaults to the corpus preset. Served through the "
-                             "relation tools only — never rendered into a prompt.")
+                             "relation tools only — never rendered into a prompt. "
+                             "To re-run a design on the vocabulary it was run "
+                             "with, pass the version its run_meta names, e.g. "
+                             "'Relation schema v1.csv' for runs before 3 Nov 2026.")
     parser.add_argument("--no-relation-guide", action="store_true",
                         help="run with NO relation vocabulary: the relation tools "
                              "are not registered and relation labels are not "

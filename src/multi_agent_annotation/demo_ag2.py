@@ -336,6 +336,11 @@ def run_live(
     # those win, since they were resolved from the CLI in main().
     corpus_kwargs["schema_path"] = schema_path
     corpus_kwargs["seeds_path"] = seeds_path
+    # Only when the caller actually named a guide: assigning None here would
+    # silently strip the preset's relation vocabulary.
+    if relation_guide_path is not None:
+        corpus_kwargs["relation_guide_path"] = Path(relation_guide_path).resolve()
+        corpus_kwargs["use_relation_guide"] = True
     annotator = MultiAgentAnnotator(
         annotator_model=annotator_model,
         critic_model=critic_model,
@@ -362,7 +367,6 @@ def run_live(
         relation_properties=relation_properties,
         split_counts=split_counts,
         entity_ids=entity_ids,
-        relation_guide_path=relation_guide_path,
         tool_choice=tool_choice,
         annotator_max_tokens=annotator_max_tokens,
         critic_max_tokens=critic_max_tokens,
@@ -556,13 +560,6 @@ def main() -> None:
              "renders the prompts exactly as the frozen review pipeline did.",
     )
     parser.add_argument(
-        "--relation-guide", type=Path, default=None,
-        help="Relation guide CSV (default: 'Relation schema.csv', the current "
-             "vocabulary, matching the annotation page). To re-run a design on "
-             "the vocabulary it was run with, pass the version its run_meta "
-             "names, e.g. 'Relation schema v1.csv' for runs before 3 Nov 2026.",
-    )
-    parser.add_argument(
         "--no-entity-ids", action="store_true",
         help="MoBiKo: do not ask the agents for mention ids. Without them two "
              "mentions of the same words in one sentence cannot be told apart.",
@@ -640,7 +637,8 @@ def main() -> None:
     # pass them explicitly keep working unchanged.
     corpus_kwargs = resolve_corpus(
         args.corpus, schema=args.schema, seeds=args.seeds, guideline=args.guideline,
-        no_guideline=args.no_guideline, no_decision_support=args.no_decision_support)
+        no_guideline=args.no_guideline, no_decision_support=args.no_decision_support,
+        relation_guide=args.relation_guide, no_relation_guide=args.no_relation_guide)
     schema_path = corpus_kwargs["schema_path"]
     seeds_path = corpus_kwargs["seeds_path"]
 
