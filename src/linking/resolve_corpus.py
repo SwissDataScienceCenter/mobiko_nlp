@@ -394,6 +394,18 @@ def _try_singular(dictionary, sp: dict, nil_result):
     return alt, {**sp, "canonical_text": alt_text, "concept_source": "singular"}
 
 
+CANDIDATES_KEPT = 20
+
+
+def _candidates(res) -> Optional[List[dict]]:
+    """The ambiguous mention's candidates, at most CANDIDATES_KEPT of them."""
+    if not res.candidates or len(res.candidates) > CANDIDATES_KEPT:
+        return None
+    return [{"uri": m.uri, "curie": m.curie, "label": m.label, "source": m.source,
+             "scope": m.scope, "rank": m.rank}
+            for m in sorted(res.candidates, key=lambda m: m.uri)]
+
+
 def _code_version() -> Optional[str]:
     """Git sha of the tree that produced this table, or None, visibly."""
     try:
@@ -650,6 +662,11 @@ def main(argv: List[str] | None = None) -> int:
                     "cluster" if eid else None),
                 "reason": res.reason or None,
                 "n_candidates": len(res.candidates) or None,
+                # Who the mention could be, for an ambiguous one: the graph
+                # turns an ambiguous place name into a meta-node linked to
+                # each of these ("Kilimanjaro" -> the mountain, the region).
+                "candidates": _candidates(res) if eid is None
+                and res.outcome is Outcome.AMBIGUOUS else None,
             }, ensure_ascii=False) + "\n")
 
     meta = {
